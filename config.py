@@ -1,13 +1,11 @@
 """
-ПОЛНАЯ КОНФИГУРАЦИЯ ДЛЯ RENDER + POSTGRESQL
-Сохраняем все настройки из оригинала
+КОНФИГУРАЦИЯ ДЛЯ RENDER + POSTGRESQL (ИСПРАВЛЕННАЯ ВЕРСИЯ)
+Поддержка Psycopg 3 и SQLite для разработки
 """
 
 import os
 from typing import List
 from dotenv import load_dotenv
-import psycopg2
-from urllib.parse import urlparse
 import sqlite3
 
 load_dotenv()
@@ -172,18 +170,18 @@ class Config:
     def get_db_connection(cls):
         """Получить соединение с БД (PostgreSQL или SQLite)"""
         if cls.is_postgresql():
-            # PostgreSQL для Render
-            database_url = os.getenv('DATABASE_URL')
-            result = urlparse(database_url)
-            
-            conn = psycopg2.connect(
-                database=result.path[1:],
-                user=result.username,
-                password=result.password,
-                host=result.hostname,
-                port=result.port
-            )
-            return conn
+            # PostgreSQL для Render (Psycopg 3)
+            try:
+                # Импортируем psycopg только при необходимости
+                from psycopg import connect
+                database_url = os.getenv('DATABASE_URL')
+                
+                # Простое подключение по URL (Psycopg 3)
+                conn = connect(database_url)
+                return conn
+            except ImportError:
+                print("❌ Psycopg 3 не установлен. Установите: pip install psycopg[binary]")
+                raise
         else:
             # SQLite для локальной разработки
             return sqlite3.connect(cls.DB_PATH)
@@ -192,18 +190,6 @@ class Config:
     def get_placeholder(cls) -> str:
         """Получить placeholder для SQL запросов"""
         return '%s' if cls.is_postgresql() else '?'
-    
-    @classmethod
-    def execute_query(cls, cursor, query: str, params: tuple = None):
-        """Универсальное выполнение SQL запроса"""
-        if params is None:
-            params = ()
-        
-        # Заменяем ? на %s если нужно
-        if cls.is_postgresql() and '?' in query:
-            query = query.replace('?', '%s')
-        
-        return cursor.execute(query, params)
 
 # Экспортируем экземпляр для удобства
 config = Config()

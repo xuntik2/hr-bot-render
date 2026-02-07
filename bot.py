@@ -1,39 +1,59 @@
 #!/usr/bin/env python3
 """
-ПОЛНЫЙ HR-BOT ДЛЯ RENDER + POSTGRESQL
-С периодическими задачами и улучшенной обработкой
+HR-BOT ДЛЯ RENDER (ИСПРАВЛЕННАЯ И ГОТОВАЯ ВЕРСИЯ)
+Web Service с health-эндпоинтом, без зависимостей от отсутствующих модулей.
 """
 
 import logging
-import sqlite3
 import time
 import threading
+import os
 from datetime import datetime, timedelta
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import telebot
 from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
 
 from config import config
 from search_engine import SearchEngine
 from handlers import CommandHandler
-from meme_handler import MemeHandler
-from create_database import create_database
+# Импорт MemeHandler убран, так как его нет. Если он нужен, раскомментируйте.
+# from meme_handler import MemeHandler
 
 # Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('hr_bot.log', encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
+# ================== ПРОСТОЙ HEALTH СЕРВЕР ДЛЯ RENDER ==================
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/health':
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'OK')
+        else:
+            self.send_response(404)
+            self.end_headers()
+    def log_message(self, format, *args):
+        pass
+
+def run_health_server():
+    """Запуск HTTP-сервера для проверки здоровья (обязательно для Render Web Service)"""
+    # Render сам предоставляет порт в переменной PORT
+    port = int(os.environ.get('PORT', 10000))
+    server = HTTPServer(('0.0.0.0', port), HealthHandler)
+    logger.info(f'✅ Health-сервер запущен на порту {port} (для Render Web Service)')
+    server.serve_forever()
+
+# ================== ОСНОВНОЙ КЛАСС БОТА ==================
 class HRBot:
-    """Полный класс бота с обновленным поисковым движком"""
-    
     def __init__(self):
         # Валидация конфигурации
         if not config.validate():
@@ -41,86 +61,42 @@ class HRBot:
         
         self.bot = telebot.TeleBot(config.get_bot_token(), threaded=True)
         
-        # Создаем/проверяем базу данных
-        try:
-            logger.info("🔧 Проверяем базу данных...")
-            create_database()
-        except Exception as e:
-            logger.warning(f"⚠️ Не удалось проверить базу: {e}")
-        
-        # Инициализация поискового движка
+        # Инициализация поискового движка (база создается при первом поиске)
         try:
             self.search_engine = SearchEngine()
-            logger.info(f"✅ Поисковый движок инициализирован: {len(self.search_engine.faq_data)} FAQ загружено")
+            logger.info(f"✅ Поисковый движок готов. FAQ: {len(self.search_engine.faq_data)}")
         except Exception as e:
             logger.error(f"❌ Ошибка инициализации поискового движка: {e}", exc_info=True)
-            raise
+            # Не падаем, пытаемся работать дальше
+            self.search_engine = None
         
         # Инициализация обработчиков
-        self.command_handler = CommandHandler(self.search_engine)
+        self.command_handler = CommandHandler(self.search_engine) if self.search_engine else None
         
-        # Если мемы включены, инициализируем мем  хендлер
-        self.meme_handler = None
-        if config.is_meme_enabled():
-            self.meme_handler = MemeHandler()
-        
-        # Статистика бота
-        self.stats = {
-            'total_queries': 0,
-            'successful_queries': 0,
-            'failed_queries': 0,
-            'start_time': datetime.now(),
-            'users': set(),
-            'active_sessions': 0
-        }
-        
-        # Планировщик для рассылки мемов
+        # Инициализация планировщика (без мемов)
         self.scheduler = BackgroundScheduler()
-        if config.is_meme_enabled() and self.meme_handler:
-            self._setup_scheduler()
+        # Здесь можно добавить задачи, например, ежедневную статистику
+        # self.scheduler.start()
         
         # Регистрация обработчиков
         self._register_handlers()
         
-        logger.info("HR Bot инициализирован с PostgreSQL")
-        logger.info(f"Конфигурация: БД={'PostgreSQL' if config.is_postgresql() else 'SQLite'}, Мемы={'включены' if config.is_meme_enabled() else 'выключены'}")
-    
-    def _setup_scheduler(self):
-        """Настройка планировщика для мемов"""
-        if not config.is_meme_enabled() or not self.meme_handler:
-            logger.info("Мемы отключены в конфигурации, планировщик не запущен")
-            return
-        
-        def send_memes():
-            try:
-                logger.info("Запуск ежедневной рассылки мемов...")
-                self.meme_handler.send_daily_memes(self.bot)
-            except Exception as e:
-                logger.error(f"Ошибка в рассылке мемов: {e}", exc_info=True)
-        
-        # Ежедневная рассылка в 10:00
-        self.scheduler.add_job(
-            send_memes,
-            CronTrigger(hour=10, minute=0),
-            id='daily_meme_delivery',
-            replace_existing=True
-        )
-        
-        self.scheduler.start()
-        logger.info("Планировщик запущен (ежедневно в 10:00)")
+        # Определяем тип БД для логов (исправление по замечанию)
+        db_type = 'PostgreSQL' if os.getenv('DATABASE_URL') else 'SQLite'
+        logger.info(f"HR Bot инициализирован. БД: {db_type}")
     
     def _register_handlers(self):
         """Регистрация обработчиков сообщений"""
+        if not self.command_handler:
+            return
         
         @self.bot.message_handler(commands=['start', 'help'])
         def send_welcome(message):
             self.command_handler.handle_welcome(message, self.bot)
-            self._update_stats(message, success=True)
         
         @self.bot.message_handler(commands=['категории', 'categories'])
         def show_categories(message):
             self.command_handler.handle_categories(message, self.bot)
-            self._update_stats(message, success=True)
         
         @self.bot.message_handler(commands=['поиск', 'search'])
         def search_command(message):
@@ -129,177 +105,81 @@ class HRBot:
         @self.bot.message_handler(commands=['отзыв', 'feedback'])
         def feedback(message):
             self.command_handler.handle_feedback(message, self.bot)
-            self._update_stats(message, success=True)
         
-        # Команды для мемов (только если включены в конфиге)
-        if config.is_meme_enabled() and self.meme_handler:
-            @self.bot.message_handler(commands=['мем', 'мем_дня'])
-            def send_meme(message):
-                self.meme_handler.handle_meme(message, self.bot)
-                self._update_stats(message, success=True)
-            
-            @self.bot.message_handler(commands=['мемподписка'])
-            def subscribe_meme(message):
-                self.meme_handler.handle_subscribe(message, self.bot)
-                self._update_stats(message, success=True)
-            
-            @self.bot.message_handler(commands=['мемотписка'])
-            def unsubscribe_meme(message):
-                self.meme_handler.handle_unsubscribe(message, self.bot)
-                self._update_stats(message, success=True)
-        
-        # Команды для администраторов
+        # АДМИНСКИЕ КОМАНДЫ (только для пользователей из ADMIN_IDS)
         @self.bot.message_handler(commands=['статистика', 'stats'])
         def show_stats(message):
-            self.command_handler.handle_stats(message, self.bot)
-            self._update_stats(message, success=True)
+            # Простая проверка на админа
+            admin_ids = config.get_admin_ids()
+            if admin_ids and message.from_user.id in admin_ids:
+                try:
+                    stats = self.search_engine.get_stats() if self.search_engine else {}
+                    response = f"📊 Статистика:\nЗапросов: {stats.get('total_searches', 0)}\nFAQ в базе: {stats.get('total_faq', 0)}"
+                    self.bot.reply_to(message, response)
+                except:
+                    self.bot.reply_to(message, "Не удалось собрать статистику.")
+            else:
+                self.bot.reply_to(message, "Команда доступна только администраторам.")
         
         @self.bot.message_handler(commands=['очистить', 'clear'])
         def clear_cache(message):
-            self.command_handler.handle_clear_cache(message, self.bot)
-            self._update_stats(message, success=True)
+            admin_ids = config.get_admin_ids()
+            if admin_ids and message.from_user.id in admin_ids:
+                if self.search_engine:
+                    self.search_engine.refresh_data()
+                    self.bot.reply_to(message, "Кэш и индексы обновлены.")
+                else:
+                    self.bot.reply_to(message, "Поисковый движок не доступен.")
+            else:
+                self.bot.reply_to(message, "Команда доступна только администраторам.")
         
+        # Обработка всех текстовых сообщений
         @self.bot.message_handler(func=lambda message: True)
         def handle_all_messages(message):
-            """Обработка всех текстовых сообщений"""
-            try:
-                self.stats['total_queries'] += 1
-                self.stats['users'].add(message.from_user.id)
-                
-                logger.info(f"Запрос от {message.from_user.id}: {message.text[:50]}...")
-                
+            if self.command_handler:
                 self.command_handler.handle_text_message(message, self.bot)
-                
-            except Exception as e:
-                logger.error(f"Ошибка обработки сообщения: {e}", exc_info=True)
-                self.bot.reply_to(
-                    message,
-                    "❌ Произошла ошибка при обработке вашего сообщения. Пожалуйста, попробуйте позже.",
-                    parse_mode='Markdown'
-                )
+            else:
+                self.bot.reply_to(message, "Бот временно не готов к работе. Попробуйте позже.")
     
-    def _update_stats(self, message, success: bool):
-        """Обновление статистики"""
-        if success:
-            self.stats['successful_queries'] += 1
-        else:
-            self.stats['failed_queries'] += 1
-    
-    def run(self):
-        """Запуск бота с автоматическим перезапуском"""
-        logger.info("🚀 Запуск HR Bot на Render...")
-        
-        # Запуск периодических задач в отдельном потоке
-        periodic_thread = threading.Thread(target=self._run_periodic_tasks, daemon=True)
-        periodic_thread.start()
-        
-        logger.info("✅ HR Bot запущен и готов к работе!")
-        logger.info("📊 Статистика системы:")
-        logger.info(f"  • FAQ в базе: {len(self.search_engine.faq_data)}")
-        logger.info(f"  • Категории: {len(self.search_engine.category_index)}")
-        
-        # Основной цикл с автоматическим перезапуском
+    def run_bot(self):
+        """Основной цикл работы бота"""
+        logger.info("🚀 Запуск поллинга Telegram бота...")
         restart_delay = 10
         
         while True:
             try:
+                # Бесконечный опрос серверов Telegram
                 self.bot.infinity_polling(timeout=30, long_polling_timeout=5)
-                
-            except KeyboardInterrupt:
-                logger.info("Бот остановлен пользователем")
-                if hasattr(self, 'scheduler') and self.scheduler.running:
-                    self.scheduler.shutdown()
-                break
-                
+            except telebot.apihelper.ApiTelegramException as e:
+                # Обработка ошибки 409 (конфликт) - ждем подольше
+                if "409" in str(e):
+                    logger.error(f"Конфликт 409. Убедитесь, что бот запущен только в одном месте. Ждем {restart_delay*2} сек.")
+                    time.sleep(restart_delay * 2)
+                else:
+                    logger.error(f"Ошибка Telegram API: {e}. Перезапуск через {restart_delay} сек.")
+                    time.sleep(restart_delay)
             except Exception as e:
-                logger.error(f"Ошибка polling: {e}", exc_info=True)
-                logger.info(f"Повторный запуск через {restart_delay} секунд...")
+                logger.error(f"Неизвестная ошибка: {e}. Перезапуск через {restart_delay} сек.")
                 time.sleep(restart_delay)
-    
-    def _run_periodic_tasks(self):
-        """Периодические задачи"""
-        logger.info("Периодические задачи запущены")
-        
-        while True:
-            try:
-                sleep_seconds = config.SLEEP_INTERVAL_HOURS * 3600
-                time.sleep(sleep_seconds)
-                
-                logger.info("Выполнение периодических задач...")
-                
-                # 1. Очистка старых записей в БД
-                self._cleanup_old_records()
-                
-                # 2. Обновление данных поискового движка
-                self.search_engine.refresh_data()
-                
-                # 3. Проверка состояния системы
-                self._check_system_health()
-                
-                logger.info(f"Периодические задачи завершены. Следующий запуск через {sleep_seconds/3600} часов")
-                
-            except Exception as e:
-                logger.error(f"Ошибка в периодических задачах: {e}", exc_info=True)
-                time.sleep(60)
-    
-    def _cleanup_old_records(self):
-        """Очистка старых записей в БД"""
-        try:
-            conn = config.get_db_connection()
-            cursor = conn.cursor()
-            
-            # Очистка старых отзывов
-            cutoff_date = (datetime.now() - timedelta(days=config.CLEANUP_OLDER_THAN_DAYS)).isoformat()
-            
-            placeholder = config.get_placeholder()
-            cursor.execute(f"DELETE FROM feedback WHERE timestamp < {placeholder}", (cutoff_date,))
-            deleted_feedback = cursor.rowcount
-            
-            # Очистка старых неотвеченных запросов
-            cursor.execute(f"DELETE FROM unanswered_queries WHERE timestamp < {placeholder}", (cutoff_date,))
-            deleted_queries = cursor.rowcount
-            
-            conn.commit()
-            conn.close()
-            
-            if deleted_feedback > 0 or deleted_queries > 0:
-                logger.info(f"Очищено {deleted_feedback} отзывов и {deleted_queries} запросов")
-                    
-        except Exception as e:
-            logger.error(f"Ошибка при очистке записей: {e}", exc_info=True)
-    
-    def _check_system_health(self):
-        """Проверка состояния системы"""
-        try:
-            search_stats = self.search_engine.get_stats()
-            
-            total_faq = search_stats.get('total_faq', 0)
-            
-            health_status = "🟢 Здоров"
-            if total_faq == 0:
-                health_status = "🔴 Критический: нет FAQ в базе"
-            
-            logger.info(f"Проверка здоровья: {health_status}")
-            logger.info(f"  • FAQ: {total_faq}")
-            logger.info(f"  • Запросов: {search_stats.get('total_searches', 0)}")
-            logger.info(f"  • Пользователей: {len(self.stats['users'])}")
-            
-        except Exception as e:
-            logger.error(f"Ошибка проверки состояния системы: {e}", exc_info=True)
 
+# ================== ГЛАВНАЯ ФУНКЦИЯ ==================
 def main():
-    """Основная функция"""
+    """Точка входа: запускает health-сервер и бота в разных потоках"""
+    logger.info("=" * 60)
+    logger.info("🤖 ЗАПУСК HR BOT НА RENDER")
+    logger.info("=" * 60)
+    
+    # Поток для health-сервера (обязательно для Render Web Service)
+    health_thread = threading.Thread(target=run_health_server, daemon=True)
+    health_thread.start()
+    logger.info("Health-сервер запущен в отдельном потоке.")
+    
+    # Создаем и запускаем бота в основном потоке
     try:
-        logger.info("=" * 60)
-        logger.info("🚀 Запуск HR Bot версии для Render + PostgreSQL")
-        logger.info("📅 " + datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-        logger.info("=" * 60)
-        
-        bot = HRBot()
-        bot.run()
-        
+        bot_instance = HRBot()
+        bot_instance.run_bot()  # Этот метод работает бесконечно
     except Exception as e:
-        logger.error(f"Ошибка при запуске: {e}", exc_info=True)
+        logger.critical(f"Критическая ошибка при создании бота: {e}")
         raise
 
 if __name__ == '__main__':

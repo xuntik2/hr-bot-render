@@ -379,7 +379,8 @@ class SearchEngine:
             placeholder = config.get_placeholder()
             query = f"UPDATE faq SET usage_count = usage_count + 1 WHERE id = {placeholder}"
             
-            config.execute_query(cursor, query, (faq_id,))
+            # ИСПРАВЛЕНИЕ: Заменяем config.execute_query на cursor.execute
+            cursor.execute(query, (faq_id,))
             
             conn.commit()
             conn.close()

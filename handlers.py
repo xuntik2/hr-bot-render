@@ -462,7 +462,8 @@ class CommandHandler:
             placeholder = config.get_placeholder()
             sql = f"INSERT INTO unanswered_queries (user_id, query_text) VALUES ({placeholder}, {placeholder})"
             
-            config.execute_query(cursor, sql, (user_id, query))
+            # ИСПРАВЛЕНИЕ: Заменяем config.execute_query на cursor.execute
+            cursor.execute(sql, (user_id, query))
             
             conn.commit()
             conn.close()
@@ -471,7 +472,7 @@ class CommandHandler:
             logger.error(f"Ошибка сохранения неотвеченного запроса: {str(e)}")
     
     def handle_unknown_command(self, message, bot):
-        """Обработка неизвестной команды"""
+        """Обработка неизвестной команда"""
         command = message.text.split()[0]
         
         response = f"""
@@ -551,7 +552,8 @@ class CommandHandler:
             placeholder = config.get_placeholder()
             sql = f"INSERT INTO feedback (user_id, comment) VALUES ({placeholder}, {placeholder})"
             
-            config.execute_query(cursor, sql, (user_id, feedback_text))
+            # ИСПРАВЛЕНИЕ: Заменяем config.execute_query на cursor.execute
+            cursor.execute(sql, (user_id, feedback_text))
             
             conn.commit()
             conn.close()

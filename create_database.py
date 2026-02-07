@@ -153,8 +153,8 @@ def create_database():
                 VALUES ({placeholder}, {placeholder}, {placeholder}, {placeholder}, {placeholder}, {placeholder}, 0)
                 '''
                 
-                config.execute_query(cursor, query, 
-                    (question, answer, keywords, norm_keywords, norm_question, category))
+                cursor.execute(query, 
+                (question, answer, keywords, norm_keywords, norm_question, category))
                 
                 inserted_count += 1
             
@@ -172,7 +172,7 @@ def create_database():
         
         for index_sql in indexes:
             try:
-                config.execute_query(cursor, index_sql)
+                cursor.execute(index_sql)
             except Exception as e:
                 logger.warning(f"Не удалось создать индекс: {e}")
         
@@ -255,4 +255,5 @@ def main():
     create_database()
 
 if __name__ == "__main__":
+
     main()

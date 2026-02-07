@@ -1,0 +1,8 @@
+# requirements.txt
+pyTelegramBotAPI==4.15.1
+APScheduler==3.10.4
+python-dotenv==1.0.0
+psycopg2-binary==2.9.9  # PostgreSQL
+requests==2.31.0         # Для мемов
+Pillow==10.1.0           # Для работы с изображениями
+emoji==2.10.0            # Эмодзи

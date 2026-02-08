@@ -1,7 +1,9 @@
+[file name]: bot.py
+[file content begin]
 #!/usr/bin/env python3
 """
 ГЛАВНЫЙ ФАЙЛ БОТА ДЛЯ RENDER
-Исправленная версия с устранением всех ошибок инициализации
+Версия с административным интерфейсом для управления базой данных
 """
 import os
 import time
@@ -23,6 +25,7 @@ from telegram.ext import (
 from config import config
 from search_engine import SearchEngine
 from handlers import CommandHandler as CustomCommandHandler
+from admin_tools import check_database_status, fill_database_manual
 
 # Настройка логирования
 logging.basicConfig(
@@ -169,11 +172,28 @@ def _register_bot_handlers():
 @app.route('/')
 def index():
     """Главная страница"""
+    current_status = check_database_status()
     faq_count = len(search_engine.faq_data) if search_engine else 0
     db_type = 'PostgreSQL' if os.getenv('DATABASE_URL') else 'SQLite'
     
     bot_status = "✅ Активен" if bot_initialized else "❌ Ошибка инициализации"
-    faq_status = f"✅ {faq_count} вопросов" if faq_count >= 75 else f"⚠️  {faq_count} вопросов (из 75)"
+    
+    # Определяем статус базы данных
+    if 'error' in current_status:
+        db_status = f"❌ Ошибка: {current_status['error']}"
+        db_class = "error"
+    elif not current_status.get('table_exists', False):
+        db_status = "❌ Таблица не существует"
+        db_class = "error"
+    elif current_status.get('total_records', 0) >= 75:
+        db_status = f"✅ {current_status['total_records']} вопросов"
+        db_class = "status"
+    elif current_status.get('total_records', 0) > 0:
+        db_status = f"⚠️  {current_status['total_records']} вопросов (из 75)"
+        db_class = "warning"
+    else:
+        db_status = "❌ База пуста"
+        db_class = "error"
     
     return f'''
     <!DOCTYPE html>
@@ -199,14 +219,15 @@ def index():
     <body>
         <h1>🤖 HR Bot Мечел — Статус: {bot_status}</h1>
         
-        <div class="{'error' if not bot_initialized else ('warning' if faq_count < 75 else 'status')}">
+        <div class="{db_class}">
             <h3>📊 Статус системы:</h3>
             <p><strong>Бот:</strong> <span class="{'' if bot_initialized else 'bad'}">{bot_status}</span></p>
-            <p><strong>FAQ в базе:</strong> <span class="{'' if faq_count >= 50 else 'bad'}">{faq_status}</span></p>
+            <p><strong>База данных:</strong> {db_status}</p>
             <p><strong>Тип БД:</strong> {db_type}</p>
             <p><strong>Webhook готов:</strong> {'✅ Да' if bot_initialized else '❌ Нет'}</p>
+            {f"<p><strong>Заполнение базы:</strong> {current_status.get('completion_percentage', 0)}%</p>" if 'completion_percentage' in current_status else ''}
             {'<p><strong>Проблема:</strong> Ошибка инициализации Telegram API</p>' if not bot_initialized else ''}
-            {'<p><strong>Проблема:</strong> Не все вопросы загружены в базу</p>' if faq_count < 75 else ''}
+            {'<p><strong>Проблема:</strong> Не все вопросы загружены в базу</p>' if current_status.get('total_records', 0) < 75 else ''}
         </div>
         
         <div class="links">
@@ -215,11 +236,14 @@ def index():
             <a href="/set_webhook">Установить вебхук</a>
             <a href="/webhook_info">Информация о вебхуке</a>
             <a href="/debug">Диагностика</a>
+            <a href="/admin/fill-db">Заполнить базу данных</a>
+            <a href="/admin/db-status">Статус БД (JSON)</a>
         </div>
         
         <div style="margin-top: 30px; color: #666; font-size: 14px;">
             <p>Время запуска: {time.strftime('%Y-%m-%d %H:%M:%S')}</p>
             <p>Telegram Bot API: python-telegram-bot v20.3</p>
+            <p>Обновление: Добавлен административный интерфейс</p>
             {'<p style="color: #dc3545;"><strong>ВНИМАНИЕ:</strong> Бот не работает! Исправьте ошибки выше.</p>' if not bot_initialized else ''}
         </div>
     </body>
@@ -233,8 +257,12 @@ def health_check():
     search_ok = search_engine is not None
     faq_count = len(search_engine.faq_data) if search_engine else 0
     
+    # Получаем статус базы данных
+    db_status = check_database_status()
+    db_ok = db_status.get('table_exists', False) and db_status.get('total_records', 0) > 0
+    
     # Определяем статус
-    if bot_ok and search_ok and faq_count >= 10:
+    if bot_ok and search_ok and db_ok and faq_count >= 10:
         status = "healthy"
         status_code = 200
     elif bot_ok and search_ok:
@@ -250,7 +278,7 @@ def health_check():
         "components": {
             "bot": bot_ok,
             "search_engine": search_ok,
-            "database_has_data": faq_count > 0
+            "database_has_data": db_ok
         },
         "details": {
             "faq_count": faq_count,
@@ -259,6 +287,7 @@ def health_check():
             "telegram_app_exists": telegram_app is not None,
             "search_engine_exists": search_engine is not None
         },
+        "database": db_status,
         "database_type": "postgresql" if os.getenv('DATABASE_URL') else "sqlite",
         "timestamp": time.strftime('%Y-%m-%d %H:%M:%S'),
         "errors": [] if bot_ok else ["Telegram bot initialization failed"]
@@ -296,10 +325,168 @@ def debug_info():
         "system_info": {
             "cwd": os.getcwd(),
             "files": [f for f in os.listdir('.') if os.path.isfile(f)]
-        }
+        },
+        "database_status": check_database_status()
     }
     
     return jsonify(info), 200
+
+# ================== АДМИНИСТРАТИВНЫЕ РОУТЫ ==================
+
+@app.route('/admin/fill-db', methods=['GET', 'POST'])
+def admin_fill_database():
+    """Административный эндпоинт для заполнения базы данных"""
+    
+    # Проверяем права администратора (по IP или токену)
+    # Для простоты разрешаем всем в демонстрационных целях
+    # В продакшене добавьте проверку авторизации
+    
+    if request.method == 'GET':
+        # Показываем форму
+        current_status = check_database_status()
+        
+        status_html = "<h3>📊 Текущий статус базы данных:</h3>"
+        if 'error' in current_status:
+            status_html += f"<p style='color: red;'><strong>Ошибка:</strong> {current_status['error']}</p>"
+        else:
+            if current_status['table_exists']:
+                status_html += f"""
+                <div style="background: {'#d4edda' if current_status['total_records'] >= 75 else '#fff3cd'}; padding: 15px; border-radius: 5px; margin: 10px 0;">
+                    <p><strong>Записей в базе:</strong> {current_status['total_records']} из 75</p>
+                    <p><strong>Заполнение:</strong> {current_status['completion_percentage']}</p>
+                    <p><strong>Категорий:</strong> {current_status['categories_count']}</p>
+                    <p><strong>Статус:</strong> {'✅ Полностью заполнена' if current_status['total_records'] >= 75 else '⚠️ Частично заполнена' if current_status['total_records'] > 0 else '❌ Пустая'}</p>
+                </div>
+                """
+                
+                if current_status['total_records'] < 75:
+                    status_html += """
+                    <h3>🛠️ Заполнение базы данных</h3>
+                    <p>Нажмите кнопку ниже, чтобы заполнить базу 75 вопросами:</p>
+                    <form method="POST" onsubmit="return confirm('Вы уверены? Это перезапишет все существующие данные.');">
+                        <button type="submit" style="padding: 10px 20px; background: #28a745; color: white; border: none; border-radius: 5px; font-size: 16px;">
+                            🚀 Заполнить базу данных (75 вопросов)
+                        </button>
+                    </form>
+                    """
+                else:
+                    status_html += """
+                    <h3>🛠️ Перезапись базы данных</h3>
+                    <p>База уже заполнена, но вы можете перезаписать её заново:</p>
+                    <form method="POST" onsubmit="return confirm('ВНИМАНИЕ: Все существующие данные будут удалены! Вы уверены?');">
+                        <button type="submit" style="padding: 10px 20px; background: #dc3545; color: white; border: none; border-radius: 5px; font-size: 16px;">
+                            ⚠️  ПЕРЕЗАПИСАТЬ базу данных
+                        </button>
+                    </form>
+                    """
+            else:
+                status_html += "<p style='color: red;'>❌ Таблица 'faq' не существует в базе данных</p>"
+                status_html += """
+                <h3>🛠️ Создание и заполнение базы данных</h3>
+                <p>Нажмите кнопку ниже, чтобы создать таблицу и заполнить её 75 вопросами:</p>
+                <form method="POST">
+                    <button type="submit" style="padding: 10px 20px; background: #28a745; color: white; border: none; border-radius: 5px; font-size: 16px;">
+                        🚀 Создать и заполнить базу данных
+                    </button>
+                </form>
+                """
+        
+        return f'''
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>🛠️ Администрирование базы данных</title>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <style>
+                body {{ font-family: Arial, sans-serif; max-width: 800px; margin: 40px auto; padding: 20px; }}
+                h1 {{ color: #333; }}
+                .success {{ background: #d4edda; color: #155724; padding: 15px; border-radius: 8px; margin: 20px 0; }}
+                .warning {{ background: #fff3cd; color: #856404; padding: 15px; border-radius: 8px; margin: 20px 0; }}
+                .error {{ background: #f8d7da; color: #721c24; padding: 15px; border-radius: 8px; margin: 20px 0; }}
+                .info {{ background: #d1ecf1; color: #0c5460; padding: 15px; border-radius: 8px; margin: 20px 0; }}
+                .back-link {{ display: inline-block; margin-top: 20px; padding: 10px 15px; background: #6c757d; color: white; text-decoration: none; border-radius: 5px; }}
+                .back-link:hover {{ background: #545b62; }}
+            </style>
+        </head>
+        <body>
+            <h1>🛠️ Администрирование базы данных</h1>
+            {status_html}
+            <a href="/" class="back-link">← На главную</a>
+        </body>
+        </html>
+        '''
+    
+    # POST запрос - заполнение базы
+    try:
+        logger.info("🔄 Запуск ручного заполнения базы данных через веб-интерфейс")
+        result = fill_database_manual()
+        
+        if result.get('success'):
+            response_html = f"""
+            <div class="success">
+                <h3>✅ База данных успешно заполнена!</h3>
+                <p><strong>Добавлено вопросов:</strong> {result['stats']['inserted']} из {result['stats']['total_questions']}</p>
+                <p><strong>Всего в базе:</strong> {result['stats']['final_count']} записей</p>
+                <p><strong>Категорий:</strong> {result['stats']['categories']}</p>
+                <p><strong>Заполнение:</strong> {result['details']['completion']}</p>
+            </div>
+            """
+            
+            if result['stats'].get('errors', 0) > 0:
+                response_html += f"""
+                <div class="warning">
+                    <p><strong>⚠️ Было {result['stats']['errors']} ошибок при добавлении</strong></p>
+                </div>
+                """
+        else:
+            response_html = f"""
+            <div class="error">
+                <h3>❌ Ошибка при заполнении базы данных</h3>
+                <p><strong>Ошибка:</strong> {result.get('error', 'Неизвестная ошибка')}</p>
+            </div>
+            """
+        
+        return f'''
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>🛠️ Результат заполнения базы данных</title>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <style>
+                body {{ font-family: Arial, sans-serif; max-width: 800px; margin: 40px auto; padding: 20px; }}
+                .success {{ background: #d4edda; color: #155724; padding: 15px; border-radius: 8px; margin: 20px 0; }}
+                .warning {{ background: #fff3cd; color: #856404; padding: 15px; border-radius: 8px; margin: 20px 0; }}
+                .error {{ background: #f8d7da; color: #721c24; padding: 15px; border-radius: 8px; margin: 20px 0; }}
+                .back-link {{ display: inline-block; margin-top: 20px; padding: 10px 15px; background: #6c757d; color: white; text-decoration: none; border-radius: 5px; }}
+                .back-link:hover {{ background: #545b62; }}
+            </style>
+        </head>
+        <body>
+            <h1>🛠️ Результат заполнения базы данных</h1>
+            {response_html}
+            <div style="margin-top: 20px;">
+                <a href="/admin/fill-db" class="back-link">← Проверить статус</a>
+                <a href="/" class="back-link" style="margin-left: 10px;">На главную</a>
+            </div>
+        </body>
+        </html>
+        '''
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка в админском интерфейсе: {e}")
+        return f'''
+        <div class="error">
+            <h3>❌ Критическая ошибка</h3>
+            <p>{str(e)}</p>
+        </div>
+        ''', 500
+
+@app.route('/admin/db-status')
+def admin_db_status():
+    """API эндпоинт для проверки статуса базы данных (JSON)"""
+    return jsonify(check_database_status())
 
 @app.route('/set_webhook', methods=['GET', 'POST'])
 def set_webhook_endpoint():
@@ -543,3 +730,4 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
     logger.info(f"🌐 Запуск Flask сервера на порту {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
+[file content end]

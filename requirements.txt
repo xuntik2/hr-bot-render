@@ -1,7 +1,7 @@
 Flask==3.0.0
 python-telegram-bot==20.6
 python-dotenv==1.0.0
-psycopg2-binary==2.9.9
-sqlite3
-gunicorn==21.2.0
+psycopg==3.2.4  # ← ЗАМЕНИЛИ psycopg2-binary на psycopg (psycopg3)
 requests==2.31.0
+gunicorn==21.2.0
+# УДАЛИЛИ sqlite3 ← ЭТО БЫЛА ОШИБКА, она стандартная в Python

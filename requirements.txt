@@ -1,8 +1,9 @@
 Flask==3.0.0
-pyTelegramBotAPI
+python-telegram-bot==20.6
 python-dotenv==1.0.0
 psycopg==3.2.4
 requests==2.31.0
 gunicorn==21.2.0
+
 
 

@@ -5,6 +5,7 @@
 """
 import logging
 import os
+import traceback
 from config import config
 from faq_data import get_faq_data
 
@@ -100,12 +101,15 @@ def fill_database_manual():
         # Вставляем данные
         inserted = 0
         errors = 0
+        error_details = []
+        
+        placeholder = config.get_placeholder()
         
         for faq in faq_list:
             try:
-                sql = '''
+                sql = f'''
                 INSERT INTO faq (question, answer, keywords, norm_keywords, norm_question, category)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                VALUES ({placeholder}, {placeholder}, {placeholder}, {placeholder}, {placeholder}, {placeholder})
                 '''
                 cur.execute(sql, (
                     faq['question'],
@@ -118,7 +122,13 @@ def fill_database_manual():
                 inserted += 1
             except Exception as e:
                 errors += 1
-                logger.error(f"Ошибка при вставке вопроса: {e}")
+                error_msg = f"Ошибка при вставке вопроса '{faq['question'][:50]}...': {str(e)}"
+                logger.error(error_msg)
+                error_details.append({
+                    'question': faq['question'][:100],
+                    'error': str(e),
+                    'category': faq['category']
+                })
         
         conn.commit()
         
@@ -129,9 +139,28 @@ def fill_database_manual():
         cur.execute('SELECT COUNT(DISTINCT category) FROM faq')
         categories = cur.fetchone()[0]
         
+        cur.execute('SELECT category, COUNT(*) as count FROM faq GROUP BY category ORDER BY count DESC')
+        category_stats = cur.fetchall()
+        
         conn.close()
         
         completion = (final_count / 75 * 100) if 75 > 0 else 0
+        
+        # Логируем детальную статистику
+        logger.info(f"📊 Статистика заполнения БД:")
+        logger.info(f"  - Всего вопросов: {total_questions}")
+        logger.info(f"  - Успешно вставлено: {inserted}")
+        logger.info(f"  - Ошибок: {errors}")
+        logger.info(f"  - Итоговое количество: {final_count}")
+        logger.info(f"  - Категорий: {categories}")
+        
+        for category, count in category_stats:
+            logger.info(f"  - {category}: {count} вопросов")
+        
+        if errors > 0:
+            logger.warning(f"⚠️ Было {errors} ошибок при добавлении:")
+            for err in error_details[:5]:  # Показываем только первые 5 ошибок
+                logger.warning(f"   - {err['question']} ({err['category']}): {err['error']}")
         
         return {
             'success': True,
@@ -141,17 +170,21 @@ def fill_database_manual():
                 'errors': errors,
                 'final_count': final_count,
                 'categories': categories,
-                'count_before': count_before
+                'count_before': count_before,
+                'category_stats': dict(category_stats)
             },
             'details': {
                 'completion': f"{completion:.1f}%",
-                'status': 'full' if final_count >= 75 else 'partial'
+                'status': 'full' if final_count >= 75 else 'partial',
+                'error_details': error_details if errors > 0 else []
             }
         }
         
     except Exception as e:
         logger.error(f"Ошибка при заполнении базы данных: {e}")
+        logger.error(traceback.format_exc())
         return {
             'success': False,
-            'error': str(e)
+            'error': str(e),
+            'traceback': traceback.format_exc()
         }

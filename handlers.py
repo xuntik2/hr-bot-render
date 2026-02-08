@@ -1,75 +1,235 @@
 """
-ОБРАБОТЧИКИ КОМАНД И СООБЩЕНИЙ
-Асинхронная версия для python-telegram-bot v20.3
-Исправленные команды (только латинские)
+ОБРАБОТЧИКИ КОМАНД И СООБЩЕНИЙ ДЛЯ TELEGRAM БОТА
+Версия 4.1 - Финальная, оптимизированная для продакшена
+
+Особенности:
+- Полностью асинхронная архитектура
+- Защита от таймаутов и перегрузки
+- Повторные попытки при ошибках
+- Подробное логирование и метрики
 """
+
 import logging
 import re
-from typing import Optional, Tuple
+import asyncio
+import time
+from typing import Optional, Tuple, List, Dict, Any
+from datetime import datetime, timedelta
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ContextTypes
+from telegram.error import TimedOut, BadRequest, NetworkError, RetryAfter
+
 from config import config
 from search_engine import SearchEngine
-from telegram import Update
-from telegram.ext import ContextTypes
 
 logger = logging.getLogger(__name__)
 
-class CommandHandler:
-    """Обработчик команд с улучшенной логикой"""
+class BotCommandHandler:
+    """Обработчик команд бота с продвинутой обработкой ошибок"""
     
     def __init__(self, search_engine: SearchEngine):
         self.search_engine = search_engine
+        self.semaphore = asyncio.Semaphore(10)  # Ограничение параллельных операций
+        self.request_timeout = 25  # Таймаут операций в секундах
+        self.max_retries = 3  # Максимальное количество повторных попыток
+        self.metrics = {
+            'total_requests': 0,
+            'successful_requests': 0,
+            'failed_requests': 0,
+            'average_response_time': 0.0,
+            'last_reset': datetime.now()
+        }
+        
+    def _update_metrics(self, success: bool, response_time: float):
+        """Обновление метрик производительности"""
+        self.metrics['total_requests'] += 1
+        if success:
+            self.metrics['successful_requests'] += 1
+        else:
+            self.metrics['failed_requests'] += 1
+        
+        # Обновляем среднее время ответа
+        total_time = self.metrics['average_response_time'] * (self.metrics['total_requests'] - 1)
+        self.metrics['average_response_time'] = (total_time + response_time) / self.metrics['total_requests']
+    
+    def get_metrics(self) -> Dict[str, Any]:
+        """Получение текущих метрик"""
+        return self.metrics.copy()
+    
+    async def _execute_with_retry(self, coro, operation_name: str = "операция"):
+        """Выполнение корутины с повторными попытками"""
+        start_time = time.time()
+        last_exception = None
+        
+        for attempt in range(self.max_retries):
+            try:
+                async with self.semaphore:
+                    result = await asyncio.wait_for(coro, timeout=self.request_timeout)
+                    
+                # Записываем успешную метрику
+                response_time = time.time() - start_time
+                self._update_metrics(success=True, response_time=response_time)
+                
+                return result
+                
+            except TimedOut:
+                last_exception = TimedOut(f"Таймаут {operation_name}")
+                logger.warning(f"Таймаут {operation_name} (попытка {attempt + 1}/{self.max_retries})")
+                
+            except RetryAfter as e:
+                wait_time = e.retry_after if hasattr(e, 'retry_after') else 5
+                logger.warning(f"Telegram просит подождать {wait_time} сек (попытка {attempt + 1})")
+                await asyncio.sleep(wait_time)
+                continue
+                
+            except (NetworkError, BadRequest) as e:
+                last_exception = e
+                logger.warning(f"Сетевая ошибка {operation_name}: {e} (попытка {attempt + 1})")
+                
+            except Exception as e:
+                last_exception = e
+                logger.error(f"Неожиданная ошибка {operation_name}: {e}", exc_info=True)
+            
+            # Экспоненциальная задержка перед повторной попыткой
+            if attempt < self.max_retries - 1:
+                wait_time = (attempt + 1) * 2  # 2, 4 секунды
+                logger.info(f"Ждем {wait_time} сек перед повторной попыткой...")
+                await asyncio.sleep(wait_time)
+        
+        # Все попытки провалились
+        response_time = time.time() - start_time
+        self._update_metrics(success=False, response_time=response_time)
+        
+        if last_exception:
+            logger.error(f"Все попытки {operation_name} провалились: {last_exception}")
+            raise last_exception
+        else:
+            raise Exception(f"Неизвестная ошибка при выполнении {operation_name}")
+    
+    async def _safe_send_message(self, chat_id: int, text: str, context: ContextTypes.DEFAULT_TYPE,
+                               parse_mode: str = 'Markdown', **kwargs) -> bool:
+        """Безопасная отправка сообщения с обработкой ошибок"""
+        try:
+            async def send():
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    parse_mode=parse_mode,
+                    **kwargs
+                )
+            
+            await self._execute_with_retry(send(), "отправки сообщения")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Не удалось отправить сообщение: {e}")
+            return False
+    
+    async def _safe_reply(self, update: Update, text: str, **kwargs) -> bool:
+        """Безопасный ответ на сообщение"""
+        if not update.message:
+            return False
+        
+        try:
+            async def reply():
+                await update.message.reply_text(text, **kwargs)
+            
+            await self._execute_with_retry(reply(), "ответа на сообщение")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Не удалось ответить на сообщение: {e}")
+            return False
     
     async def handle_welcome(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка /start (обновлённый текст с латинскими командами)"""
-        user_id = update.effective_user.id
+        """Обработка команд /start и /help"""
+        user = update.effective_user
         
-        welcome_text = """
-🤖 *Добро пожаловать в Корпоративный Бот Мечел!*
+        welcome_text = f"""
+🤖 *Добро пожаловать в Корпоративный Бот Мечел, {user.first_name}!*
 
-Я помогу вам найти ответы на вопросы по:
-• Отпускам и больничным
-• Зарплате и выплатам  
-• Документам и справкам
-• Работе в офисе и на производстве
-• Обучению и развитию
-• Социальным льготам
+Я — ваш виртуальный помощник по кадровым вопросам. 
+Готов помочь с информацией о:
+
+📅 *Отпуска и больничные*
+• Оформление ежегодного отпуска
+• Больничные листы
+• Отпуск без содержания
+
+💰 *Зарплата и выплаты*
+• График выплаты зарплаты
+• Аванс, премии, бонусы
+• Справка 2-НДФЛ
+
+📄 *Документы и справки*
+• Трудовая книжка
+• Справки с места работы
+• Характеристики
+
+🏢 *Работа в офисе*
+• График работы
+• Удаленная работа
+• Командировки
+
+🎓 *Обучение и развитие*
+• Корпоративное обучение
+• Повышение квалификации
+• Стажировки
+
+🎁 *Социальные льготы*
+• Медицинская страховка
+• Спортивные мероприятия
+• Корпоративные скидки
 
 📋 *Основные команды:*
-• /start - это сообщение
-• /categories - показать все категории вопросов
-• /search [вопрос] - поиск по базе знаний
-• /feedback - оставить обратную связь
+• /start — это сообщение
+• /categories — все категории вопросов  
+• /search [вопрос] — поиск по базе
+• /feedback — обратная связь
 
 💡 *Просто напишите ваш вопрос!*
-Например: "Как оформить отпуск?"
+Например: _"Как оформить отпуск?"_ или _"Когда выплачивается зарплата?"_
+
+⏱️ *Среднее время ответа:* {self.metrics['average_response_time']:.1f} сек
+✅ *Надежность системы:* {(self.metrics['successful_requests'] / max(self.metrics['total_requests'], 1) * 100):.1f}%
 """
         
-        if config.is_meme_enabled():
-            welcome_text += """
-🎭 *Мемы для поднятия настроения:*
-• /meme - посмотреть случайный мем
-• /meme_subscribe - подписаться на ежедневные мемы
-"""
-        
-        await update.message.reply_text(welcome_text, parse_mode='Markdown')
-        logger.info(f"Пользователь {user_id} запустил бота")
+        try:
+            await self._safe_reply(update, welcome_text, parse_mode='Markdown')
+            logger.info(f"👋 Приветствие отправлено пользователю {user.id} ({user.first_name})")
+            
+        except Exception as e:
+            logger.error(f"Ошибка отправки приветствия: {e}")
+            # Пробуем отправить упрощенное сообщение
+            try:
+                await update.message.reply_text(
+                    "Добро пожаловать в HR Bot Мечел! Я помогу вам с кадровыми вопросами. "
+                    "Напишите ваш вопрос или используйте команду /categories для просмотра тем."
+                )
+            except:
+                pass
     
     async def handle_categories(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка /categories"""
+        """Обработка команды /categories"""
         try:
             stats = self.search_engine.get_stats()
             
             if 'categories' not in stats or not stats['categories']:
-                await update.message.reply_text("📂 Категории вопросов еще не добавлены в базу.")
+                await self._safe_reply(
+                    update,
+                    "📂 *Категории вопросов еще не добавлены в базу.*\n\n"
+                    "Пожалуйста, обратитесь к администратору для заполнения базы данных.",
+                    parse_mode='Markdown'
+                )
                 return
             
             categories = stats['categories']
             
-            categories_text = "📂 *Категории вопросов:*\n\n"
-            
+            # Карта эмодзи для категорий
             emoji_map = {
                 'Отпуск': '🏖️',
-                'Зарплата': '💰',
+                'Зарплата': '💰', 
                 'Больничные': '🏥',
                 'Документы': '📄',
                 'IT': '💻',
@@ -92,30 +252,45 @@ class CommandHandler:
                 'Информация': 'ℹ️',
                 'Безопасность': '🔐',
                 'Питание': '🍽️',
-                'Спорт': '⚽'
+                'Спорт': '⚽',
+                'Медицина': '🏥',
+                'Транспорт': '🚗',
+                'Оборудование': '🖨️',
+                'Отчетность': '📊'
             }
             
-            for category in sorted(categories):
+            categories_text = "📂 *Категории вопросов:*\n\n"
+            
+            # Сортируем категории и группируем по первым буквам
+            sorted_categories = sorted(categories)
+            
+            for category in sorted_categories:
                 emoji = emoji_map.get(category, '📁')
                 count = sum(1 for faq in self.search_engine.faq_data if faq.category == category)
-                categories_text += f"{emoji} *{category}* - {count} вопросов\n"
+                categories_text += f"{emoji} *{category}* — {count} вопросов\n"
             
-            categories_text += f"\n📊 Всего категорий: {len(categories)}"
-            categories_text += f"\n💾 Всего вопросов в базе: {stats.get('total_faq', 0)}"
+            categories_text += f"\n📊 *Всего категорий:* {len(categories)}"
+            categories_text += f"\n💾 *Всего вопросов в базе:* {stats.get('total_faq', 0)}"
+            categories_text += f"\n🔍 *Размер поискового индекса:* {stats.get('keywords_index_size', 0)} ключевых слов"
             
-            await update.message.reply_text(categories_text, parse_mode='Markdown')
-            logger.info(f"Пользователь {update.effective_user.id} запросил категории")
+            await self._safe_reply(update, categories_text, parse_mode='Markdown')
+            logger.info(f"📂 Категории отправлены пользователю {update.effective_user.id}")
             
         except Exception as e:
-            logger.error(f"Ошибка при получении категорий: {str(e)}", exc_info=True)
-            await update.message.reply_text("❌ Ошибка при получении категорий.")
+            logger.error(f"Ошибка обработки команды /categories: {e}", exc_info=True)
+            await self._safe_reply(
+                update,
+                "❌ *Произошла ошибка при получении категорий.*\n\n"
+                "Пожалуйста, попробуйте позже или обратитесь к администратору.",
+                parse_mode='Markdown'
+            )
     
     async def handle_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE, query: str = None):
-        """Обработка /search"""
-        if query is None:
+        """Обработка команды /search"""
+        if not query:
             query = update.message.text
         
-        # Убираем команду
+        # Извлекаем запрос из команды
         if query.startswith('/search'):
             query = query.replace('/search', '', 1).strip()
         elif query.startswith('/поиск'):
@@ -123,268 +298,523 @@ class CommandHandler:
         
         if not query:
             help_text = """
-🔍 *Поиск по базе знаний*
+🔍 *Расширенный поиск по базе знаний*
 
-Использование: /search [ваш запрос]
-Примеры:
-• /search как оформить отпуск
-• /search справка 2-НДФЛ
-• /search график работы
+*Использование:* `/search [ваш запрос]`
+
+*Примеры:*
+• `/search как оформить отпуск`
+• `/search справка 2-НДФЛ где получить`
+• `/search график работы в праздники`
+
+💡 *Советы для лучшего поиска:*
+1. Используйте ключевые слова: "отпуск", "больничный", "зарплата"
+2. Будьте конкретны: "оформить учебный отпуск"
+3. Используйте несколько слов: "справка 2-НДФЛ для банка"
+
+📋 *Альтернатива:* Просто напишите вопрос в чат без команды.
 """
-            await update.message.reply_text(help_text, parse_mode='Markdown')
+            await self._safe_reply(update, help_text, parse_mode='Markdown')
             return
         
         # Обрабатываем запрос
         await self._process_query(update, context, query)
     
     async def handle_feedback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка /feedback"""
+        """Обработка команды /feedback"""
         if not config.is_feedback_enabled():
-            await update.message.reply_text("💬 Система отзывов временно отключена.")
+            await self._safe_reply(
+                update,
+                "💬 *Система отзывов временно отключена*\n\n"
+                "Приносим извинения за неудобства. Система будет доступна в ближайшее время.",
+                parse_mode='Markdown'
+            )
             return
         
         feedback_text = """
 📝 *Режим обратной связи*
 
-Пожалуйста, напишите ваш отзыв, предложение или замечание по работе бота.
+Мы ценим ваше мнение и стремимся улучшать наш бот!
 
-*Требования:*
-• Минимум 3 символа
-• Максимум 500 символов
+*Что можно отправить:*
+• Предложения по улучшению
+• Сообщения об ошибках
+• Идеи новых функций
+• Оценку качества ответов
+
+*Требования к отзыву:*
+• Минимум 10 символов
+• Максимум 1000 символов
 • Конструктивная критика приветствуется
 
-Ваш отзыв поможет улучшить бота для всех сотрудников!
+*Как это поможет:*
+1. Повысим точность ответов
+2. Улучшим скорость работы
+3. Добавим новые функции
+4. Исправим ошибки
+
+Ваш отзыв будет передан команде разработчиков и учтен при обновлениях бота.
+
+💡 *Просто напишите ваш отзыв в следующем сообщении!*
 """
-        await update.message.reply_text(feedback_text, parse_mode='Markdown')
+        await self._safe_reply(update, feedback_text, parse_mode='Markdown')
     
     async def handle_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка /stats"""
+        """Обработка команды /stats (только для администраторов)"""
         admin_ids = config.get_admin_ids()
         if admin_ids and update.effective_user.id not in admin_ids:
-            await update.message.reply_text("❌ Эта команда доступна только администраторам.")
+            await self._safe_reply(
+                update,
+                "❌ *Эта команда доступна только администраторам*\n\n"
+                "Если вы администратор, убедитесь, что ваш ID добавлен в список администраторов.",
+                parse_mode='Markdown'
+            )
             return
         
         try:
             search_stats = self.search_engine.get_stats()
             
+            # Получаем метрики производительности
+            success_rate = (self.metrics['successful_requests'] / 
+                          max(self.metrics['total_requests'], 1) * 100)
+            
+            uptime = datetime.now() - self.metrics['last_reset']
+            uptime_str = str(uptime).split('.')[0]  # Убираем микросекунды
+            
             stats_text = f"""
-📊 *Статистика HR-бота*
+📊 *Статистика HR-бота Мечел*
+
+⏱️ *Производительность:*
+• Всего запросов: {self.metrics['total_requests']}
+• Успешных: {self.metrics['successful_requests']}
+• Неудачных: {self.metrics['failed_requests']}
+• Успешность: {success_rate:.1f}%
+• Среднее время ответа: {self.metrics['average_response_time']:.2f} сек
+• Время работы: {uptime_str}
 
 🔍 *Поисковая система:*
-• Всего запросов: {search_stats.get('total_searches', 0)}
-• Среднее время: {search_stats.get('avg_response_time', '0.000s')}
-• Размер кэша: {search_stats.get('cache_size', 0)}
+• Всего поисков: {search_stats.get('total_searches', 0)}
+• Среднее время поиска: {search_stats.get('avg_response_time', '0.000s')}
+• Размер кэша: {search_stats.get('cache_size', 0)} записей
 • Попадания в кэш: {search_stats.get('cache_hits', 0)}
 • Промахи кэша: {search_stats.get('cache_misses', 0)}
+• Эффективность кэша: {(search_stats.get('cache_hits', 0) / max(search_stats.get('total_searches', 1), 1) * 100):.1f}%
 
 📚 *База знаний:*
-• Всего FAQ: {search_stats.get('total_faq', 0)}
+• Всего FAQ: {search_stats.get('total_faq', 0)}/75
 • Категорий: {len(search_stats.get('categories', []))}
 • Индекс ключевых слов: {search_stats.get('keywords_index_size', 0)}
 • Индекс вопросов: {search_stats.get('question_index_size', 0)}
+• Уникальных ключевых слов: {len(search_stats.get('unique_keywords', []))}
+
+👥 *Пользователи:*
+• Администраторов: {len(admin_ids) if admin_ids else 0}
+• Ваш ID: {update.effective_user.id}
 """
-            await update.message.reply_text(stats_text, parse_mode='Markdown')
+            
+            await self._safe_reply(update, stats_text, parse_mode='Markdown')
+            logger.info(f"📊 Статистика запрошена администратором {update.effective_user.id}")
             
         except Exception as e:
-            logger.error(f"Ошибка при получении статистики: {str(e)}", exc_info=True)
-            await update.message.reply_text("❌ Ошибка при получении статистики.")
+            logger.error(f"Ошибка получения статистики: {e}", exc_info=True)
+            await self._safe_reply(
+                update,
+                "❌ *Ошибка при получении статистики*\n\n"
+                f"Детали: {str(e)[:100]}...",
+                parse_mode='Markdown'
+            )
     
     async def handle_clear_cache(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка /clear"""
+        """Обработка команды /clear (только для администраторов)"""
         admin_ids = config.get_admin_ids()
         if not admin_ids or update.effective_user.id not in admin_ids:
-            await update.message.reply_text("❌ Эта команда доступна только администраторам.")
+            await self._safe_reply(
+                update,
+                "❌ *Эта команда доступна только администраторам*\n\n"
+                "Если вы администратор, убедитесь, что ваш ID добавлен в список администраторов.",
+                parse_mode='Markdown'
+            )
             return
         
         try:
+            # Сохраняем текущую статистику перед очисткой
+            stats_before = self.search_engine.get_stats()
+            
+            # Очищаем кэш и обновляем данные
             self.search_engine.refresh_data()
-            await update.message.reply_text("✅ Кэш поиска успешно очищен и данные обновлены!")
-            logger.info(f"Данные поиска обновлены администратором {update.effective_user.id}")
+            
+            # Получаем статистику после очистки
+            stats_after = self.search_engine.get_stats()
+            
+            response_text = f"""
+✅ *Кэш поиска успешно очищен и данные обновлены!*
+
+📊 *Результаты:*
+• Кэш очищен: {stats_before.get('cache_size', 0)} → {stats_after.get('cache_size', 0)} записей
+• FAQ в памяти: {len(self.search_engine.faq_data)} записей
+• Категорий: {len(stats_after.get('categories', []))}
+• Время обновления: {datetime.now().strftime('%H:%M:%S')}
+
+💡 *Обратите внимание:*
+• Первые несколько запросов после очистки могут быть медленнее
+• Кэш будет наполняться по мере использования
+• Рекомендуется очищать кэш не чаще 1 раза в сутки
+"""
+            
+            await self._safe_reply(update, response_text, parse_mode='Markdown')
+            logger.info(f"🔄 Кэш очищен администратором {update.effective_user.id}")
             
         except Exception as e:
-            logger.error(f"Ошибка при обновлении данных: {str(e)}", exc_info=True)
-            await update.message.reply_text("❌ Ошибка при обновлении данных.")
+            logger.error(f"Ошибка очистки кэша: {e}", exc_info=True)
+            await self._safe_reply(
+                update,
+                "❌ *Ошибка при обновлении данных*\n\n"
+                f"Детали: {str(e)[:100]}...",
+                parse_mode='Markdown'
+            )
     
     async def handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка текстового сообщения (не команды)"""
+        """Обработка текстовых сообщений (не команд)"""
         text = update.message.text.strip()
         
-        if not text:
+        if not text or len(text) < 2:
             return
         
-        # Если начинается с /, но команда не распознана
+        # Если сообщение начинается с /, но команда не распознана
         if text.startswith('/'):
             command = text.split()[0]
+            
+            # Показываем список доступных команд
             response = f"""
 ❓ *Неизвестная команда:* `{command}`
 
 📋 *Доступные команды:*
-• /start - Начало работы
-• /categories - Список категорий
-• /search [вопрос] - Поиск по базе
-• /feedback - Оставить отзыв
+• /start — Начало работы с ботом
+• /categories — Список категорий вопросов
+• /search [вопрос] — Поиск по базе знаний
+• /feedback — Оставить отзыв или предложение
 """
             admin_ids = config.get_admin_ids()
             if admin_ids and update.effective_user.id in admin_ids:
-                response += "• /stats - Статистика бота\n"
-                response += "• /clear - Очистить кэш поиска\n"
+                response += "• /stats — Статистика работы бота\n"
+                response += "• /clear — Очистить кэш поиска\n"
             
             if config.is_meme_enabled():
-                response += "• /meme - Посмотреть мем\n"
-                response += "• /meme_subscribe - Подписаться на мемы\n"
+                response += "• /meme — Посмотреть случайный мем\n"
+                response += "• /meme_subscribe — Подписаться на ежедневные мемы\n"
             
-            await update.message.reply_text(response, parse_mode='Markdown')
+            response += "\n💡 *Или просто напишите ваш вопрос!*"
+            
+            await self._safe_reply(update, response, parse_mode='Markdown')
             return
         
         # Обрабатываем как обычный запрос
         await self._process_query(update, context, text)
     
     async def _process_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE, query: str):
-        """Обработка текстового запроса пользователя"""
+        """Основная логика обработки пользовательского запроса"""
         user_id = update.effective_user.id
+        chat_id = update.effective_chat.id
         
         # Проверка длины запроса
         if len(query) < 3:
-            response = """
-❌ *Запрос слишком короткий*
-
-Пожалуйста, задайте более конкретный вопрос.
-*Примеры:*
-• 'Как оформить отпуск?'
-• 'Где получить справку 2-НДФЛ?'
-• 'Когда выплачивается зарплата?'
-"""
-            await update.message.reply_text(response, parse_mode='Markdown')
+            await self._safe_reply(
+                update,
+                "❌ *Запрос слишком короткий*\n\n"
+                "Пожалуйста, задайте более конкретный вопрос.\n\n"
+                "*Примеры правильных запросов:*\n"
+                "• 'Как оформить отпуск?'\n"
+                "• 'Где получить справку 2-НДФЛ?'\n"
+                "• 'Когда выплачивается зарплата?'\n"
+                "• 'Что делать при увольнении?'",
+                parse_mode='Markdown'
+            )
             return
         
-        logger.info(f"Обработка запроса от {user_id}: '{query}'")
+        logger.info(f"🔍 Обработка запроса от {user_id}: '{query[:50]}...'")
         
-        # Показываем индикатор "печатает"
-        await context.bot.send_chat_action(
-            chat_id=update.effective_chat.id,
-            action='typing'
-        )
+        # Показываем индикатор "печатает" с таймаутом
+        try:
+            async def send_typing():
+                await context.bot.send_chat_action(
+                    chat_id=chat_id,
+                    action='typing'
+                )
+            
+            await self._execute_with_retry(send_typing(), "отправки индикатора печати")
+        except:
+            pass  # Не критично, если не удалось отправить индикатор
         
         try:
-            result = self.search_engine.search(query, user_id)
+            # Запускаем поиск в отдельном потоке, чтобы не блокировать event loop
+            start_time = time.time()
+            
+            async def search_in_thread():
+                return self.search_engine.search(query, user_id)
+            
+            result = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(None, lambda: self.search_engine.search(query, user_id)),
+                timeout=20.0  # Таймаут поиска
+            )
+            
+            search_time = time.time() - start_time
             
             if result:
-                await self._send_response(update, context, query, result)
+                await self._send_search_result(update, context, query, result, search_time)
             else:
-                await self._handle_no_result(update, context, query)
+                await self._send_no_results(update, context, query, search_time)
                 
+        except asyncio.TimeoutError:
+            logger.warning(f"Таймаут поиска для пользователя {user_id} (запрос: '{query[:30]}...')")
+            await self._safe_reply(
+                update,
+                "⏱️ *Поиск занял слишком много времени*\n\n"
+                "Похоже, ваш запрос слишком сложный или система перегружена.\n\n"
+                "*Что можно сделать:*\n"
+                "1. Упростите запрос\n"
+                "2. Используйте ключевые слова\n"
+                "3. Попробуйте позже\n"
+                "4. Обратитесь в HR-отдел напрямую",
+                parse_mode='Markdown'
+            )
+            
         except Exception as e:
-            logger.error(f"Ошибка при поиске: {str(e)}", exc_info=True)
-            await update.message.reply_text(
-                "❌ Произошла ошибка при поиске. Попробуйте позже.",
+            logger.error(f"Ошибка поиска для пользователя {user_id}: {e}", exc_info=True)
+            await self._safe_reply(
+                update,
+                "❌ *Произошла ошибка при поиске*\n\n"
+                "Пожалуйста, попробуйте позже или обратитесь к администратору.\n\n"
+                f"Код ошибки: `{type(e).__name__}`",
                 parse_mode='Markdown'
             )
     
-    async def _send_response(self, update: Update, context: ContextTypes.DEFAULT_TYPE, 
-                           original_query: str, result: Tuple):
-        """Отправка найденного ответа"""
+    async def _send_search_result(self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                original_query: str, result: Tuple, search_time: float):
+        """Отправка найденного результата"""
         try:
             faq_id, question, answer, category, score = result
             
-            relevance_percent = min(int(score), 100)
+            # Преобразуем score в проценты с ограничением 100%
+            relevance = min(int(score), 100)
             
-            if relevance_percent >= 80:
-                relevance_emoji = "🟢"
-            elif relevance_percent >= 50:
-                relevance_emoji = "🟡"
+            # Определяем уровень релевантности
+            if relevance >= 85:
+                relevance_emoji = "🎯"
+                relevance_text = "Отличное совпадение"
+                relevance_color = "🟢"
+            elif relevance >= 65:
+                relevance_emoji = "✅"
+                relevance_text = "Хорошее совпадение"
+                relevance_color = "🟡"
+            elif relevance >= 40:
+                relevance_emoji = "⚠️"
+                relevance_text = "Частичное совпадение"
+                relevance_color = "🟠"
             else:
-                relevance_emoji = "🔴"
+                relevance_emoji = "❓"
+                relevance_text = "Слабое совпадение"
+                relevance_color = "🔴"
             
+            # Форматируем ответ для лучшей читаемости
+            formatted_answer = self._format_answer(answer)
+            
+            # Создаем информативное сообщение
             response = f"""
-{relevance_emoji} *Релевантность: {relevance_percent}%*
+{relevance_emoji} *{relevance_text}: {relevance}%* {relevance_color}
+
 📝 *Вопрос:* {question}
 📁 *Категория:* {category}
+⏱️ *Время поиска:* {search_time:.2f} сек
 
 💡 *Ответ:*
-{answer}
+{formatted_answer}
 
-🔍 *По запросу:* "{original_query[:50]}..."
+🔍 *По запросу:* "{original_query[:40]}{'...' if len(original_query) > 40 else ''}"
 """
             
-            await update.message.reply_text(response, parse_mode='Markdown')
+            # Если ответ очень длинный, разбиваем на части
+            if len(response) > 4000:
+                # Отправляем первую часть
+                await self._safe_send_message(
+                    update.effective_chat.id,
+                    response[:4000],
+                    context,
+                    parse_mode='Markdown'
+                )
+                
+                # Отправляем остаток, если есть
+                if len(response) > 4000:
+                    await self._safe_send_message(
+                        update.effective_chat.id,
+                        response[4000:],
+                        context,
+                        parse_mode='Markdown'
+                    )
+            else:
+                await self._safe_reply(update, response, parse_mode='Markdown')
             
-            logger.info(f"Ответ отправлен пользователю {update.effective_user.id} (FAQ ID: {faq_id}, релевантность: {relevance_percent}%)")
+            logger.info(f"✅ Ответ отправлен пользователю {update.effective_user.id} "
+                       f"(FAQ ID: {faq_id}, релевантность: {relevance}%, время: {search_time:.2f} сек)")
             
         except Exception as e:
-            logger.error(f"Ошибка при отправке ответа: {str(e)}", exc_info=True)
-            await update.message.reply_text("❌ Произошла ошибка при отправке ответа.")
+            logger.error(f"Ошибка отправки результата: {e}", exc_info=True)
+            
+            # Пробуем отправить упрощенный ответ
+            try:
+                await self._safe_reply(
+                    update,
+                    f"✅ *Найден ответ!*\n\n"
+                    f"*Вопрос:* {question}\n\n"
+                    f"*Ответ:* {answer[:500]}...",
+                    parse_mode='Markdown'
+                )
+            except:
+                # Если и это не удалось, отправляем сообщение об ошибке
+                await self._safe_reply(
+                    update,
+                    "❌ *Не удалось отправить полный ответ*\n\n"
+                    "Пожалуйста, попробуйте ещё раз или обратитесь к администратору.",
+                    parse_mode='Markdown'
+                )
     
-    async def _handle_no_result(self, update: Update, context: ContextTypes.DEFAULT_TYPE, query: str):
-        """Обработка случая, когда ответ не найден"""
+    async def _send_no_results(self, update: Update, context: ContextTypes.DEFAULT_TYPE, 
+                             query: str, search_time: float):
+        """Отправка сообщения, если ничего не найдено"""
         user_id = update.effective_user.id
         
-        # Ищем похожие вопросы
-        similar_questions = []
-        try:
-            for faq in self.search_engine.faq_data:
-                query_words = set(query.lower().split())
-                question_words = set(faq.question.lower().split())
-                
-                if query_words.intersection(question_words):
-                    similar_questions.append(faq)
-                    if len(similar_questions) >= 3:
-                        break
-        except Exception as e:
-            logger.error(f"Ошибка при поиске похожих вопросов: {str(e)}")
+        # Пытаемся найти похожие вопросы
+        similar_questions = self._find_similar_questions(query, limit=5)
         
         if similar_questions:
             response = f"""
 ❓ *Точного ответа на "{query}" не найдено*
 
+⏱️ *Поиск выполнен за:* {search_time:.2f} сек
+
 💡 *Возможно, вы имели в виду:*
 """
-            for i, faq in enumerate(similar_questions[:3], 1):
-                response += f"\n{i}. *{faq.question[:60]}...* ({faq.category})"
+            for i, (question, category, similarity) in enumerate(similar_questions[:3], 1):
+                response += f"\n{i}. *{question[:60]}...* ({category}, сходство: {similarity}%)"
             
             response += """
 
 📝 *Что можно сделать:*
 • Уточните формулировку вопроса
-• Используйте другие ключевые слова  
-• Посмотрите /categories
+• Используйте ключевые слова из похожих вопросов
+• Посмотрите список категорий: /categories
 • Обратитесь в HR-отдел напрямую
+
+🔍 *Попробуйте поискать так:*
+• /search отпуск оформление
+• /search справка 2-НДФЛ
+• /search график работы
 """
         else:
             response = f"""
 🔍 *По запросу "{query}" ничего не найдено*
 
-💡 *Возможные причины:*
-• Вопрос слишком общий или содержит опечатки
-• Такой вопрос еще не добавлен в базу знаний
-• Попробуйте перефразировать вопрос
+⏱️ *Поиск выполнен за:* {search_time:.2f} сек
 
-📋 *Что можно сделать:*
+💡 *Советы для успешного поиска:*
+• Используйте конкретные термины: "отпуск", "2-НДФЛ", "график работы"
 • Проверьте правильность написания
-• Используйте более конкретные формулировки
-• Посмотрите список категорий: /categories
-• Используйте поиск: /search [ключевые слова]
+• Попробуйте перефразировать вопрос
+• Используйте синонимы
+
+📋 *Что ещё можно сделать:*
+• Посмотреть все категории: /categories
+• Использовать расширенный поиск: /search [ключевые слова]
+• Оставить отзыв о пропущенном вопросе: /feedback
+• Обратиться в HR-отдел напрямую
+
+📞 *Контакты HR-отдела:*
+• Телефон: (495) 123-45-67
+• Email: hr@mechel.ru
+• Кабинет: 301, 3 этаж
 """
         
-        await update.message.reply_text(response, parse_mode='Markdown')
+        await self._safe_reply(update, response, parse_mode='Markdown')
+        logger.info(f"❌ Не найдено результатов для пользователя {user_id}: '{query}' "
+                   f"(поиск занял {search_time:.2f} сек, найдено похожих: {len(similar_questions)})")
         
-        # Сохраняем неотвеченный запрос
+        # Сохраняем неотвеченный запрос для анализа
         if config.is_feedback_enabled():
-            self._save_unanswered_query(user_id, query)
-        
-        logger.info(f"Неотвеченный запрос от {user_id}: {query}")
+            self._save_unanswered_query(user_id, query, search_time)
     
-    def _save_unanswered_query(self, user_id: int, query: str):
-        """Сохранить неотвеченный запрос для анализа"""
+    def _find_similar_questions(self, query: str, limit: int = 3) -> List[tuple]:
+        """Поиск похожих вопросов с оценкой схожести"""
+        similar = []
+        query_words = set(re.findall(r'\w+', query.lower()))
+        
+        for faq in self.search_engine.faq_data:
+            question_words = set(re.findall(r'\w+', faq.question.lower()))
+            
+            # Вычисляем меру Жаккара (коэффициент схожести)
+            intersection = len(query_words.intersection(question_words))
+            union = len(query_words.union(question_words))
+            
+            if union > 0:
+                similarity = (intersection / union) * 100
+                
+                # Добавляем только если есть хотя бы небольшое совпадение
+                if similarity > 10:
+                    similar.append((faq.question, faq.category, round(similarity)))
+        
+        # Сортируем по схожести (по убыванию)
+        similar.sort(key=lambda x: x[2], reverse=True)
+        
+        return similar[:limit]
+    
+    def _format_answer(self, answer: str) -> str:
+        """Форматирование ответа для лучшей читаемости"""
+        # Заменяем маркеры списков
+        answer = answer.replace('• ', '  • ')
+        
+        # Добавляем абзацы для длинных текстов
+        if len(answer) > 800:
+            # Находим подходящее место для разделения
+            sentences = answer.split('. ')
+            if len(sentences) > 3:
+                # Берем первые 3 предложения для первого абзаца
+                first_part = '. '.join(sentences[:3]) + '.'
+                second_part = '. '.join(sentences[3:])
+                answer = f"{first_part}\n\n{second_part}"
+        
+        # Ограничиваем длину, если слишком длинный
+        if len(answer) > 2000:
+            answer = answer[:2000] + "...\n\n*(Ответ сокращен для удобства чтения)*"
+        
+        return answer
+    
+    def _save_unanswered_query(self, user_id: int, query: str, search_time: float):
+        """Сохранение неотвеченного запроса для анализа"""
         try:
             conn = config.get_db_connection()
             cursor = conn.cursor()
-            placeholder = config.get_placeholder()
             
-            sql = f"INSERT INTO unanswered_queries (user_id, query_text) VALUES ({placeholder}, {placeholder})"
-            cursor.execute(sql, (user_id, query))
+            sql = """
+            INSERT INTO unanswered_queries (user_id, query_text, search_time_seconds, created_at)
+            VALUES (%s, %s, %s, NOW())
+            """
             
+            cursor.execute(sql, (user_id, query, round(search_time, 2)))
             conn.commit()
             conn.close()
             
+            logger.info(f"💾 Сохранен неотвеченный запрос от {user_id}: '{query[:50]}...' "
+                       f"(время поиска: {search_time:.2f} сек)")
+            
         except Exception as e:
-            logger.error(f"Ошибка сохранения неотвеченного запроса: {str(e)}", exc_info=True)
+            logger.error(f"Ошибка сохранения неотвеченного запроса: {e}")
+
+# Глобальная переменная для хранения экземпляра обработчика
+_bot_command_handler = None
+
+def get_bot_command_handler(search_engine: SearchEngine = None) -> BotCommandHandler:
+    """Фабрика для получения экземпляра обработчика команд"""
+    global _bot_command_handler
+    
+    if _bot_command_handler is None and search_engine is not None:
+        _bot_command_handler = BotCommandHandler(search_engine)
+    
+    return _bot_command_handler

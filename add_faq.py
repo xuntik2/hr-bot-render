@@ -30,8 +30,9 @@ def add_questions():
         
         for faq in faq_data:
             # Проверяем, есть ли уже такой вопрос (по нормализованному вопросу)
+            # Используем параметризованный запрос
             cursor.execute(
-                f"SELECT id FROM faq WHERE norm_question = {placeholder}",
+                "SELECT id FROM faq WHERE norm_question = " + placeholder,
                 (faq['norm_question'],)
             )
             
@@ -40,10 +41,11 @@ def add_questions():
                 continue
             
             # Добавляем новый вопрос
-            query = f'''
+            # Формируем запрос с несколькими плейсхолдерами
+            query = '''
                 INSERT INTO faq (question, answer, keywords, norm_keywords, norm_question, category, usage_count)
-                VALUES ({placeholder}, {placeholder}, {placeholder}, {placeholder}, {placeholder}, {placeholder}, 0)
-            '''
+                VALUES ({0}, {0}, {0}, {0}, {0}, {0}, 0)
+            '''.format(placeholder)
             cursor.execute(query, (
                 faq['question'],
                 faq['answer'],

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ГЛАВНЫЙ ФАЙЛ БОТА ДЛЯ RENDER
-Исправленная версия с устранением ошибок инициализации
+Исправленная версия с устранением всех ошибок инициализации
 """
 import os
 import time
@@ -60,9 +60,9 @@ def initialize_app():
         logger.info(f"✅ Поисковый движок готов. FAQ: {faq_count}")
         
         if faq_count < 50:  # Если мало вопросов - это проблема
-            logger.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА: Загружено только {faq_count} FAQ вместо 75")
-            logger.error("   Запустите init_database.py для заполнения базы")
-            # Но не прекращаем работу - бот может работать и с меньшим числом FAQ
+            logger.warning(f"⚠️  ВНИМАНИЕ: Загружено только {faq_count} FAQ вместо 75")
+            logger.warning("   Бот будет работать, но с ограниченной базой знаний")
+            # Не прекращаем инициализацию - бот может работать и с меньшим числом FAQ
     except Exception as e:
         logger.error(f"❌ Ошибка поискового движка: {e}", exc_info=True)
         search_engine = None
@@ -81,8 +81,8 @@ def initialize_app():
         
         logger.info(f"🔧 Создание приложения Telegram с токеном: {bot_token[:10]}...")
         
-        # Создаем приложение с настройками таймаутов
-        telegram_app = Application.builder().token(bot_token).read_timeout(30).write_timeout(30).build()
+        # Создаем приложение с настройками таймаутов (версия 20.3)
+        telegram_app = Application.builder().token(bot_token).build()
         
         # Регистрация обработчиков команд
         _register_bot_handlers()
@@ -100,7 +100,7 @@ def initialize_app():
     return True
 
 def _register_bot_handlers():
-    """Регистрация обработчиков команд бота"""
+    """Регистрация обработчиков команд бота (ТОЛЬКО ЛАТИНСКИЕ КОМАНДЫ)"""
     if not command_handler or not telegram_app:
         logger.error("❌ Не удалось зарегистрировать обработчики")
         return
@@ -110,30 +110,30 @@ def _register_bot_handlers():
         logger.info(f"📝 /start от {update.effective_user.id}")
         await command_handler.handle_welcome(update, context)
     
-    # Обработчик команды /категории
+    # Обработчик команды /categories (было /категории)
     async def categories_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        logger.info(f"📝 /категории от {update.effective_user.id}")
+        logger.info(f"📝 /categories от {update.effective_user.id}")
         await command_handler.handle_categories(update, context)
     
-    # Обработчик команды /поиск
+    # Обработчик команды /search (было /поиск)
     async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.message.text.replace('/поиск', '').replace('/search', '').strip()
-        logger.info(f"📝 /поиск от {update.effective_user.id}: {query[:50]}...")
+        query = update.message.text.replace('/search', '').replace('/поиск', '').strip()
+        logger.info(f"📝 /search от {update.effective_user.id}: {query[:50]}...")
         await command_handler.handle_search(update, context, query)
     
-    # Обработчик команды /отзыв
+    # Обработчик команды /feedback (было /отзыв)
     async def feedback_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        logger.info(f"📝 /отзыв от {update.effective_user.id}")
+        logger.info(f"📝 /feedback от {update.effective_user.id}")
         await command_handler.handle_feedback(update, context)
     
-    # Обработчик команды /статистика
+    # Обработчик команды /stats (было /статистика)
     async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        logger.info(f"📝 /статистика от {update.effective_user.id}")
+        logger.info(f"📝 /stats от {update.effective_user.id}")
         await command_handler.handle_stats(update, context)
     
-    # Обработчик команды /очистить
+    # Обработчик команды /clear (было /очистить)
     async def clear_cache_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        logger.info(f"📝 /очистить от {update.effective_user.id}")
+        logger.info(f"📝 /clear от {update.effective_user.id}")
         await command_handler.handle_clear_cache(update, context)
     
     # Обработчик всех текстовых сообщений
@@ -149,23 +149,19 @@ def _register_bot_handlers():
             logger.error(f"❌ Ошибка обработки: {e}", exc_info=True)
             await update.message.reply_text("❌ Произошла ошибка. Пожалуйста, попробуйте ещё раз.")
     
-    # Регистрация обработчиков
+    # Регистрация обработчиков - ТОЛЬКО ЛАТИНСКИЕ КОМАНДЫ (версия 20.3)
     telegram_app.add_handler(CommandHandler("start", start_command))
     telegram_app.add_handler(CommandHandler("help", start_command))
-    telegram_app.add_handler(CommandHandler("категории", categories_command))
     telegram_app.add_handler(CommandHandler("categories", categories_command))
-    telegram_app.add_handler(CommandHandler("поиск", search_command))
     telegram_app.add_handler(CommandHandler("search", search_command))
-    telegram_app.add_handler(CommandHandler("отзыв", feedback_command))
     telegram_app.add_handler(CommandHandler("feedback", feedback_command))
-    telegram_app.add_handler(CommandHandler("статистика", stats_command))
     telegram_app.add_handler(CommandHandler("stats", stats_command))
-    telegram_app.add_handler(CommandHandler("очистить", clear_cache_command))
+    telegram_app.add_handler(CommandHandler("clear", clear_cache_command))
     
     # Обработчик всех текстовых сообщений (должен быть последним)
     telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_all_messages))
     
-    logger.info("✅ Обработчики команд зарегистрированы")
+    logger.info("✅ Обработчики команд зарегистрированы (латинские команды)")
 
 # ================== FLASK РОУТЫ ==================
 
@@ -176,7 +172,7 @@ def index():
     db_type = 'PostgreSQL' if os.getenv('DATABASE_URL') else 'SQLite'
     
     bot_status = "✅ Активен" if bot_initialized else "❌ Ошибка инициализации"
-    faq_status = f"✅ {faq_count} вопросов" if faq_count >= 50 else f"⚠️ Только {faq_count} вопросов"
+    faq_status = f"✅ {faq_count} вопросов" if faq_count >= 75 else f"⚠️  {faq_count} вопросов (из 75)"
     
     return f'''
     <!DOCTYPE html>
@@ -196,12 +192,13 @@ def index():
             .links a:hover {{ background: #0056b3; }}
             .good {{ color: #28a745; }}
             .bad {{ color: #dc3545; }}
+            code {{ background: #f8f9fa; padding: 2px 5px; border-radius: 3px; }}
         </style>
     </head>
     <body>
         <h1>🤖 HR Bot Мечел — Статус: {bot_status}</h1>
         
-        <div class="{'error' if not bot_initialized else ('warning' if faq_count < 50 else 'status')}">
+        <div class="{'error' if not bot_initialized else ('warning' if faq_count < 75 else 'status')}">
             <h3>📊 Статус системы:</h3>
             <p><strong>Бот:</strong> <span class="{'' if bot_initialized else 'bad'}">{bot_status}</span></p>
             <p><strong>FAQ в базе:</strong> <span class="{'' if faq_count >= 50 else 'bad'}">{faq_status}</span></p>
@@ -221,6 +218,7 @@ def index():
         
         <div style="margin-top: 30px; color: #666; font-size: 14px;">
             <p>Время запуска: {time.strftime('%Y-%m-%d %H:%M:%S')}</p>
+            <p>Telegram Bot API: python-telegram-bot v20.3</p>
             {'<p style="color: #dc3545;"><strong>ВНИМАНИЕ:</strong> Бот не работает! Исправьте ошибки выше.</p>' if not bot_initialized else ''}
         </div>
     </body>

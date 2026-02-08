@@ -1,18 +1,29 @@
 #!/usr/bin/env python3
 """
 ГЛАВНЫЙ ФАЙЛ БОТА ДЛЯ RENDER
+С использованием python-telegram-bot v20.6
 """
 import os
 import time
 import logging
+import asyncio
+from threading import Thread
 from flask import Flask, request, jsonify
-import telebot
-from telebot import types
+
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes
+)
 
 from config import config
 from search_engine import SearchEngine
-from handlers import CommandHandler
+from handlers import CommandHandler as CustomCommandHandler
 
+# Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -20,26 +31,27 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Инициализация приложения Flask
 app = Flask(__name__)
 
-bot = None
+# Глобальные объекты
+telegram_app = None
 search_engine = None
 command_handler = None
 
 def initialize_app():
     """Инициализация всех компонентов приложения"""
-    global bot, search_engine, command_handler
+    global telegram_app, search_engine, command_handler
     
     logger.info("=" * 60)
     logger.info("🚀 ИНИЦИАЛИЗАЦИЯ КОРПОРАТИВНОГО БОТА МЕЧЕЛ")
     logger.info("=" * 60)
     
+    # Проверка конфигурации
     if not config.validate():
         raise RuntimeError("Конфигурация не прошла валидацию")
     
-    bot = telebot.TeleBot(config.get_bot_token(), threaded=False)
-    logger.info(f"✅ Бот инициализирован. Токен: {config.get_bot_token()[:10]}...")
-    
+    # Инициализация поискового движка
     try:
         search_engine = SearchEngine()
         logger.info(f"✅ Поисковый движок готов. FAQ: {len(search_engine.faq_data)}")
@@ -47,60 +59,94 @@ def initialize_app():
         logger.error(f"❌ Ошибка поискового движка: {e}", exc_info=True)
         search_engine = None
     
-    command_handler = CommandHandler(search_engine) if search_engine else None
+    # Инициализация обработчиков
+    command_handler = CustomCommandHandler(search_engine) if search_engine else None
     
-    _register_bot_handlers()
+    # Инициализация Telegram Application
+    try:
+        telegram_app = (
+            Application.builder()
+            .token(config.get_bot_token())
+            .build()
+        )
+        
+        # Регистрация обработчиков команд
+        _register_bot_handlers()
+        
+        logger.info(f"✅ Бот инициализирован. Токен: {config.get_bot_token()[:10]}...")
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка инициализации Telegram бота: {e}")
+        telegram_app = None
     
     logger.info("✅ Приложение полностью инициализировано")
     return True
 
 def _register_bot_handlers():
     """Регистрация обработчиков команд бота"""
-    if not command_handler:
+    if not command_handler or not telegram_app:
         return
     
-    @bot.message_handler(commands=['start', 'help'])
-    def send_welcome(message):
-        logger.info(f"📝 /start от {message.from_user.id}")
-        command_handler.handle_welcome(message, bot)
+    # Обработчик команды /start и /help
+    async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        logger.info(f"📝 /start от {update.effective_user.id}")
+        await command_handler.handle_welcome(update, context)
     
-    @bot.message_handler(commands=['категории', 'categories'])
-    def show_categories(message):
-        logger.info(f"📝 /категории от {message.from_user.id}")
-        command_handler.handle_categories(message, bot)
+    # Обработчик команды /категории
+    async def categories_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        logger.info(f"📝 /категории от {update.effective_user.id}")
+        await command_handler.handle_categories(update, context)
     
-    @bot.message_handler(commands=['поиск', 'search'])
-    def search_command(message):
-        query = message.text.replace('/поиск', '').replace('/search', '').strip()
-        logger.info(f"📝 /поиск от {message.from_user.id}: {query[:50]}")
-        command_handler.handle_search(message, bot)
+    # Обработчик команды /поиск
+    async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.message.text.replace('/поиск', '').replace('/search', '').strip()
+        logger.info(f"📝 /поиск от {update.effective_user.id}: {query[:50]}")
+        await command_handler.handle_search(update, context, query)
     
-    @bot.message_handler(commands=['отзыв', 'feedback'])
-    def feedback_command(message):
-        logger.info(f"📝 /отзыв от {message.from_user.id}")
-        command_handler.handle_feedback(message, bot)
+    # Обработчик команды /отзыв
+    async def feedback_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        logger.info(f"📝 /отзыв от {update.effective_user.id}")
+        await command_handler.handle_feedback(update, context)
     
-    @bot.message_handler(commands=['статистика', 'stats'])
-    def stats_command(message):
-        logger.info(f"📝 /статистика от {message.from_user.id}")
-        command_handler.handle_stats(message, bot)
+    # Обработчик команды /статистика
+    async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        logger.info(f"📝 /статистика от {update.effective_user.id}")
+        await command_handler.handle_stats(update, context)
     
-    @bot.message_handler(commands=['очистить'])
-    def clear_cache_command(message):
-        logger.info(f"📝 /очистить от {message.from_user.id}")
-        command_handler.handle_clear_cache(message, bot)
+    # Обработчик команды /очистить
+    async def clear_cache_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        logger.info(f"📝 /очистить от {update.effective_user.id}")
+        await command_handler.handle_clear_cache(update, context)
     
-    @bot.message_handler(func=lambda message: True)
-    def handle_all_messages(message):
-        logger.info(f"📝 Сообщение от {message.from_user.id}: {message.text[:100]}")
+    # Обработчик всех текстовых сообщений
+    async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        logger.info(f"📝 Сообщение от {update.effective_user.id}: {update.message.text[:100]}")
         try:
             if command_handler:
-                command_handler.handle_text_message(message, bot)
+                await command_handler.handle_text_message(update, context)
             else:
-                bot.reply_to(message, "⚠️ Бот временно не готов к работе. Попробуйте позже.")
+                await update.message.reply_text("⚠️ Бот временно не готов к работе. Попробуйте позже.")
         except Exception as e:
             logger.error(f"❌ Ошибка обработки: {e}", exc_info=True)
-            bot.reply_to(message, "❌ Произошла ошибка. Пожалуйста, попробуйте ещё раз.")
+            await update.message.reply_text("❌ Произошла ошибка. Пожалуйста, попробуйте ещё раз.")
+    
+    # Регистрация обработчиков
+    telegram_app.add_handler(CommandHandler("start", start_command))
+    telegram_app.add_handler(CommandHandler("help", start_command))
+    telegram_app.add_handler(CommandHandler("категории", categories_command))
+    telegram_app.add_handler(CommandHandler("categories", categories_command))
+    telegram_app.add_handler(CommandHandler("поиск", search_command))
+    telegram_app.add_handler(CommandHandler("search", search_command))
+    telegram_app.add_handler(CommandHandler("отзыв", feedback_command))
+    telegram_app.add_handler(CommandHandler("feedback", feedback_command))
+    telegram_app.add_handler(CommandHandler("статистика", stats_command))
+    telegram_app.add_handler(CommandHandler("stats", stats_command))
+    telegram_app.add_handler(CommandHandler("очистить", clear_cache_command))
+    
+    # Обработчик всех текстовых сообщений (должен быть последним)
+    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_all_messages))
+
+# ================== FLASK РОУТЫ ==================
 
 @app.route('/')
 def index():
@@ -151,7 +197,7 @@ def health_check():
     status = {
         "status": "healthy",
         "service": "hr-bot-mechel",
-        "bot_initialized": bot is not None,
+        "bot_initialized": telegram_app is not None,
         "search_engine": search_engine is not None,
         "faq_count": len(search_engine.faq_data) if search_engine else 0,
         "database": "postgresql" if os.getenv('DATABASE_URL') else "sqlite"
@@ -173,6 +219,7 @@ def set_webhook_endpoint():
         <p><a href="/">← Назад</a></p>
         '''
     
+    # POST запрос - установка вебхука
     try:
         domain = os.getenv('RENDER_EXTERNAL_URL', 'https://hr-bot-mechel.onrender.com')
         if domain.startswith('https://'):
@@ -181,30 +228,31 @@ def set_webhook_endpoint():
         webhook_url = f"https://{domain}/webhook"
         logger.info(f"🔄 Установка вебхука на {webhook_url}")
         
-        bot.remove_webhook()
-        time.sleep(1)
+        # Устанавливаем вебхук асинхронно
+        async def set_webhook_async():
+            await telegram_app.bot.set_webhook(
+                url=webhook_url,
+                max_connections=40,
+                allowed_updates=['message', 'callback_query']
+            )
         
-        success = bot.set_webhook(
-            url=webhook_url,
-            max_connections=40,
-            allowed_updates=['message', 'callback_query']
-        )
+        # Запускаем асинхронную функцию
+        asyncio.run(set_webhook_async())
         
-        if success:
-            msg = f"✅ Вебхук успешно установлен!<br>URL: <code>{webhook_url}</code>"
-            logger.info("✅ Вебхук установлен")
-            
-            try:
-                webhook_info = bot.get_webhook_info()
-                msg += f"<br><br>📊 Информация от Telegram:<br>"
-                msg += f"• Ожидающих обновлений: {webhook_info.pending_update_count}<br>"
-                msg += f"• Последняя ошибка: {webhook_info.last_error_message or 'нет'}"
-            except:
-                pass
-        else:
-            msg = "❌ Не удалось установить вебхук."
-            logger.error("❌ Ошибка установки вебхука")
-    
+        msg = f"✅ Вебхук успешно установлен!<br>URL: <code>{webhook_url}</code>"
+        logger.info("✅ Вебхук установлен")
+        
+        # Получаем информацию о вебхуке
+        async def get_webhook_info_async():
+            webhook_info = await telegram_app.bot.get_webhook_info()
+            return webhook_info
+        
+        webhook_info = asyncio.run(get_webhook_info_async())
+        msg += f"<br><br>📊 Информация от Telegram:<br>"
+        msg += f"• Ожидающих обновлений: {webhook_info.pending_update_count}<br>"
+        msg += f"• Последняя ошибка: {webhook_info.last_error_message or 'нет'}<br>"
+        msg += f"• URL: {webhook_info.url}"
+        
     except Exception as e:
         msg = f"❌ Ошибка: {str(e)}"
         logger.error(f"❌ Ошибка установки вебхука: {e}", exc_info=True)
@@ -221,7 +269,11 @@ def set_webhook_endpoint():
 def webhook_info():
     """Страница с информацией о текущем вебхуке"""
     try:
-        info = bot.get_webhook_info()
+        # Получаем информацию о вебхуке асинхронно
+        async def get_webhook_info_async():
+            return await telegram_app.bot.get_webhook_info()
+        
+        info = asyncio.run(get_webhook_info_async())
         status = {
             "url": info.url or "Не установлен",
             "has_custom_certificate": info.has_custom_certificate,
@@ -253,12 +305,17 @@ def telegram_webhook():
     if request.headers.get('content-type') == 'application/json':
         try:
             json_string = request.get_data().decode('utf-8')
-            update = types.Update.de_json(json_string)
             
-            if update.message:
-                logger.info(f"📨 Получено сообщение от {update.message.from_user.id}")
+            # Создаем Update из JSON
+            update = Update.de_json(json_string, telegram_app.bot)
             
-            bot.process_new_updates([update])
+            # Обрабатываем update асинхронно
+            async def process_update_async():
+                await telegram_app.process_update(update)
+            
+            # Запускаем в отдельном потоке, чтобы не блокировать Flask
+            Thread(target=lambda: asyncio.run(process_update_async())).start()
+            
             return '', 200
             
         except Exception as e:
@@ -267,35 +324,85 @@ def telegram_webhook():
     
     return 'Bad Request', 400
 
-try:
-    initialize_app()
-    
+async def main_async():
+    """Асинхронная основная функция для запуска бота"""
+    # Автоматическая установка вебхука
     AUTO_SET_WEBHOOK = os.getenv('AUTO_SET_WEBHOOK', 'true').lower() == 'true'
-    if AUTO_SET_WEBHOOK and bot:
+    if AUTO_SET_WEBHOOK and telegram_app:
         try:
             domain = os.getenv('RENDER_EXTERNAL_URL', 'https://hr-bot-mechel.onrender.com')
             if domain.startswith('https://'):
                 domain = domain[8:]
             
             webhook_url = f"https://{domain}/webhook"
-            bot.remove_webhook()
-            success = bot.set_webhook(url=webhook_url)
             
-            if success:
-                logger.info(f"✅ Вебхук автоматически установлен на {webhook_url}")
-            else:
-                logger.warning("⚠️ Не удалось установить вебхук автоматически")
+            # Удаляем старый вебхук
+            await telegram_app.bot.delete_webhook()
+            
+            # Устанавливаем новый
+            await telegram_app.bot.set_webhook(
+                url=webhook_url,
+                max_connections=40,
+                allowed_updates=['message', 'callback_query']
+            )
+            
+            logger.info(f"✅ Вебхук автоматически установлен на {webhook_url}")
+            
         except Exception as e:
             logger.warning(f"⚠️ Ошибка автоматической установки вебхука: {e}")
+
+def run_bot():
+    """Запуск бота в отдельном потоке"""
+    try:
+        # Запускаем асинхронную основную функцию
+        asyncio.run(main_async())
+        
+        # Бот теперь работает через вебхуки, поэтому просто логируем
+        logger.info(f"✅ Приложение готово к работе на порту {os.getenv('PORT', 10000)}")
+        logger.info("✅ Бот настроен на работу через вебхуки")
+        
+    except Exception as e:
+        logger.critical(f"❌ КРИТИЧЕСКАЯ ОШИБКА ПРИ ИНИЦИАЛИЗАЦИИ: {e}", exc_info=True)
+        raise
+
+# ================== ИНИЦИАЛИЗАЦИЯ ==================
+
+# Инициализируем приложение сразу при импорте
+try:
+    initialize_app()
     
-    logger.info(f"✅ Приложение готово к работе на порту {os.getenv('PORT', 10000)}")
+    # Запускаем бота в фоновом потоке
+    bot_thread = Thread(target=run_bot, daemon=True)
+    bot_thread.start()
+    
+    logger.info("✅ Инициализация завершена, бот запущен в фоновом режиме")
     
 except Exception as e:
     logger.critical(f"❌ КРИТИЧЕСКАЯ ОШИБКА ПРИ ИНИЦИАЛИЗАЦИИ: {e}", exc_info=True)
     raise
 
+# ================== ЛОКАЛЬНЫЙ ЗАПУСК ==================
 if __name__ == '__main__':
     logger.warning("⚠️ ЛОКАЛЬНЫЙ ЗАПУСК - только для разработки!")
     port = int(os.environ.get('PORT', 10000))
     logger.info(f"🌐 Запуск Flask сервера на порту {port}")
+    
+    # Для локального запуска также запускаем polling
+    async def local_polling():
+        await telegram_app.initialize()
+        await telegram_app.start()
+        logger.info("🤖 Бот запущен в режиме polling")
+        await telegram_app.updater.start_polling()
+        
+        # Ждем завершения
+        await telegram_app.updater.idle()
+    
+    # Запускаем polling в отдельном потоке
+    if telegram_app:
+        polling_thread = Thread(
+            target=lambda: asyncio.run(local_polling()),
+            daemon=True
+        )
+        polling_thread.start()
+    
     app.run(host='0.0.0.0', port=port, debug=False)

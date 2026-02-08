@@ -51,6 +51,28 @@ class SearchEngine:
             conn = config.get_db_connection()
             cursor = conn.cursor()
             
+            # Проверяем существование таблицы faq
+            if config.is_postgresql():
+                cursor.execute("""
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.tables 
+                        WHERE table_name = 'faq'
+                    );
+                """)
+            else:
+                cursor.execute("""
+                    SELECT name FROM sqlite_master 
+                    WHERE type='table' AND name='faq';
+                """)
+            
+            table_exists = cursor.fetchone()[0]
+            
+            if not table_exists:
+                logger.warning("Таблица 'faq' не существует. Загрузка FAQ невозможна.")
+                self.faq_data = []
+                conn.close()
+                return
+            
             cursor.execute("SELECT * FROM faq")
             rows = cursor.fetchall()
             

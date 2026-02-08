@@ -67,9 +67,8 @@ class Config:
     @classmethod
     def get_db_connection(cls):
         if cls.is_postgresql():
-            import psycopg  # ← ИЗМЕНИЛИ: psycopg2 → psycopg
+            import psycopg
             db_url = os.getenv('DATABASE_URL')
-            # Для совместимости с Heroku/Render
             if db_url and db_url.startswith('postgres://'):
                 db_url = db_url.replace('postgres://', 'postgresql://', 1)
             return psycopg.connect(db_url)

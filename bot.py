@@ -5,6 +5,7 @@
 """
 import os
 import time
+import json
 import logging
 import asyncio
 import threading
@@ -327,22 +328,36 @@ def set_webhook_endpoint():
     
     # POST запрос - установка вебхука
     try:
-        domain = os.getenv('RENDER_EXTERNAL_URL', 'https://hr-bot-mechel.onrender.com')
+        domain = os.getenv('RENDER_EXTERNAL_URL', 'https://hr-bot-render.onrender.com')
         if domain.startswith('https://'):
             domain = domain[8:]
         
         webhook_url = f"https://{domain}/webhook"
         logger.info(f"🔄 Установка вебхука на {webhook_url}")
         
-        # Устанавливаем вебхук
-        success = asyncio.run(set_webhook(webhook_url))
+        # Устанавливаем вебхук (синхронная версия для избежания проблем с блокировками)
+        import requests
         
-        if success:
+        # Удаляем старый вебхук
+        delete_url = f"https://api.telegram.org/bot{config.get_bot_token()}/deleteWebhook"
+        response = requests.get(delete_url)
+        logger.debug(f"Удаление вебхука: {response.status_code}")
+        
+        # Устанавливаем новый вебхук
+        set_url = f"https://api.telegram.org/bot{config.get_bot_token()}/setWebhook"
+        payload = {
+            'url': webhook_url,
+            'max_connections': 40,
+            'allowed_updates': ['message', 'callback_query']
+        }
+        response = requests.post(set_url, json=payload)
+        
+        if response.status_code == 200 and response.json().get('ok'):
             msg = f"✅ Вебхук успешно установлен!<br>URL: <code>{webhook_url}</code>"
-            logger.info("✅ Вебхук установлен")
+            logger.info("✅ Вебхук установлен (через requests)")
         else:
-            msg = "❌ Не удалось установить вебхук"
-            logger.error(msg)
+            msg = f"❌ Не удалось установить вебхук. Ответ API: {response.text}"
+            logger.error(f"Ошибка установки вебхука: {response.text}")
         
     except Exception as e:
         msg = f"❌ Ошибка: {str(e)}"
@@ -356,20 +371,6 @@ def set_webhook_endpoint():
     <p style="margin-top: 20px;"><a href="/">← На главную</a> | <a href="/webhook_info">ℹ️ Информация о вебхуке</a></p>
     ''', 200 if '✅' in msg else 500
 
-async def set_webhook(webhook_url: str):
-    """Асинхронная установка вебхука"""
-    try:
-        await telegram_app.bot.delete_webhook()
-        await telegram_app.bot.set_webhook(
-            url=webhook_url,
-            max_connections=40,
-            allowed_updates=['message', 'callback_query']
-        )
-        return True
-    except Exception as e:
-        logger.error(f"Ошибка установки вебхука: {e}")
-        return False
-
 @app.route('/webhook_info')
 def webhook_info():
     """Страница с информацией о текущем вебхуке"""
@@ -381,28 +382,32 @@ def webhook_info():
         ''', 500
     
     try:
-        # Получаем информацию о вебхуке
-        info = asyncio.run(get_webhook_info())
+        # Получаем информацию о вебхуке через requests (синхронно)
+        import requests
+        token = config.get_bot_token()
+        info_url = f"https://api.telegram.org/bot{token}/getWebhookInfo"
+        response = requests.get(info_url)
         
-        return f'''
-        <h1>ℹ️ Информация о вебхуке</h1>
-        <div style="background: #f8f9fa; padding: 20px; border-radius: 8px;">
-            <p><strong>URL:</strong> <code>{info.url or 'Не установлен'}</code></p>
-            <p><strong>Ожидающих обновлений:</strong> {info.pending_update_count}</p>
-            <p><strong>Последняя ошибка:</strong> {info.last_error_message or 'Нет ошибок'}</p>
-            <p><strong>Макс. соединений:</strong> {info.max_connections}</p>
-        </div>
-        <p style="margin-top: 20px;">
-            <a href="/">← На главную</a> |
-            <a href="/set_webhook">🔧 Установить вебхук</a>
-        </p>
-        ''', 200
+        if response.status_code == 200:
+            info = response.json().get('result', {})
+            return f'''
+            <h1>ℹ️ Информация о вебхуке</h1>
+            <div style="background: #f8f9fa; padding: 20px; border-radius: 8px;">
+                <p><strong>URL:</strong> <code>{info.get('url', 'Не установлен')}</code></p>
+                <p><strong>Ожидающих обновлений:</strong> {info.get('pending_update_count', 0)}</p>
+                <p><strong>Последняя ошибка:</strong> {info.get('last_error_message', 'Нет ошибок')}</p>
+                <p><strong>Макс. соединений:</strong> {info.get('max_connections', 'Не указано')}</p>
+            </div>
+            <p style="margin-top: 20px;">
+                <a href="/">← На главную</a> |
+                <a href="/set_webhook">🔧 Установить вебхук</a>
+            </p>
+            ''', 200
+        else:
+            return f'<h1>❌ Ошибка</h1><p>Не удалось получить информацию: {response.text}</p>', 500
+            
     except Exception as e:
         return f'<h1>❌ Ошибка</h1><p>Не удалось получить информацию: {e}</p>', 500
-
-async def get_webhook_info():
-    """Получить информацию о вебхуке"""
-    return await telegram_app.bot.get_webhook_info()
 
 @app.route('/webhook', methods=['POST'])
 def telegram_webhook():
@@ -411,27 +416,67 @@ def telegram_webhook():
         logger.error("❌ Вебхук вызван, но бот не инициализирован")
         return jsonify({'error': 'Bot not initialized'}), 503
     
-    if request.headers.get('content-type') != 'application/json':
+    # Проверяем content-type
+    content_type = request.headers.get('content-type', '')
+    if 'application/json' not in content_type:
+        logger.warning(f"❌ Неверный content-type: {content_type}")
         return 'Bad Request', 400
     
     try:
-        json_string = request.get_data().decode('utf-8')
+        # Получаем JSON данные
+        update_data = request.get_json(force=True, silent=True)
         
-        # Создаем Update из JSON
-        update = Update.de_json(json_string, telegram_app.bot)
+        if not update_data:
+            logger.error("❌ Не удалось получить JSON данные из запроса")
+            return 'Bad Request', 400
+        
+        logger.debug(f"📨 Получен вебхук от Telegram. update_id: {update_data.get('update_id', 'unknown')}")
+        
+        # Создаем Update объект из словаря
+        update = Update.de_json(update_data, telegram_app.bot)
+        
+        if update is None:
+            logger.error("❌ Не удалось создать Update объект из данных")
+            return 'Bad Request', 400
         
         # Обрабатываем update асинхронно
-        asyncio.run(process_update(update))
-        
-        return '', 200
+        try:
+            # Запускаем обработку в отдельном потоке, чтобы быстро ответить Telegram
+            def run_async():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(telegram_app.process_update(update))
+                loop.close()
+            
+            # Запускаем в отдельном потоке, не блокируя основной
+            thread = threading.Thread(target=run_async, daemon=True)
+            thread.start()
+            
+            # Telegram ожидает ответ в течение 10 секунд
+            # Мы возвращаем ответ сразу, а обработка идет в фоне
+            return '', 200
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка при асинхронной обработке update: {e}", exc_info=True)
+            return 'Internal Server Error', 500
             
     except Exception as e:
         logger.error(f"❌ Ошибка обработки вебхука: {e}", exc_info=True)
         return 'Internal Server Error', 500
 
-async def process_update(update: Update):
-    """Обработка обновления"""
-    await telegram_app.process_update(update)
+async def set_webhook_async(webhook_url: str):
+    """Асинхронная установка вебхука (альтернативная версия)"""
+    try:
+        await telegram_app.bot.delete_webhook()
+        await telegram_app.bot.set_webhook(
+            url=webhook_url,
+            max_connections=40,
+            allowed_updates=['message', 'callback_query']
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка установки вебхука (async): {e}")
+        return False
 
 # ================== ИНИЦИАЛИЗАЦИЯ ==================
 
@@ -444,21 +489,41 @@ try:
         logger.info(f"✅ Приложение готово к работе на порту {os.getenv('PORT', 10000)}")
         logger.info("🤖 Бот работает в режиме вебхуков")
         
-        # Автоматическая установка вебхука при запуске
+        # Автоматическая установка вебхука при запуске (синхронная версия)
         AUTO_SET_WEBHOOK = os.getenv('AUTO_SET_WEBHOOK', 'true').lower() == 'true'
         if AUTO_SET_WEBHOOK and bot_initialized:
             logger.info("🔄 Автоматическая установка вебхука...")
             
             def auto_set_webhook():
                 try:
-                    domain = os.getenv('RENDER_EXTERNAL_URL', 'https://hr-bot-mechel.onrender.com')
+                    domain = os.getenv('RENDER_EXTERNAL_URL', 'https://hr-bot-render.onrender.com')
                     if domain.startswith('https://'):
                         domain = domain[8:]
                     
                     webhook_url = f"https://{domain}/webhook"
                     
-                    asyncio.run(set_webhook(webhook_url))
-                    logger.info(f"✅ Вебхук установлен: {webhook_url}")
+                    # Используем синхронный подход через requests
+                    import requests
+                    token = config.get_bot_token()
+                    
+                    # Удаляем старый вебхук
+                    delete_url = f"https://api.telegram.org/bot{token}/deleteWebhook"
+                    requests.get(delete_url)
+                    
+                    # Устанавливаем новый
+                    set_url = f"https://api.telegram.org/bot{token}/setWebhook"
+                    payload = {
+                        'url': webhook_url,
+                        'max_connections': 40,
+                        'allowed_updates': ['message', 'callback_query']
+                    }
+                    response = requests.post(set_url, json=payload)
+                    
+                    if response.status_code == 200 and response.json().get('ok'):
+                        logger.info(f"✅ Вебхук установлен: {webhook_url}")
+                    else:
+                        logger.warning(f"⚠️ Не удалось установить вебхук автоматически: {response.text}")
+                        
                 except Exception as e:
                     logger.warning(f"⚠️ Не удалось установить вебхук автоматически: {e}")
             

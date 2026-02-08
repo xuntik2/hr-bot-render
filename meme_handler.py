@@ -25,7 +25,6 @@ class MemeHandler:
             "https://some-random-api.com/meme"
         ]
         
-        # Кэш мемов для быстрого доступа
         self.meme_cache: List[Dict] = []
         self.last_cache_update = 0
     
@@ -38,7 +37,6 @@ class MemeHandler:
         try:
             user_id = message.from_user.id
             
-            # Проверяем, включены ли мемы
             if not config.is_meme_enabled():
                 bot.reply_to(
                     message,
@@ -49,14 +47,11 @@ class MemeHandler:
                 )
                 return
             
-            # Показываем индикатор "печатает"
             bot.send_chat_action(message.chat.id, 'upload_photo')
             
-            # Получаем мем
             meme_url = self._get_random_meme()
             
             if meme_url:
-                # Отправляем мем
                 bot.send_photo(
                     message.chat.id,
                     meme_url,
@@ -99,19 +94,16 @@ class MemeHandler:
             conn = self._get_db_connection()
             cursor = conn.cursor()
             
-            # Проверяем, подписан ли уже пользователь
             cursor.execute("SELECT subscribed FROM meme_subscriptions WHERE user_id = %s", (user_id,))
             result = cursor.fetchone()
             
             if result:
-                # Обновляем подписку
                 cursor.execute(
                     "UPDATE meme_subscriptions SET subscribed = TRUE, subscribed_at = CURRENT_TIMESTAMP WHERE user_id = %s",
                     (user_id,)
                 )
                 action = "возобновлена"
             else:
-                # Добавляем новую подписку
                 cursor.execute(
                     "INSERT INTO meme_subscriptions (user_id, subscribed, subscribed_at) VALUES (%s, TRUE, CURRENT_TIMESTAMP)",
                     (user_id,)
@@ -147,7 +139,6 @@ class MemeHandler:
             conn = self._get_db_connection()
             cursor = conn.cursor()
             
-            # Отписываем пользователя
             cursor.execute(
                 "UPDATE meme_subscriptions SET subscribed = FALSE WHERE user_id = %s",
                 (user_id,)
@@ -185,7 +176,6 @@ class MemeHandler:
             conn = self._get_db_connection()
             cursor = conn.cursor()
             
-            # Получаем всех подписчиков
             cursor.execute("SELECT user_id FROM meme_subscriptions WHERE subscribed = TRUE")
             subscribers = cursor.fetchall()
             
@@ -214,7 +204,7 @@ class MemeHandler:
                         parse_mode='Markdown'
                     )
                     sent_count += 1
-                    time.sleep(0.1)  # Задержка между отправками
+                    time.sleep(0.1)
                     
                 except Exception as e:
                     failed_count += 1
@@ -228,13 +218,11 @@ class MemeHandler:
     def _get_random_meme(self) -> Optional[str]:
         """Получить случайный мем из API"""
         try:
-            # Используем кэш если он свежий
             current_time = time.time()
             if self.meme_cache and (current_time - self.last_cache_update < 3600):
                 meme = random.choice(self.meme_cache)
                 return meme.get('url')
             
-            # Обновляем кэш
             self.meme_cache = []
             
             for source in self.meme_sources:
@@ -244,7 +232,6 @@ class MemeHandler:
                         data = response.json()
                         
                         if 'memes' in data:
-                            # ImgFlip API
                             memes = data['memes']
                             meme = random.choice(memes)
                             self.meme_cache.append({
@@ -252,13 +239,11 @@ class MemeHandler:
                                 'title': meme.get('name', 'Мем')
                             })
                         elif 'url' in data:
-                            # Meme API
                             self.meme_cache.append({
                                 'url': data['url'],
                                 'title': data.get('title', 'Мем')
                             })
                         
-                        # Если нашли достаточно мемов, выходим
                         if len(self.meme_cache) >= 10:
                             break
                             
@@ -272,7 +257,6 @@ class MemeHandler:
                 meme = random.choice(self.meme_cache)
                 return meme['url']
             else:
-                # Запасной вариант - статичные мемы
                 fallback_memes = [
                     "https://i.imgflip.com/30b1gx.jpg",
                     "https://i.imgflip.com/1g8my4.jpg",

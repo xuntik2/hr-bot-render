@@ -67,11 +67,12 @@ class Config:
     @classmethod
     def get_db_connection(cls):
         if cls.is_postgresql():
-            import psycopg2
+            import psycopg  # ← ИЗМЕНИЛИ: psycopg2 → psycopg
             db_url = os.getenv('DATABASE_URL')
-            if db_url.startswith('postgres://'):
+            # Для совместимости с Heroku/Render
+            if db_url and db_url.startswith('postgres://'):
                 db_url = db_url.replace('postgres://', 'postgresql://', 1)
-            return psycopg2.connect(db_url)
+            return psycopg.connect(db_url)
         else:
             import sqlite3
             return sqlite3.connect(cls.DB_PATH)

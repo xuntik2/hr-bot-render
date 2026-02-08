@@ -8,13 +8,13 @@ services:
     buildCommand: |
       pip install --upgrade pip
       pip install -r requirements.txt
-      python create_database.py
-      python check_database.py
-      python add_faq.py  # Дополнительно заполняем базу, если нужно
+      python init_database.py  # Надежное заполнение базы
+      python check_database.py  # Проверка результата
     startCommand: python bot.py
     envVars:
       - key: BOT_TOKEN
         sync: false
+        required: true
       - key: ADMIN_IDS
         sync: false
       - key: DATABASE_URL
@@ -33,5 +33,5 @@ services:
       - key: PORT
         value: "10000"
     healthCheckPath: /health
-    healthCheckInterval: 60  # Проверка каждые 60 секунд
-
+    healthCheckInterval: 60
+    initialDeployHook: "echo '🚀 Начало деплоя HR-бота'"

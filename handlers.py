@@ -1,6 +1,7 @@
 """
 ОБРАБОТЧИКИ КОМАНД И СООБЩЕНИЙ
-Асинхронная версия для python-telegram-bot v20.6
+Асинхронная версия для python-telegram-bot v20.3
+Исправленные команды (только латинские)
 """
 import logging
 import re
@@ -19,7 +20,7 @@ class CommandHandler:
         self.search_engine = search_engine
     
     async def handle_welcome(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка /start"""
+        """Обработка /start (обновлённый текст с латинскими командами)"""
         user_id = update.effective_user.id
         
         welcome_text = """
@@ -35,9 +36,9 @@ class CommandHandler:
 
 📋 *Основные команды:*
 • /start - это сообщение
-• /категории - показать все категории вопросов
-• /поиск [вопрос] - поиск по базе знаний
-• /отзыв - оставить обратную связь
+• /categories - показать все категории вопросов
+• /search [вопрос] - поиск по базе знаний
+• /feedback - оставить обратную связь
 
 💡 *Просто напишите ваш вопрос!*
 Например: "Как оформить отпуск?"
@@ -46,15 +47,15 @@ class CommandHandler:
         if config.is_meme_enabled():
             welcome_text += """
 🎭 *Мемы для поднятия настроения:*
-• /мем - посмотреть случайный мем
-• /мемподписка - подписаться на ежедневные мемы
+• /meme - посмотреть случайный мем
+• /meme_subscribe - подписаться на ежедневные мемы
 """
         
         await update.message.reply_text(welcome_text, parse_mode='Markdown')
         logger.info(f"Пользователь {user_id} запустил бота")
     
     async def handle_categories(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка /категории"""
+        """Обработка /categories"""
         try:
             stats = self.search_engine.get_stats()
             
@@ -110,25 +111,25 @@ class CommandHandler:
             await update.message.reply_text("❌ Ошибка при получении категорий.")
     
     async def handle_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE, query: str = None):
-        """Обработка /поиск"""
+        """Обработка /search"""
         if query is None:
             query = update.message.text
         
         # Убираем команду
-        if query.startswith('/поиск'):
-            query = query.replace('/поиск', '', 1).strip()
-        elif query.startswith('/search'):
+        if query.startswith('/search'):
             query = query.replace('/search', '', 1).strip()
+        elif query.startswith('/поиск'):
+            query = query.replace('/поиск', '', 1).strip()
         
         if not query:
             help_text = """
 🔍 *Поиск по базе знаний*
 
-Использование: /поиск [ваш запрос]
+Использование: /search [ваш запрос]
 Примеры:
-• /поиск как оформить отпуск
-• /поиск справка 2-НДФЛ
-• /поиск график работы
+• /search как оформить отпуск
+• /search справка 2-НДФЛ
+• /search график работы
 """
             await update.message.reply_text(help_text, parse_mode='Markdown')
             return
@@ -137,7 +138,7 @@ class CommandHandler:
         await self._process_query(update, context, query)
     
     async def handle_feedback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка /отзыв"""
+        """Обработка /feedback"""
         if not config.is_feedback_enabled():
             await update.message.reply_text("💬 Система отзывов временно отключена.")
             return
@@ -157,7 +158,7 @@ class CommandHandler:
         await update.message.reply_text(feedback_text, parse_mode='Markdown')
     
     async def handle_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка /статистика"""
+        """Обработка /stats"""
         admin_ids = config.get_admin_ids()
         if admin_ids and update.effective_user.id not in admin_ids:
             await update.message.reply_text("❌ Эта команда доступна только администраторам.")
@@ -189,7 +190,7 @@ class CommandHandler:
             await update.message.reply_text("❌ Ошибка при получении статистики.")
     
     async def handle_clear_cache(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка /очистить"""
+        """Обработка /clear"""
         admin_ids = config.get_admin_ids()
         if not admin_ids or update.effective_user.id not in admin_ids:
             await update.message.reply_text("❌ Эта команда доступна только администраторам.")
@@ -219,18 +220,18 @@ class CommandHandler:
 
 📋 *Доступные команды:*
 • /start - Начало работы
-• /категории - Список категорий
-• /поиск [вопрос] - Поиск по базе
-• /отзыв - Оставить отзыв
+• /categories - Список категорий
+• /search [вопрос] - Поиск по базе
+• /feedback - Оставить отзыв
 """
             admin_ids = config.get_admin_ids()
             if admin_ids and update.effective_user.id in admin_ids:
-                response += "• /статистика - Статистика бота\n"
-                response += "• /очистить - Очистить кэш поиска\n"
+                response += "• /stats - Статистика бота\n"
+                response += "• /clear - Очистить кэш поиска\n"
             
             if config.is_meme_enabled():
-                response += "• /мем - Посмотреть мем\n"
-                response += "• /мемподписка - Подписаться на мемы\n"
+                response += "• /meme - Посмотреть мем\n"
+                response += "• /meme_subscribe - Подписаться на мемы\n"
             
             await update.message.reply_text(response, parse_mode='Markdown')
             return
@@ -338,14 +339,14 @@ class CommandHandler:
 💡 *Возможно, вы имели в виду:*
 """
             for i, faq in enumerate(similar_questions[:3], 1):
-                response += f"\n{i}. *{faq.question[:60]}* ({faq.category})"
+                response += f"\n{i}. *{faq.question[:60]}...* ({faq.category})"
             
             response += """
 
 📝 *Что можно сделать:*
 • Уточните формулировку вопроса
 • Используйте другие ключевые слова  
-• Посмотрите /категории
+• Посмотрите /categories
 • Обратитесь в HR-отдел напрямую
 """
         else:
@@ -360,8 +361,8 @@ class CommandHandler:
 📋 *Что можно сделать:*
 • Проверьте правильность написания
 • Используйте более конкретные формулировки
-• Посмотрите список категорий: /категории
-• Используйте поиск: /поиск [ключевые слова]
+• Посмотрите список категорий: /categories
+• Используйте поиск: /search [ключевые слова]
 """
         
         await update.message.reply_text(response, parse_mode='Markdown')

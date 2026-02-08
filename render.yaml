@@ -9,6 +9,7 @@ services:
       pip install --upgrade pip
       pip install -r requirements.txt
       python create_database.py
+      python check_database.py
       python add_faq.py  # Дополнительно заполняем базу, если нужно
     startCommand: python bot.py
     envVars:
@@ -33,3 +34,4 @@ services:
         value: "10000"
     healthCheckPath: /health
     healthCheckInterval: 60  # Проверка каждые 60 секунд
+

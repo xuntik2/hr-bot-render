@@ -1,5 +1,3 @@
-[file name]: bot.py
-[file content begin]
 #!/usr/bin/env python3
 """
 ГЛАВНЫЙ ФАЙЛ БОТА ДЛЯ RENDER
@@ -730,4 +728,3 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
     logger.info(f"🌐 Запуск Flask сервера на порту {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
-[file content end]

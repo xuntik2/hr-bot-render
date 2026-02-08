@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 """
-ПОИСКОВЫЙ ДВИЖОК С ИНДЕКСАМИ И КЭШИРОВАНИЕМ
-Адаптирован для PostgreSQL/SQLite с исправлением ошибок
+ПОИСКОВЫЙ ДВИЖОК С ИНДЕКСАЦИЕЙ И КЭШЕМ
 """
-
 import logging
 import time
 import hashlib
@@ -15,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class FAQEntry:
-    """Датакласс для хранения структурированных данных FAQ"""
+    """Структура для хранения FAQ"""
     id: int
     question: str
     answer: str
@@ -26,31 +24,26 @@ class FAQEntry:
     usage_count: int
 
 class SearchEngine:
-    """Полноценный поисковый движок с индексами и кэшированием"""
+    """Поисковый движок с индексами и кэшированием"""
     
     def __init__(self):
-        # Данные FAQ
         self.faq_data: List[FAQEntry] = []
-        # Индексы для быстрого поиска
         self.keywords_index: Dict[str, List[int]] = {}
         self.question_index: Dict[str, List[int]] = {}
         self.category_index: Dict[str, List[int]] = {}
-        # Кэш результатов поиска
         self.search_cache: Dict[str, tuple] = {}
-        # Статистика
+        
         self.stats = {
             'total_searches': 0,
             'cache_hits': 0,
             'cache_misses': 0,
-            'total_time': 0.0,
-            'last_update': time.time()
+            'total_time': 0.0
         }
         
-        # Загрузка данных
         self.load_all_faq()
         self._build_indexes()
         
-        logger.info(f"✅ Поисковый движок загружен. FAQ: {len(self.faq_data)}")
+        logger.info(f"✅ Поисковый движок готов. Загружено {len(self.faq_data)} FAQ")
     
     def load_all_faq(self):
         """Загрузка всех FAQ из базы данных"""
@@ -58,7 +51,7 @@ class SearchEngine:
             conn = config.get_db_connection()
             cursor = conn.cursor()
             
-            cursor.execute("SELECT * FROM faq ORDER BY usage_count DESC")
+            cursor.execute("SELECT * FROM faq")
             rows = cursor.fetchall()
             
             self.faq_data.clear()
@@ -69,18 +62,18 @@ class SearchEngine:
                     question=row[1],
                     answer=row[2],
                     keywords=row[3] if len(row) > 3 else "",
-                    norm_keywords=row[4] if len(row) > 4 else row[1].lower(),
-                    norm_question=row[5] if len(row) > 5 else row[1].lower(),
+                    norm_keywords=row[4] if len(row) > 4 else "",
+                    norm_question=row[5] if len(row) > 5 else "",
                     category=row[6] if len(row) > 6 else "Общее",
                     usage_count=row[7] if len(row) > 7 else 0
                 )
                 self.faq_data.append(faq_entry)
             
             conn.close()
-            logger.info(f"✅ Загружено {len(self.faq_data)} FAQ из базы данных")
+            logger.info(f"Загружено {len(self.faq_data)} FAQ из базы данных")
             
         except Exception as e:
-            logger.error(f"❌ Ошибка при загрузке FAQ: {e}", exc_info=True)
+            logger.error(f"Ошибка при загрузке FAQ: {e}")
             self.faq_data = []
     
     def _build_indexes(self):
@@ -120,8 +113,6 @@ class SearchEngine:
                             self.question_index[word_clean] = []
                         if faq_id not in self.question_index[word_clean]:
                             self.question_index[word_clean].append(faq_id)
-        
-        logger.info(f"📊 Построены индексы: {len(self.question_index)} слов, {len(self.category_index)} категорий")
     
     @staticmethod
     def _clean_word(word: str) -> str:
@@ -138,8 +129,7 @@ class SearchEngine:
         
         # Точное совпадение вопроса
         if query_lower == faq.question.lower():
-            score += 10.0
-            return score
+            return 100.0
         
         # Подготовка данных для сравнения
         query_words = set(self._clean_word(w) for w in query_lower.split() if self._clean_word(w))
@@ -149,14 +139,17 @@ class SearchEngine:
             faq_keywords = set(k.strip().lower() for k in faq.keywords.split(',') if k.strip())
             common_keywords = query_words.intersection(faq_keywords)
             if common_keywords:
-                score += len(common_keywords) * 2.0
+                score += len(common_keywords) * 20.0
         
         # Совпадение слов в вопросе
         for q_word in query_words:
             if q_word in faq.norm_question:
-                score += 3.0
+                score += 30.0
         
-        return max(score, 0)
+        # Учитываем популярность (usage_count)
+        score += min(faq.usage_count * 0.5, 10.0)
+        
+        return min(score, 100.0)
     
     def search(self, query: str, user_id: int = 0) -> Optional[tuple]:
         """Основной метод поиска"""
@@ -193,8 +186,10 @@ class SearchEngine:
         for idx in candidate_ids:
             if idx >= len(self.faq_data):
                 continue
+                
             faq = self.faq_data[idx]
             score = self._calculate_relevance(query, faq)
+            
             if score > best_score:
                 best_score = score
                 best_match = (faq.id, faq.question, faq.answer, faq.category, score)
@@ -208,7 +203,7 @@ class SearchEngine:
             if len(self.search_cache) > 1000:
                 self.search_cache.pop(next(iter(self.search_cache)))
         
-        # Логирование
+        # Логирование времени
         search_time = time.time() - start_time
         self.stats['total_time'] += search_time
         
@@ -221,7 +216,6 @@ class SearchEngine:
             cursor = conn.cursor()
             placeholder = config.get_placeholder()
             
-            # ИСПРАВЛЕНИЕ: Используем прямой вызов cursor.execute вместо несуществующего config.execute_query
             query = f"UPDATE faq SET usage_count = usage_count + 1 WHERE id = {placeholder}"
             cursor.execute(query, (faq_id,))
             
@@ -235,7 +229,7 @@ class SearchEngine:
                     break
                     
         except Exception as e:
-            logger.error(f"Ошибка при обновлении usage_count: {e}", exc_info=True)
+            logger.error(f"Ошибка при обновлении usage_count: {e}")
     
     def refresh_data(self):
         """Обновление данных из БД и перестроение индексов"""
@@ -243,7 +237,7 @@ class SearchEngine:
         self.load_all_faq()
         self._build_indexes()
         self.search_cache.clear()
-        logger.info(f"✅ Данные обновлены: было {old_count}, стало {len(self.faq_data)} FAQ")
+        logger.info(f"Данные обновлены: было {old_count}, стало {len(self.faq_data)} FAQ")
     
     def get_stats(self) -> dict:
         """Получение статистики работы поискового движка"""

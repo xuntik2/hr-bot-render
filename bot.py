@@ -41,6 +41,7 @@ telegram_app = None
 search_engine = None
 command_handler = None
 bot_initialized = False
+bot_started = False
 
 def initialize_app():
     """Инициализация всех компонентов приложения"""
@@ -64,7 +65,6 @@ def initialize_app():
         if faq_count < 50:  # Если мало вопросов - это проблема
             logger.warning(f"⚠️  ВНИМАНИЕ: Загружено только {faq_count} FAQ вместо 75")
             logger.warning("   Бот будет работать, но с ограниченной базой знаний")
-            # Не прекращаем инициализацию - бот может работать и с меньшим числом FAQ
     except Exception as e:
         logger.error(f"❌ Ошибка поискового движка: {e}", exc_info=True)
         search_engine = None
@@ -624,44 +624,23 @@ def telegram_webhook():
             logger.error("❌ Не удалось создать Update объект из данных")
             return 'Bad Request', 400
         
-        # Обрабатываем update асинхронно
+        # Обрабатываем update с использованием update_queue
         try:
-            # Запускаем обработку в отдельном потоке, чтобы быстро ответить Telegram
-            def run_async():
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                loop.run_until_complete(telegram_app.process_update(update))
-                loop.close()
-            
-            # Запускаем в отдельном потоке, не блокируя основной
-            thread = threading.Thread(target=run_async, daemon=True)
-            thread.start()
+            # Используем update_queue вместо ручного создания event loop
+            # Это более правильный способ для python-telegram-bot 20.3+
+            telegram_app.update_queue.put_nowait(update)
             
             # Telegram ожидает ответ в течение 10 секунд
             # Мы возвращаем ответ сразу, а обработка идет в фоне
             return '', 200
             
         except Exception as e:
-            logger.error(f"❌ Ошибка при асинхронной обработке update: {e}", exc_info=True)
+            logger.error(f"❌ Ошибка при добавлении update в очередь: {e}", exc_info=True)
             return 'Internal Server Error', 500
             
     except Exception as e:
         logger.error(f"❌ Ошибка обработки вебхука: {e}", exc_info=True)
         return 'Internal Server Error', 500
-
-async def set_webhook_async(webhook_url: str):
-    """Асинхронная установка вебхука (альтернативная версия)"""
-    try:
-        await telegram_app.bot.delete_webhook()
-        await telegram_app.bot.set_webhook(
-            url=webhook_url,
-            max_connections=40,
-            allowed_updates=['message', 'callback_query']
-        )
-        return True
-    except Exception as e:
-        logger.error(f"Ошибка установки вебхука (async): {e}")
-        return False
 
 # ================== ИНИЦИАЛИЗАЦИЯ ==================
 

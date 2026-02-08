@@ -6,6 +6,7 @@ import re
 from typing import Optional, Tuple
 from config import config
 from search_engine import SearchEngine
+import utils
 
 logger = logging.getLogger(__name__)
 
@@ -202,6 +203,16 @@ class CommandHandler:
     def _process_query(self, message, bot, query: str):
         """Обработка текстового запроса пользователя"""
         user_id = message.from_user.id
+        
+        # Проверка на спам
+        is_spam, wait_time = utils.check_spam(user_id)
+        if is_spam:
+            bot.reply_to(
+                message,
+                f"⏳ Слишком много запросов. Подождите {wait_time} секунд.",
+                parse_mode='Markdown'
+            )
+            return
         
         # Проверка длины запроса
         if len(query) < 3:

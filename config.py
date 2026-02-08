@@ -4,7 +4,7 @@
 """
 
 import os
-from typing import List, Optional
+from typing import List
 from dotenv import load_dotenv
 import sqlite3
 import logging
@@ -69,6 +69,8 @@ class Config:
         logger.info(f"   🤖 Токен: {token[:10]}...{token[-10:]}")
         logger.info(f"   👑 Админы: {cls.get_admin_ids()}")
         logger.info(f"   🗄️  БД: {'PostgreSQL' if cls.is_postgresql() else 'SQLite'}")
+        logger.info(f"   🎭 Мемы: {'ВКЛ' if cls.is_meme_enabled() else 'ВЫКЛ'}")
+        logger.info(f"   💬 Отзывы: {'ВКЛ' if cls.is_feedback_enabled() else 'ВЫКЛ'}")
         return True
     
     # =========== МЕТОДЫ ДЛЯ ПОЛУЧЕНИЯ НАСТРОЕК ===========
@@ -121,7 +123,20 @@ class Config:
         except ValueError:
             return cls.SEARCH_THRESHOLD
     
+    @classmethod
+    def get_max_search_results(cls) -> int:
+        """Получить максимальное количество результатов поиска"""
+        try:
+            return int(os.getenv('MAX_SEARCH_RESULTS', cls.MAX_SEARCH_RESULTS))
+        except ValueError:
+            return cls.MAX_SEARCH_RESULTS
+    
     # =========== ФЛАГИ (ВКЛ/ВЫКЛ) ===========
+    
+    @classmethod
+    def is_meme_enabled(cls) -> bool:
+        """Проверить, включены ли мемы"""
+        return os.getenv('MEME_ENABLED', 'False').lower() in ['true', '1', 'yes', 'y']
     
     @classmethod
     def is_feedback_enabled(cls) -> bool:
@@ -132,14 +147,6 @@ class Config:
     def is_spam_protection_enabled(cls) -> bool:
         """Проверить, включена ли защита от спама"""
         return os.getenv('SPAM_PROTECTION_ENABLED', 'True').lower() in ['true', '1', 'yes', 'y']
-    
-    @classmethod
-    def get_max_search_results(cls) -> int:
-        """Получить максимальное количество результатов поиска"""
-        try:
-            return int(os.getenv('MAX_SEARCH_RESULTS', cls.MAX_SEARCH_RESULTS))
-        except ValueError:
-            return cls.MAX_SEARCH_RESULTS
     
     # =========== МЕТОДЫ ДЛЯ РАБОТЫ С БАЗОЙ ДАННЫХ ===========
     
@@ -184,6 +191,23 @@ class Config:
     def get_database_type(cls) -> str:
         """Получить тип базы данных"""
         return 'postgresql' if cls.is_postgresql() else 'sqlite'
+    
+    # =========== ДОПОЛНИТЕЛЬНЫЕ МЕТОДЫ ===========
+    
+    @classmethod
+    def get_feedback_limits(cls) -> tuple:
+        """Получить минимальную и максимальную длину отзыва"""
+        return (cls.FEEDBACK_MIN_LENGTH, cls.FEEDBACK_MAX_LENGTH)
+    
+    @classmethod
+    def get_cache_settings(cls) -> tuple:
+        """Получить настройки кэширования"""
+        return (cls.CACHE_MAX_SIZE, cls.CACHE_TTL_SECONDS)
+    
+    @classmethod
+    def get_schedule_settings(cls) -> tuple:
+        """Получить настройки расписания"""
+        return (cls.SLEEP_INTERVAL_HOURS, cls.CLEANUP_OLDER_THAN_DAYS)
 
 # Экспортируем экземпляр для удобства
 config = Config()

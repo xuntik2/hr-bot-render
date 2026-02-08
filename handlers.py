@@ -1,12 +1,14 @@
 """
 ОБРАБОТЧИКИ КОМАНД И СООБЩЕНИЙ
+Асинхронная версия для python-telegram-bot v20.6
 """
 import logging
 import re
 from typing import Optional, Tuple
 from config import config
 from search_engine import SearchEngine
-import utils
+from telegram import Update
+from telegram.ext import ContextTypes
 
 logger = logging.getLogger(__name__)
 
@@ -16,9 +18,9 @@ class CommandHandler:
     def __init__(self, search_engine: SearchEngine):
         self.search_engine = search_engine
     
-    def handle_welcome(self, message, bot):
+    async def handle_welcome(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработка /start"""
-        user_id = message.from_user.id
+        user_id = update.effective_user.id
         
         welcome_text = """
 🤖 *Добро пожаловать в Корпоративный Бот Мечел!*
@@ -41,7 +43,6 @@ class CommandHandler:
 Например: "Как оформить отпуск?"
 """
         
-        # Добавляем информацию о мемах, если они включены
         if config.is_meme_enabled():
             welcome_text += """
 🎭 *Мемы для поднятия настроения:*
@@ -49,23 +50,22 @@ class CommandHandler:
 • /мемподписка - подписаться на ежедневные мемы
 """
         
-        bot.reply_to(message, welcome_text, parse_mode='Markdown')
+        await update.message.reply_text(welcome_text, parse_mode='Markdown')
         logger.info(f"Пользователь {user_id} запустил бота")
     
-    def handle_categories(self, message, bot):
+    async def handle_categories(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработка /категории"""
         try:
             stats = self.search_engine.get_stats()
             
             if 'categories' not in stats or not stats['categories']:
-                bot.reply_to(message, "📂 Категории вопросов еще не добавлены в базу.")
+                await update.message.reply_text("📂 Категории вопросов еще не добавлены в базу.")
                 return
             
             categories = stats['categories']
             
             categories_text = "📂 *Категории вопросов:*\n\n"
             
-            # Маппинг эмодзи для категорий
             emoji_map = {
                 'Отпуск': '🏖️',
                 'Зарплата': '💰',
@@ -102,16 +102,17 @@ class CommandHandler:
             categories_text += f"\n📊 Всего категорий: {len(categories)}"
             categories_text += f"\n💾 Всего вопросов в базе: {stats.get('total_faq', 0)}"
             
-            bot.reply_to(message, categories_text, parse_mode='Markdown')
-            logger.info(f"Пользователь {message.from_user.id} запросил категории")
+            await update.message.reply_text(categories_text, parse_mode='Markdown')
+            logger.info(f"Пользователь {update.effective_user.id} запросил категории")
             
         except Exception as e:
             logger.error(f"Ошибка при получении категорий: {str(e)}", exc_info=True)
-            bot.reply_to(message, "❌ Ошибка при получении категорий.")
+            await update.message.reply_text("❌ Ошибка при получении категорий.")
     
-    def handle_search(self, message, bot):
+    async def handle_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE, query: str = None):
         """Обработка /поиск"""
-        query = message.text
+        if query is None:
+            query = update.message.text
         
         # Убираем команду
         if query.startswith('/поиск'):
@@ -120,22 +121,25 @@ class CommandHandler:
             query = query.replace('/search', '', 1).strip()
         
         if not query:
-            bot.reply_to(
-                message,
-                "🔍 *Поиск по базе знаний*\n\n"
-                "Использование: /поиск [ваш запрос]\n"
-                "Примеры:\n• /поиск как оформить отпуск\n• /поиск справка 2-НДФЛ\n• /поиск график работы",
-                parse_mode='Markdown'
-            )
+            help_text = """
+🔍 *Поиск по базе знаний*
+
+Использование: /поиск [ваш запрос]
+Примеры:
+• /поиск как оформить отпуск
+• /поиск справка 2-НДФЛ
+• /поиск график работы
+"""
+            await update.message.reply_text(help_text, parse_mode='Markdown')
             return
         
         # Обрабатываем запрос
-        self._process_query(message, bot, query)
+        await self._process_query(update, context, query)
     
-    def handle_feedback(self, message, bot):
+    async def handle_feedback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработка /отзыв"""
         if not config.is_feedback_enabled():
-            bot.reply_to(message, "💬 Система отзывов временно отключена.")
+            await update.message.reply_text("💬 Система отзывов временно отключена.")
             return
         
         feedback_text = """
@@ -150,13 +154,13 @@ class CommandHandler:
 
 Ваш отзыв поможет улучшить бота для всех сотрудников!
 """
-        bot.reply_to(message, feedback_text, parse_mode='Markdown')
+        await update.message.reply_text(feedback_text, parse_mode='Markdown')
     
-    def handle_stats(self, message, bot):
+    async def handle_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработка /статистика"""
         admin_ids = config.get_admin_ids()
-        if admin_ids and message.from_user.id not in admin_ids:
-            bot.reply_to(message, "❌ Эта команда доступна только администраторам.")
+        if admin_ids and update.effective_user.id not in admin_ids:
+            await update.message.reply_text("❌ Эта команда доступна только администраторам.")
             return
         
         try:
@@ -178,85 +182,111 @@ class CommandHandler:
 • Индекс ключевых слов: {search_stats.get('keywords_index_size', 0)}
 • Индекс вопросов: {search_stats.get('question_index_size', 0)}
 """
-            bot.reply_to(message, stats_text, parse_mode='Markdown')
+            await update.message.reply_text(stats_text, parse_mode='Markdown')
             
         except Exception as e:
             logger.error(f"Ошибка при получении статистики: {str(e)}", exc_info=True)
-            bot.reply_to(message, "❌ Ошибка при получении статистики.")
+            await update.message.reply_text("❌ Ошибка при получении статистики.")
     
-    def handle_clear_cache(self, message, bot):
+    async def handle_clear_cache(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработка /очистить"""
         admin_ids = config.get_admin_ids()
-        if not admin_ids or message.from_user.id not in admin_ids:
-            bot.reply_to(message, "❌ Эта команда доступна только администраторам.")
+        if not admin_ids or update.effective_user.id not in admin_ids:
+            await update.message.reply_text("❌ Эта команда доступна только администраторам.")
             return
         
         try:
             self.search_engine.refresh_data()
-            bot.reply_to(message, "✅ Кэш поиска успешно очищен и данные обновлены!")
-            logger.info(f"Данные поиска обновлены администратором {message.from_user.id}")
+            await update.message.reply_text("✅ Кэш поиска успешно очищен и данные обновлены!")
+            logger.info(f"Данные поиска обновлены администратором {update.effective_user.id}")
             
         except Exception as e:
             logger.error(f"Ошибка при обновлении данных: {str(e)}", exc_info=True)
-            bot.reply_to(message, "❌ Ошибка при обновлении данных.")
+            await update.message.reply_text("❌ Ошибка при обновлении данных.")
     
-    def _process_query(self, message, bot, query: str):
-        """Обработка текстового запроса пользователя"""
-        user_id = message.from_user.id
+    async def handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка текстового сообщения (не команды)"""
+        text = update.message.text.strip()
         
-        # Проверка на спам
-        is_spam, wait_time = utils.check_spam(user_id)
-        if is_spam:
-            bot.reply_to(
-                message,
-                f"⏳ Слишком много запросов. Подождите {wait_time} секунд.",
-                parse_mode='Markdown'
-            )
+        if not text:
             return
+        
+        # Если начинается с /, но команда не распознана
+        if text.startswith('/'):
+            command = text.split()[0]
+            response = f"""
+❓ *Неизвестная команда:* `{command}`
+
+📋 *Доступные команды:*
+• /start - Начало работы
+• /категории - Список категорий
+• /поиск [вопрос] - Поиск по базе
+• /отзыв - Оставить отзыв
+"""
+            admin_ids = config.get_admin_ids()
+            if admin_ids and update.effective_user.id in admin_ids:
+                response += "• /статистика - Статистика бота\n"
+                response += "• /очистить - Очистить кэш поиска\n"
+            
+            if config.is_meme_enabled():
+                response += "• /мем - Посмотреть мем\n"
+                response += "• /мемподписка - Подписаться на мемы\n"
+            
+            await update.message.reply_text(response, parse_mode='Markdown')
+            return
+        
+        # Обрабатываем как обычный запрос
+        await self._process_query(update, context, text)
+    
+    async def _process_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE, query: str):
+        """Обработка текстового запроса пользователя"""
+        user_id = update.effective_user.id
         
         # Проверка длины запроса
         if len(query) < 3:
-            bot.reply_to(
-                message,
-                "❌ *Запрос слишком короткий*\n\n"
-                "Пожалуйста, задайте более конкретный вопрос.\n"
-                "*Примеры:*\n"
-                "• 'Как оформить отпуск?'\n"
-                "• 'Где получить справку 2-НДФЛ?'\n"
-                "• 'Когда выплачивается зарплата?'",
-                parse_mode='Markdown'
-            )
+            response = """
+❌ *Запрос слишком короткий*
+
+Пожалуйста, задайте более конкретный вопрос.
+*Примеры:*
+• 'Как оформить отпуск?'
+• 'Где получить справку 2-НДФЛ?'
+• 'Когда выплачивается зарплата?'
+"""
+            await update.message.reply_text(response, parse_mode='Markdown')
             return
         
         logger.info(f"Обработка запроса от {user_id}: '{query}'")
         
         # Показываем индикатор "печатает"
-        bot.send_chat_action(message.chat.id, 'typing')
+        await context.bot.send_chat_action(
+            chat_id=update.effective_chat.id,
+            action='typing'
+        )
         
         try:
             result = self.search_engine.search(query, user_id)
             
             if result:
-                self._send_response(message, bot, query, result)
+                await self._send_response(update, context, query, result)
             else:
-                self._handle_no_result(message, bot, query)
+                await self._handle_no_result(update, context, query)
                 
         except Exception as e:
             logger.error(f"Ошибка при поиске: {str(e)}", exc_info=True)
-            bot.reply_to(
-                message,
+            await update.message.reply_text(
                 "❌ Произошла ошибка при поиске. Попробуйте позже.",
                 parse_mode='Markdown'
             )
     
-    def _send_response(self, message, bot, original_query: str, result: Tuple):
+    async def _send_response(self, update: Update, context: ContextTypes.DEFAULT_TYPE, 
+                           original_query: str, result: Tuple):
         """Отправка найденного ответа"""
         try:
             faq_id, question, answer, category, score = result
             
             relevance_percent = min(int(score), 100)
             
-            # Определяем эмодзи в зависимости от релевантности
             if relevance_percent >= 80:
                 relevance_emoji = "🟢"
             elif relevance_percent >= 50:
@@ -275,17 +305,17 @@ class CommandHandler:
 🔍 *По запросу:* "{original_query[:50]}..."
 """
             
-            bot.reply_to(message, response, parse_mode='Markdown')
+            await update.message.reply_text(response, parse_mode='Markdown')
             
-            logger.info(f"Ответ отправлен пользователю {message.from_user.id} (FAQ ID: {faq_id}, релевантность: {relevance_percent}%)")
+            logger.info(f"Ответ отправлен пользователю {update.effective_user.id} (FAQ ID: {faq_id}, релевантность: {relevance_percent}%)")
             
         except Exception as e:
             logger.error(f"Ошибка при отправке ответа: {str(e)}", exc_info=True)
-            bot.reply_to(message, "❌ Произошла ошибка при отправке ответа.")
+            await update.message.reply_text("❌ Произошла ошибка при отправке ответа.")
     
-    def _handle_no_result(self, message, bot, query: str):
+    async def _handle_no_result(self, update: Update, context: ContextTypes.DEFAULT_TYPE, query: str):
         """Обработка случая, когда ответ не найден"""
-        user_id = message.from_user.id
+        user_id = update.effective_user.id
         
         # Ищем похожие вопросы
         similar_questions = []
@@ -334,7 +364,7 @@ class CommandHandler:
 • Используйте поиск: /поиск [ключевые слова]
 """
         
-        bot.reply_to(message, response, parse_mode='Markdown')
+        await update.message.reply_text(response, parse_mode='Markdown')
         
         # Сохраняем неотвеченный запрос
         if config.is_feedback_enabled():
@@ -357,37 +387,3 @@ class CommandHandler:
             
         except Exception as e:
             logger.error(f"Ошибка сохранения неотвеченного запроса: {str(e)}", exc_info=True)
-    
-    def handle_text_message(self, message, bot):
-        """Обработка текстового сообщения (не команды)"""
-        text = message.text.strip()
-        
-        if not text:
-            return
-        
-        # Если начинается с /, но команда не распознана
-        if text.startswith('/'):
-            command = text.split()[0]
-            response = f"""
-❓ *Неизвестная команда:* `{command}`
-
-📋 *Доступные команды:*
-• /start - Начало работы
-• /категории - Список категорий
-• /поиск [вопрос] - Поиск по базе
-• /отзыв - Оставить отзыв
-"""
-            admin_ids = config.get_admin_ids()
-            if admin_ids and message.from_user.id in admin_ids:
-                response += "• /статистика - Статистика бота\n"
-                response += "• /очистить - Очистить кэш поиска\n"
-            
-            if config.is_meme_enabled():
-                response += "• /мем - Посмотреть мем\n"
-                response += "• /мемподписка - Подписаться на мемы\n"
-            
-            bot.reply_to(message, response, parse_mode='Markdown')
-            return
-        
-        # Обрабатываем как обычный запрос
-        self._process_query(message, bot, text)

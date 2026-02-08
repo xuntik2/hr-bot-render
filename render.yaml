@@ -8,8 +8,27 @@ services:
     buildCommand: |
       pip install --upgrade pip
       pip install -r requirements.txt
-      python init_database.py  # Надежное заполнение базы
-      python check_database.py  # Проверка результата
+      
+      echo "🗄️  Принудительная инициализация базы данных..."
+      python force_init_db.py
+      
+      echo "🔍 Проверка результата..."
+      python -c "
+      import sys
+      sys.path.insert(0, '.')
+      from config import config
+      conn = config.get_db_connection()
+      cur = conn.cursor()
+      cur.execute('SELECT COUNT(*) FROM faq')
+      count = cur.fetchone()[0]
+      conn.close()
+      print(f'✅ В базе данных записей: {count}')
+      if count < 75:
+          print('❌ ОШИБКА: В базе меньше 75 записей!')
+          sys.exit(1)
+      else:
+          print('🎉 База данных успешно заполнена!')
+      "
     startCommand: python bot.py
     envVars:
       - key: BOT_TOKEN
@@ -34,4 +53,3 @@ services:
         value: "10000"
     healthCheckPath: /health
     healthCheckInterval: 60
-    initialDeployHook: "echo '🚀 Начало деплоя HR-бота'"

@@ -20,7 +20,6 @@ def create_database():
         
         logger.info("🔧 Создание структуры базы данных...")
         
-        # Создаем таблицу FAQ
         if config.is_postgresql():
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS faq (
@@ -50,7 +49,6 @@ def create_database():
                 )
             ''')
         
-        # Создаем таблицу для обратной связи
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS feedback (
                 id SERIAL PRIMARY KEY,
@@ -60,7 +58,6 @@ def create_database():
             )
         ''')
         
-        # Создаем таблицу для неотвеченных запросов
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS unanswered_queries (
                 id SERIAL PRIMARY KEY,
@@ -72,10 +69,8 @@ def create_database():
         
         logger.info("✅ Таблицы созданы")
         
-        # Получаем данные из единого источника
         faq_data = get_faq_data()
         
-        # Проверяем, есть ли уже данные
         cursor.execute("SELECT COUNT(*) FROM faq")
         count = cursor.fetchone()[0]
         
@@ -86,7 +81,6 @@ def create_database():
             placeholder = config.get_placeholder()
             
             for faq in faq_data:
-                # Проверяем, есть ли уже такой вопрос
                 cursor.execute(
                     f"SELECT id FROM faq WHERE norm_question = {placeholder}",
                     (faq['norm_question'],)
@@ -94,7 +88,6 @@ def create_database():
                 if cursor.fetchone():
                     continue
                 
-                # Добавляем вопрос
                 query = f'''
                     INSERT INTO faq (question, answer, keywords, norm_keywords, norm_question, category)
                     VALUES ({placeholder}, {placeholder}, {placeholder}, {placeholder}, {placeholder}, {placeholder})
@@ -113,7 +106,6 @@ def create_database():
         else:
             logger.info(f"ℹ️ База уже содержит {count} вопросов")
         
-        # Создаем индексы для ускорения поиска
         logger.info("⚡ Создание индексов...")
         
         indexes = [
@@ -133,7 +125,6 @@ def create_database():
         
         logger.info("✅ База данных готова!")
         
-        # Показываем статистику
         show_statistics()
         
     except Exception as e:

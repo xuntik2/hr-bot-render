@@ -59,9 +59,10 @@ def initialize_app():
         faq_count = len(search_engine.faq_data) if search_engine else 0
         logger.info(f"✅ Поисковый движок готов. FAQ: {faq_count}")
         
-        if faq_count < 10:  # Если мало вопросов - это проблема
+        if faq_count < 50:  # Если мало вопросов - это проблема
             logger.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА: Загружено только {faq_count} FAQ вместо 75")
-            logger.error("   Проблема с базой данных или скриптом create_database.py")
+            logger.error("   Запустите init_database.py для заполнения базы")
+            # Но не прекращаем работу - бот может работать и с меньшим числом FAQ
     except Exception as e:
         logger.error(f"❌ Ошибка поискового движка: {e}", exc_info=True)
         search_engine = None
@@ -80,13 +81,13 @@ def initialize_app():
         
         logger.info(f"🔧 Создание приложения Telegram с токеном: {bot_token[:10]}...")
         
-        # Создаем приложение без использования Updater
-        telegram_app = Application.builder().token(bot_token).build()
+        # Создаем приложение с настройками таймаутов
+        telegram_app = Application.builder().token(bot_token).read_timeout(30).write_timeout(30).build()
         
         # Регистрация обработчиков команд
         _register_bot_handlers()
         
-        # Инициализируем приложение (но не запускаем polling)
+        # Инициализируем приложение
         logger.info("✅ Приложение Telegram создано")
         bot_initialized = True
         
@@ -101,7 +102,7 @@ def initialize_app():
 def _register_bot_handlers():
     """Регистрация обработчиков команд бота"""
     if not command_handler or not telegram_app:
-        logger.error("❌ Не удалось зарегистрировать обработчики: telegram_app или command_handler не инициализированы")
+        logger.error("❌ Не удалось зарегистрировать обработчики")
         return
     
     # Обработчик команды /start и /help
@@ -117,7 +118,7 @@ def _register_bot_handlers():
     # Обработчик команды /поиск
     async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.message.text.replace('/поиск', '').replace('/search', '').strip()
-        logger.info(f"📝 /поиск от {update.effective_user.id}: {query[:50]}")
+        logger.info(f"📝 /поиск от {update.effective_user.id}: {query[:50]}...")
         await command_handler.handle_search(update, context, query)
     
     # Обработчик команды /отзыв
@@ -137,7 +138,8 @@ def _register_bot_handlers():
     
     # Обработчик всех текстовых сообщений
     async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        logger.info(f"📝 Сообщение от {update.effective_user.id}: {update.message.text[:100]}")
+        text = update.message.text[:100] if update.message.text else ""
+        logger.info(f"📝 Сообщение от {update.effective_user.id}: {text}")
         try:
             if command_handler:
                 await command_handler.handle_text_message(update, context)
@@ -174,7 +176,7 @@ def index():
     db_type = 'PostgreSQL' if os.getenv('DATABASE_URL') else 'SQLite'
     
     bot_status = "✅ Активен" if bot_initialized else "❌ Ошибка инициализации"
-    faq_status = "✅ 75 вопросов" if faq_count >= 75 else f"❌ Только {faq_count} вопросов"
+    faq_status = f"✅ {faq_count} вопросов" if faq_count >= 50 else f"⚠️ Только {faq_count} вопросов"
     
     return f'''
     <!DOCTYPE html>
@@ -192,15 +194,17 @@ def index():
             .links a {{ display: inline-block; margin: 10px 15px 10px 0; padding: 10px 20px;
                       background: #007bff; color: white; text-decoration: none; border-radius: 5px; }}
             .links a:hover {{ background: #0056b3; }}
+            .good {{ color: #28a745; }}
+            .bad {{ color: #dc3545; }}
         </style>
     </head>
     <body>
         <h1>🤖 HR Bot Мечел — Статус: {bot_status}</h1>
         
-        {'<div class="error">' if not bot_initialized else ('<div class="warning">' if faq_count < 75 else '<div class="status">')}
+        <div class="{'error' if not bot_initialized else ('warning' if faq_count < 50 else 'status')}">
             <h3>📊 Статус системы:</h3>
-            <p><strong>Бот:</strong> {bot_status}</p>
-            <p><strong>FAQ в базе:</strong> {faq_status}</p>
+            <p><strong>Бот:</strong> <span class="{'' if bot_initialized else 'bad'}">{bot_status}</span></p>
+            <p><strong>FAQ в базе:</strong> <span class="{'' if faq_count >= 50 else 'bad'}">{faq_status}</span></p>
             <p><strong>Тип БД:</strong> {db_type}</p>
             <p><strong>Webhook готов:</strong> {'✅ Да' if bot_initialized else '❌ Нет'}</p>
             {'<p><strong>Проблема:</strong> Ошибка инициализации Telegram API</p>' if not bot_initialized else ''}
@@ -239,7 +243,7 @@ def health_check():
         status_code = 200  # Возвращаем 200, чтобы Render не перезапускал
     else:
         status = "unhealthy"
-        status_code = 500
+        status_code = 503  # 503 - Service Unavailable
     
     status_data = {
         "status": status,
@@ -275,6 +279,7 @@ def debug_info():
         "python_version": sys.version,
         "environment_variables": {
             "BOT_TOKEN_set": bool(os.getenv('BOT_TOKEN')),
+            "BOT_TOKEN_length": len(os.getenv('BOT_TOKEN', '')),
             "DATABASE_URL_set": bool(os.getenv('DATABASE_URL')),
             "RENDER_EXTERNAL_URL": os.getenv('RENDER_EXTERNAL_URL', 'Not set'),
             "PORT": os.getenv('PORT', 'Not set')
@@ -288,6 +293,10 @@ def debug_info():
         "config_check": {
             "is_postgresql": config.is_postgresql(),
             "bot_token_length": len(config.get_bot_token()) if config.get_bot_token() else 0
+        },
+        "system_info": {
+            "cwd": os.getcwd(),
+            "files": [f for f in os.listdir('.') if os.path.isfile(f)]
         }
     }
     
@@ -296,6 +305,16 @@ def debug_info():
 @app.route('/set_webhook', methods=['GET', 'POST'])
 def set_webhook_endpoint():
     """Ручная установка вебхука"""
+    if not telegram_app or not bot_initialized:
+        msg = "❌ Бот не инициализирован. Сначала исправьте ошибки инициализации."
+        return f'''
+        <h1>🔧 Результат установки вебхука</h1>
+        <div style="padding: 20px; background: #f8d7da; border-radius: 8px;">
+            {msg}
+        </div>
+        <p style="margin-top: 20px;"><a href="/">← На главную</a></p>
+        ''', 500
+    
     if request.method == 'GET':
         return '''
         <h1>🔧 Установка вебхука</h1>
@@ -309,16 +328,6 @@ def set_webhook_endpoint():
         '''
     
     # POST запрос - установка вебхука
-    if not telegram_app or not bot_initialized:
-        msg = "❌ Бот не инициализирован. Сначала исправьте ошибки инициализации."
-        return f'''
-        <h1>🔧 Результат установки вебхука</h1>
-        <div style="padding: 20px; background: #f8d7da; border-radius: 8px;">
-            {msg}
-        </div>
-        <p style="margin-top: 20px;"><a href="/">← На главную</a></p>
-        ''', 500
-    
     try:
         domain = os.getenv('RENDER_EXTERNAL_URL', 'https://hr-bot-mechel.onrender.com')
         if domain.startswith('https://'):
@@ -327,52 +336,15 @@ def set_webhook_endpoint():
         webhook_url = f"https://{domain}/webhook"
         logger.info(f"🔄 Установка вебхука на {webhook_url}")
         
-        # Используем asyncio для установки вебхука
-        async def set_webhook_task():
-            await telegram_app.bot.delete_webhook()  # Сначала удаляем старый
-            await telegram_app.bot.set_webhook(
-                url=webhook_url,
-                max_connections=40,
-                allowed_updates=['message', 'callback_query']
-            )
+        # Устанавливаем вебхук
+        success = asyncio.run(set_webhook(webhook_url))
         
-        # Запускаем в отдельном потоке
-        def run_async():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(set_webhook_task())
-            loop.close()
-        
-        thread = threading.Thread(target=run_async)
-        thread.start()
-        thread.join(timeout=10)
-        
-        if thread.is_alive():
-            msg = "❌ Таймаут при установке вебхука"
-            logger.error(msg)
-        else:
+        if success:
             msg = f"✅ Вебхук успешно установлен!<br>URL: <code>{webhook_url}</code>"
             logger.info("✅ Вебхук установлен")
-            
-            # Получаем информацию о вебхуке
-            async def get_webhook_info_task():
-                return await telegram_app.bot.get_webhook_info()
-            
-            def get_info():
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                info = loop.run_until_complete(get_webhook_info_task())
-                loop.close()
-                return info
-            
-            info_thread = threading.Thread(target=get_info)
-            info_thread.start()
-            info_thread.join(timeout=5)
-            
-            if not info_thread.is_alive():
-                msg += f"<br><br>📊 Информация от Telegram:<br>"
-                msg += f"• Ожидающих обновлений: 0<br>"
-                msg += f"• URL: {webhook_url}"
+        else:
+            msg = "❌ Не удалось установить вебхук"
+            logger.error(msg)
         
     except Exception as e:
         msg = f"❌ Ошибка: {str(e)}"
@@ -386,6 +358,20 @@ def set_webhook_endpoint():
     <p style="margin-top: 20px;"><a href="/">← На главную</a> | <a href="/webhook_info">ℹ️ Информация о вебхуке</a></p>
     ''', 200 if '✅' in msg else 500
 
+async def set_webhook(webhook_url: str):
+    """Асинхронная установка вебхука"""
+    try:
+        await telegram_app.bot.delete_webhook()
+        await telegram_app.bot.set_webhook(
+            url=webhook_url,
+            max_connections=40,
+            allowed_updates=['message', 'callback_query']
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка установки вебхука: {e}")
+        return False
+
 @app.route('/webhook_info')
 def webhook_info():
     """Страница с информацией о текущем вебхуке"""
@@ -398,44 +384,15 @@ def webhook_info():
     
     try:
         # Получаем информацию о вебхуке
-        async def get_webhook_info_task():
-            return await telegram_app.bot.get_webhook_info()
-        
-        def get_info():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            info = loop.run_until_complete(get_webhook_info_task())
-            loop.close()
-            return info
-        
-        thread = threading.Thread(target=get_info)
-        thread.start()
-        thread.join(timeout=5)
-        
-        if thread.is_alive():
-            return '<h1>❌ Таймаут</h1><p>Не удалось получить информацию о вебхуке</p>', 500
-        
-        info = get_info() if 'info' in locals() else None
-        
-        if info:
-            status = {
-                "url": info.url or "Не установлен",
-                "has_custom_certificate": info.has_custom_certificate,
-                "pending_update_count": info.pending_update_count,
-                "last_error_date": info.last_error_date,
-                "last_error_message": info.last_error_message or "Нет ошибок",
-                "max_connections": info.max_connections,
-            }
-        else:
-            status = {"url": "Не удалось получить информацию"}
+        info = asyncio.run(get_webhook_info())
         
         return f'''
         <h1>ℹ️ Информация о вебхуке</h1>
         <div style="background: #f8f9fa; padding: 20px; border-radius: 8px;">
-            <p><strong>URL:</strong> <code>{status['url']}</code></p>
-            <p><strong>Ожидающих обновлений:</strong> {status.get('pending_update_count', 'N/A')}</p>
-            <p><strong>Последняя ошибка:</strong> {status.get('last_error_message', 'N/A')}</p>
-            <p><strong>Макс. соединений:</strong> {status.get('max_connections', 'N/A')}</p>
+            <p><strong>URL:</strong> <code>{info.url or 'Не установлен'}</code></p>
+            <p><strong>Ожидающих обновлений:</strong> {info.pending_update_count}</p>
+            <p><strong>Последняя ошибка:</strong> {info.last_error_message or 'Нет ошибок'}</p>
+            <p><strong>Макс. соединений:</strong> {info.max_connections}</p>
         </div>
         <p style="margin-top: 20px;">
             <a href="/">← На главную</a> |
@@ -445,12 +402,16 @@ def webhook_info():
     except Exception as e:
         return f'<h1>❌ Ошибка</h1><p>Не удалось получить информацию: {e}</p>', 500
 
+async def get_webhook_info():
+    """Получить информацию о вебхуке"""
+    return await telegram_app.bot.get_webhook_info()
+
 @app.route('/webhook', methods=['POST'])
 def telegram_webhook():
     """Основной эндпоинт для получения обновлений от Telegram"""
     if not telegram_app or not bot_initialized:
         logger.error("❌ Вебхук вызван, но бот не инициализирован")
-        return 'Bot not initialized', 500
+        return jsonify({'error': 'Bot not initialized'}), 503
     
     if request.headers.get('content-type') != 'application/json':
         return 'Bad Request', 400
@@ -461,22 +422,8 @@ def telegram_webhook():
         # Создаем Update из JSON
         update = Update.de_json(json_string, telegram_app.bot)
         
-        # Обрабатываем update асинхронно в отдельном потоке
-        async def process_update_task():
-            await telegram_app.process_update(update)
-        
-        def run_async():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(process_update_task())
-            loop.close()
-        
-        # Запускаем в отдельном потоке, чтобы не блокировать Flask
-        thread = threading.Thread(target=run_async)
-        thread.start()
-        
-        # Не ждем завершения, чтобы быстро отвечать Telegram
-        # (Telegram ожидает ответ в течение 10 секунд)
+        # Обрабатываем update асинхронно
+        asyncio.run(process_update(update))
         
         return '', 200
             
@@ -484,9 +431,13 @@ def telegram_webhook():
         logger.error(f"❌ Ошибка обработки вебхука: {e}", exc_info=True)
         return 'Internal Server Error', 500
 
+async def process_update(update: Update):
+    """Обработка обновления"""
+    await telegram_app.process_update(update)
+
 # ================== ИНИЦИАЛИЗАЦИЯ ==================
 
-# Инициализируем приложение
+# Инициализируем приложение при старте
 try:
     logger.info("🔧 Запуск инициализации приложения...")
     success = initialize_app()
@@ -508,15 +459,8 @@ try:
                     
                     webhook_url = f"https://{domain}/webhook"
                     
-                    async def set_webhook():
-                        await telegram_app.bot.delete_webhook()
-                        await telegram_app.bot.set_webhook(url=webhook_url)
-                        logger.info(f"✅ Вебхук установлен: {webhook_url}")
-                    
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    loop.run_until_complete(set_webhook())
-                    loop.close()
+                    asyncio.run(set_webhook(webhook_url))
+                    logger.info(f"✅ Вебхук установлен: {webhook_url}")
                 except Exception as e:
                     logger.warning(f"⚠️ Не удалось установить вебхук автоматически: {e}")
             
@@ -527,13 +471,6 @@ try:
         logger.error("❌ Инициализация приложения завершилась с ошибками")
         logger.error("❌ Бот не будет работать корректно")
         
-        # Показываем возможные причины
-        logger.error("🔍 Возможные причины:")
-        logger.error("   1. Не указан BOT_TOKEN в переменных окружения")
-        logger.error("   2. Ошибка в DATABASE_URL (PostgreSQL)")
-        logger.error("   3. Проблема с python-telegram-bot версии 20.6")
-        logger.error("   4. База данных не содержит все 75 вопросов")
-        
 except Exception as e:
     logger.critical(f"❌ КРИТИЧЕСКАЯ ОШИБКА ПРИ ИНИЦИАЛИЗАЦИИ: {e}", exc_info=True)
 
@@ -542,10 +479,4 @@ if __name__ == '__main__':
     logger.warning("⚠️ ЛОКАЛЬНЫЙ ЗАПУСК - только для разработки!")
     port = int(os.environ.get('PORT', 10000))
     logger.info(f"🌐 Запуск Flask сервера на порту {port}")
-    
-    # Для локального запуска можно добавить простой polling
-    if telegram_app and bot_initialized:
-        logger.info("🤖 Для локальной разработки используйте polling командой:")
-        logger.info("   python -m telegram.ext --token YOUR_TOKEN")
-    
     app.run(host='0.0.0.0', port=port, debug=False)

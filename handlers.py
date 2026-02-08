@@ -1,19 +1,16 @@
 """
 ОБРАБОТЧИКИ КОМАНД И СООБЩЕНИЙ
-С улучшенной логикой и исправлением ошибок
 """
-
 import logging
-from datetime import datetime
-from typing import Optional, Tuple
 import re
+from typing import Optional, Tuple
 from config import config
 from search_engine import SearchEngine
 
 logger = logging.getLogger(__name__)
 
 class CommandHandler:
-    """Полный обработчик команд с улучшенной логикой"""
+    """Обработчик команд с улучшенной логикой"""
     
     def __init__(self, search_engine: SearchEngine):
         self.search_engine = search_engine
@@ -67,7 +64,7 @@ class CommandHandler:
             
             categories_text = "📂 *Категории вопросов:*\n\n"
             
-            # Маппинг эмодзи для категории
+            # Маппинг эмодзи для категорий
             emoji_map = {
                 'Отпуск': '🏖️',
                 'Зарплата': '💰',
@@ -78,7 +75,22 @@ class CommandHandler:
                 'Обучение': '🎓',
                 'Льготы': '🎁',
                 'Командировки': '✈️',
-                'Трудоустройство': '💼'
+                'Трудоустройство': '💼',
+                'Охрана труда': '🛡️',
+                'Корпоративная культура': '🏢',
+                'Соцпакет': '🎁',
+                'Развитие': '📈',
+                'Портал': '🌐',
+                'Праздники': '🎉',
+                'Семья': '👨‍👩‍👧‍👦',
+                'Финансы': '💵',
+                'График работы': '🕒',
+                'Кадры': '👥',
+                'Связь': '📱',
+                'Информация': 'ℹ️',
+                'Безопасность': '🔐',
+                'Питание': '🍽️',
+                'Спорт': '⚽'
             }
             
             for category in sorted(categories):
@@ -130,7 +142,7 @@ class CommandHandler:
 
 Пожалуйста, напишите ваш отзыв, предложение или замечание по работе бота.
 
-Требования:
+*Требования:*
 • Минимум 3 символа
 • Максимум 500 символов
 • Конструктивная критика приветствуется
@@ -170,6 +182,22 @@ class CommandHandler:
         except Exception as e:
             logger.error(f"Ошибка при получении статистики: {str(e)}", exc_info=True)
             bot.reply_to(message, "❌ Ошибка при получении статистики.")
+    
+    def handle_clear_cache(self, message, bot):
+        """Обработка /очистить"""
+        admin_ids = config.get_admin_ids()
+        if not admin_ids or message.from_user.id not in admin_ids:
+            bot.reply_to(message, "❌ Эта команда доступна только администраторам.")
+            return
+        
+        try:
+            self.search_engine.refresh_data()
+            bot.reply_to(message, "✅ Кэш поиска успешно очищен и данные обновлены!")
+            logger.info(f"Данные поиска обновлены администратором {message.from_user.id}")
+            
+        except Exception as e:
+            logger.error(f"Ошибка при обновлении данных: {str(e)}", exc_info=True)
+            bot.reply_to(message, "❌ Ошибка при обновлении данных.")
     
     def _process_query(self, message, bot, query: str):
         """Обработка текстового запроса пользователя"""
@@ -215,7 +243,7 @@ class CommandHandler:
         try:
             faq_id, question, answer, category, score = result
             
-            relevance_percent = min(int(score * 10), 100)
+            relevance_percent = min(int(score), 100)
             
             # Определяем эмодзи в зависимости от релевантности
             if relevance_percent >= 80:
@@ -297,7 +325,7 @@ class CommandHandler:
         
         bot.reply_to(message, response, parse_mode='Markdown')
         
-        # Сохраняем неотвеченый запрос
+        # Сохраняем неотвеченный запрос
         if config.is_feedback_enabled():
             self._save_unanswered_query(user_id, query)
         
@@ -310,7 +338,6 @@ class CommandHandler:
             cursor = conn.cursor()
             placeholder = config.get_placeholder()
             
-            # ИСПРАВЛЕНИЕ: Используем прямой вызов cursor.execute
             sql = f"INSERT INTO unanswered_queries (user_id, query_text) VALUES ({placeholder}, {placeholder})"
             cursor.execute(sql, (user_id, query))
             
@@ -342,6 +369,11 @@ class CommandHandler:
             admin_ids = config.get_admin_ids()
             if admin_ids and message.from_user.id in admin_ids:
                 response += "• /статистика - Статистика бота\n"
+                response += "• /очистить - Очистить кэш поиска\n"
+            
+            if config.is_meme_enabled():
+                response += "• /мем - Посмотреть мем\n"
+                response += "• /мемподписка - Подписаться на мемы\n"
             
             bot.reply_to(message, response, parse_mode='Markdown')
             return

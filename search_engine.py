@@ -51,28 +51,6 @@ class SearchEngine:
             conn = config.get_db_connection()
             cursor = conn.cursor()
             
-            # Проверяем существование таблицы faq
-            if config.is_postgresql():
-                cursor.execute("""
-                    SELECT EXISTS (
-                        SELECT FROM information_schema.tables 
-                        WHERE table_name = 'faq'
-                    );
-                """)
-            else:
-                cursor.execute("""
-                    SELECT name FROM sqlite_master 
-                    WHERE type='table' AND name='faq';
-                """)
-            
-            table_exists = cursor.fetchone()[0]
-            
-            if not table_exists:
-                logger.warning("Таблица 'faq' не существует. Загрузка FAQ невозможна.")
-                self.faq_data = []
-                conn.close()
-                return
-            
             cursor.execute("SELECT * FROM faq")
             rows = cursor.fetchall()
             
@@ -107,14 +85,12 @@ class SearchEngine:
         for faq in self.faq_data:
             faq_id = faq.id
             
-            # Индексация по категории
             if faq.category:
                 category = faq.category.strip()
                 if category not in self.category_index:
                     self.category_index[category] = []
                 self.category_index[category].append(faq_id)
             
-            # Индексация ключевых слов
             if faq.keywords:
                 keywords_list = [k.strip().lower() for k in faq.keywords.split(',') if k.strip()]
                 for keyword in keywords_list:
@@ -125,7 +101,6 @@ class SearchEngine:
                         if faq_id not in self.keywords_index[keyword_clean]:
                             self.keywords_index[keyword_clean].append(faq_id)
             
-            # Индексация слов из нормализованного вопроса
             if faq.norm_question:
                 words = faq.norm_question.split()
                 for word in words:
@@ -149,26 +124,21 @@ class SearchEngine:
         score = 0.0
         query_lower = query.lower()
         
-        # Точное совпадение вопроса
         if query_lower == faq.question.lower():
             return 100.0
         
-        # Подготовка данных для сравнения
         query_words = set(self._clean_word(w) for w in query_lower.split() if self._clean_word(w))
         
-        # Совпадение ключевых слов
         if faq.keywords:
             faq_keywords = set(k.strip().lower() for k in faq.keywords.split(',') if k.strip())
             common_keywords = query_words.intersection(faq_keywords)
             if common_keywords:
                 score += len(common_keywords) * 20.0
         
-        # Совпадение слов в вопросе
         for q_word in query_words:
             if q_word in faq.norm_question:
                 score += 30.0
         
-        # Учитываем популярность (usage_count)
         score += min(faq.usage_count * 0.5, 10.0)
         
         return min(score, 100.0)
@@ -178,7 +148,6 @@ class SearchEngine:
         self.stats['total_searches'] += 1
         start_time = time.time()
         
-        # Проверка кэша
         cache_key = hashlib.md5(query.encode()).hexdigest()[:8]
         if cache_key in self.search_cache:
             self.stats['cache_hits'] += 1
@@ -186,7 +155,6 @@ class SearchEngine:
         
         self.stats['cache_misses'] += 1
         
-        # Получаем кандидатов через инвертированный индекс
         candidate_ids = set()
         query_words = set(self._clean_word(w) for w in query.lower().split() if self._clean_word(w))
         
@@ -196,11 +164,9 @@ class SearchEngine:
             if word in self.question_index:
                 candidate_ids.update(self.question_index[word])
         
-        # Если кандидатов нет, проверяем все FAQ
         if not candidate_ids:
             candidate_ids = set(range(len(self.faq_data)))
         
-        # Поиск лучшего совпадения
         best_match = None
         best_score = 0.0
         threshold = config.get_search_threshold()
@@ -216,16 +182,13 @@ class SearchEngine:
                 best_score = score
                 best_match = (faq.id, faq.question, faq.answer, faq.category, score)
         
-        # Обновляем статистику использования
         if best_match and best_score >= threshold:
             self._update_usage_count(best_match[0])
             self.search_cache[cache_key] = best_match
             
-            # Ограничиваем размер кэша
             if len(self.search_cache) > 1000:
                 self.search_cache.pop(next(iter(self.search_cache)))
         
-        # Логирование времени
         search_time = time.time() - start_time
         self.stats['total_time'] += search_time
         
@@ -244,7 +207,6 @@ class SearchEngine:
             conn.commit()
             conn.close()
             
-            # Обновляем в памяти
             for faq in self.faq_data:
                 if faq.id == faq_id:
                     faq.usage_count += 1

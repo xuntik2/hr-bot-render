@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """
-КОРПОРАТИВНЫЙ БОТ МЕЧЕЛ ДЛЯ RENDER + POSTGRESQL
-Оптимизированная версия с вебхуками и полной поддержкой базы данных
+ГЛАВНЫЙ ФАЙЛ БОТА ДЛЯ RENDER
 """
-
 import os
-import logging
 import time
+import logging
 from flask import Flask, request, jsonify
 import telebot
 from telebot import types
@@ -88,30 +86,17 @@ def _register_bot_handlers():
     @bot.message_handler(commands=['отзыв', 'feedback'])
     def feedback_command(message):
         logger.info(f"📝 /отзыв от {message.from_user.id}")
-        if hasattr(command_handler, 'handle_feedback'):
-            command_handler.handle_feedback(message, bot)
-        else:
-            bot.reply_to(message, "Функция отзывов временно недоступна")
+        command_handler.handle_feedback(message, bot)
     
     @bot.message_handler(commands=['статистика', 'stats'])
     def stats_command(message):
-        """Статистика (только для админов)"""
-        admin_ids = config.get_admin_ids()
-        if admin_ids and message.from_user.id in admin_ids:
-            try:
-                stats = search_engine.get_stats() if search_engine else {}
-                response = (
-                    f"📊 Статистика бота:\n"
-                    f"• FAQ в базе: {stats.get('total_faq', 0)}\n"
-                    f"• Всего поисков: {stats.get('total_searches', 0)}\n"
-                    f"• Уникальных слов: {stats.get('unique_words', 0)}"
-                )
-                bot.reply_to(message, response)
-            except Exception as e:
-                logger.error(f"Ошибка статистики: {e}")
-                bot.reply_to(message, "❌ Не удалось получить статистику")
-        else:
-            bot.reply_to(message, "⚠️ Эта команда доступна только администраторам")
+        logger.info(f"📝 /статистика от {message.from_user.id}")
+        command_handler.handle_stats(message, bot)
+    
+    @bot.message_handler(commands=['очистить'])
+    def clear_cache_command(message):
+        logger.info(f"📝 /очистить от {message.from_user.id}")
+        command_handler.handle_clear_cache(message, bot)
     
     # Обработка всех текстовых сообщений
     @bot.message_handler(func=lambda message: True)
@@ -133,7 +118,6 @@ def index():
     """Главная страница"""
     faq_count = len(search_engine.faq_data) if search_engine else 0
     db_type = 'PostgreSQL' if os.getenv('DATABASE_URL') else 'SQLite'
-    bot_username = config.get_bot_token().split(':')[0] if bot else ''
     
     return f'''
     <!DOCTYPE html>
@@ -147,7 +131,7 @@ def index():
             h1 {{ color: #333; }}
             .status {{ background: #f0f9ff; padding: 15px; border-radius: 8px; margin: 20px 0; }}
             .links a {{ display: inline-block; margin: 10px 15px 10px 0; padding: 10px 20px;
-            background: #007bff; color: white; text-decoration: none; border-radius: 5px; }}
+                      background: #007bff; color: white; text-decoration: none; border-radius: 5px; }}
             .links a:hover {{ background: #0056b3; }}
         </style>
     </head>
@@ -164,7 +148,6 @@ def index():
             <a href="/health">Health Check</a>
             <a href="/set_webhook">Установить вебхук</a>
             <a href="/webhook_info">Информация о вебхуке</a>
-            <a href="https://t.me/{bot_username}">Написать боту</a>
         </div>
         <div style="margin-top: 30px; color: #666; font-size: 14px;">
             <p>Время запуска: {time.strftime('%Y-%m-%d %H:%M:%S')}</p>
@@ -178,7 +161,7 @@ def health_check():
     """Health check endpoint для Render"""
     status = {
         "status": "healthy",
-        "service": "hr-bot",
+        "service": "hr-bot-mechel",
         "bot_initialized": bot is not None,
         "search_engine": search_engine is not None,
         "faq_count": len(search_engine.faq_data) if search_engine else 0,
@@ -188,7 +171,7 @@ def health_check():
 
 @app.route('/set_webhook', methods=['GET', 'POST'])
 def set_webhook_endpoint():
-    """Ручная установка вебхука (для отладки)"""
+    """Ручная установка вебхука"""
     if request.method == 'GET':
         return '''
         <h1>🔧 Установка вебхука</h1>
@@ -203,16 +186,16 @@ def set_webhook_endpoint():
     
     # POST запрос - установка вебхука
     try:
-        # Получаем домен из переменных окружения или используем текущий
-        domain = os.getenv('RENDER_EXTERNAL_URL', 'https://hr-bot-render.onrender.com')
+        domain = os.getenv('RENDER_EXTERNAL_URL', 'https://hr-bot-mechel.onrender.com')
         if domain.startswith('https://'):
             domain = domain[8:]
+        
         webhook_url = f"https://{domain}/webhook"
         logger.info(f"🔄 Установка вебхука на {webhook_url}")
         
         # Удаляем старый вебхук
         bot.remove_webhook()
-        time.sleep(1)  # Небольшая пауза
+        time.sleep(1)
         
         # Устанавливаем новый вебхук
         success = bot.set_webhook(
@@ -224,7 +207,7 @@ def set_webhook_endpoint():
         if success:
             msg = f"✅ Вебхук успешно установлен!<br>URL: <code>{webhook_url}</code>"
             logger.info("✅ Вебхук установлен")
-            # Получаем информацию о вебхуке для проверки
+            
             try:
                 webhook_info = bot.get_webhook_info()
                 msg += f"<br><br>📊 Информация от Telegram:<br>"
@@ -233,8 +216,9 @@ def set_webhook_endpoint():
             except:
                 pass
         else:
-            msg = "❌ Не удалось установить вебхук. Проверьте токен бота и доступность сервера."
+            msg = "❌ Не удалось установить вебхук."
             logger.error("❌ Ошибка установки вебхука")
+    
     except Exception as e:
         msg = f"❌ Ошибка: {str(e)}"
         logger.error(f"❌ Ошибка установки вебхука: {e}", exc_info=True)
@@ -282,37 +266,39 @@ def telegram_webhook():
     """Основной эндпоинт для получения обновлений от Telegram"""
     if request.headers.get('content-type') == 'application/json':
         try:
-            # Получаем и декодируем JSON
             json_string = request.get_data().decode('utf-8')
             update = types.Update.de_json(json_string)
             
-            # Логируем получение обновления
             if update.message:
                 logger.info(f"📨 Получено сообщение от {update.message.from_user.id}")
             
-            # Передаём обновление боту на обработку
             bot.process_new_updates([update])
             return '', 200
+            
         except Exception as e:
             logger.error(f"❌ Ошибка обработки вебхука: {e}", exc_info=True)
             return 'Internal Server Error', 500
+    
     return 'Bad Request', 400
 
-# ================== ИНИЦИАЛИЗАЦИЯ ПРИ ЗАПУСКЕ ==================
+# ================== ИНИЦИАЛИЗАЦИЯ ==================
+
 # Инициализируем приложение сразу при импорте
 try:
     initialize_app()
     
-    # Автоматическая установка вебхука при запуске
+    # Автоматическая установка вебхука
     AUTO_SET_WEBHOOK = os.getenv('AUTO_SET_WEBHOOK', 'true').lower() == 'true'
     if AUTO_SET_WEBHOOK and bot:
         try:
-            domain = os.getenv('RENDER_EXTERNAL_URL', 'https://hr-bot-render.onrender.com')
+            domain = os.getenv('RENDER_EXTERNAL_URL', 'https://hr-bot-mechel.onrender.com')
             if domain.startswith('https://'):
                 domain = domain[8:]
+            
             webhook_url = f"https://{domain}/webhook"
             bot.remove_webhook()
             success = bot.set_webhook(url=webhook_url)
+            
             if success:
                 logger.info(f"✅ Вебхук автоматически установлен на {webhook_url}")
             else:
@@ -320,16 +306,15 @@ try:
         except Exception as e:
             logger.warning(f"⚠️ Ошибка автоматической установки вебхука: {e}")
     
-    logger.info("✅ Приложение готово к работе на порту %s", os.getenv('PORT', 10000))
+    logger.info(f"✅ Приложение готово к работе на порту {os.getenv('PORT', 10000)}")
+    
 except Exception as e:
     logger.critical(f"❌ КРИТИЧЕСКАЯ ОШИБКА ПРИ ИНИЦИАЛИЗАЦИИ: {e}", exc_info=True)
     raise
 
-# ================== ЗАПУСК ДЛЯ ЛОКАЛЬНОЙ РАЗРАБОТКИ ==================
+# ================== ЛОКАЛЬНЫЙ ЗАПУСК ==================
 if __name__ == '__main__':
-    # Этот блок выполняется только при локальном запуске python bot.py
-    # НЕ используется на Render в продакшене!
     logger.warning("⚠️ ЛОКАЛЬНЫЙ ЗАПУСК - только для разработки!")
     port = int(os.environ.get('PORT', 10000))
-    logger.info(f"🌐 Запуск Flask сервера на порту {port} (ТОЛЬКО ДЛЯ РАЗРАБОТКИ!)")
+    logger.info(f"🌐 Запуск Flask сервера на порту {port}")
     app.run(host='0.0.0.0', port=port, debug=False)

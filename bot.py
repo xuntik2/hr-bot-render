@@ -43,7 +43,7 @@ def initialize_app():
     
     # Инициализация бота
     bot = telebot.TeleBot(config.get_bot_token(), threaded=False)
-    logger.info(f"✅ Бот инициализирован. Токен: {config.get_bot_token()[:10]}...")
+    logger.info("✅ Бот инициализирован.")
     
     # Инициализация поискового движка
     try:
@@ -187,8 +187,11 @@ def set_webhook_endpoint():
     # POST запрос - установка вебхука
     try:
         domain = os.getenv('RENDER_EXTERNAL_URL', 'https://hr-bot-mechel.onrender.com')
-        if domain.startswith('https://'):
-            domain = domain[8:]
+        # Удаляем протокол, если есть
+        for prefix in ['https://', 'http://']:
+            if domain.startswith(prefix):
+                domain = domain[len(prefix):]
+                break
         
         webhook_url = f"https://{domain}/webhook"
         logger.info(f"🔄 Установка вебхука на {webhook_url}")

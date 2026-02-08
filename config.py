@@ -1,17 +1,19 @@
 """
-КОНФИГУРАЦИЯ ДЛЯ RENDER + POSTGRESQL (ИСПРАВЛЕННАЯ ВЕРСИЯ)
-Поддержка Psycopg 3 и SQLite для разработки
+КОНФИГУРАЦИЯ ДЛЯ RENDER + ВЕБХУКИ
+Поддержка PostgreSQL и SQLite
 """
 
 import os
-from typing import List
+from typing import List, Optional
 from dotenv import load_dotenv
 import sqlite3
+import logging
 
 load_dotenv()
+logger = logging.getLogger(__name__)
 
 class Config:
-    """Конфигурация бота для Render с поддержкой обоих БД"""
+    """Конфигурация бота для Render с поддержкой вебхуков"""
     
     # =========== ПУТИ И ФАЙЛЫ ===========
     DB_PATH = 'faq_database.db'  # Для локальной разработки
@@ -30,10 +32,6 @@ class Config:
     SLEEP_INTERVAL_HOURS = 6
     CLEANUP_OLDER_THAN_DAYS = 30
     
-    # Мемы
-    MEME_MAX_ATTEMPTS = 15
-    MEME_RETRY_DELAY = 3
-    
     # Поисковые настройки
     SEARCH_THRESHOLD = 0.3
     MAX_SEARCH_RESULTS = 5
@@ -42,36 +40,35 @@ class Config:
     def validate(cls) -> bool:
         """Валидация конфигурации"""
         errors = []
-        warnings = []
         
         # Проверка токена
         token = cls.get_bot_token()
         if not token:
-            errors.append("BOT_TOKEN не найден. Проверьте файл .env")
+            errors.append("BOT_TOKEN не найден. Проверьте переменные окружения")
         elif token == 'ВАШ_ТОКЕН_ЗДЕСЬ':
             errors.append("Замените 'ВАШ_ТОКЕН_ЗДЕСЬ' на реальный токен")
         elif len(token) < 30:
             errors.append(f"Токен слишком короткий ({len(token)} символов)")
         
+        # Проверка для продакшена (Render)
+        if cls.is_postgresql():
+            database_url = os.getenv('DATABASE_URL')
+            if not database_url:
+                errors.append("DATABASE_URL не установлен для PostgreSQL")
+            elif 'postgresql://' not in database_url and 'postgres://' not in database_url:
+                errors.append("Некорректный формат DATABASE_URL для PostgreSQL")
+        
         # Вывод ошибок
         if errors:
             for error in errors:
-                print(f"❌ {error}")
-            print("\nФайл .env должен содержать:")
-            print("BOT_TOKEN=ваш_токен_от_BotFather")
-            print("ADMIN_IDS=ваш_telegram_id")
-            print("\nОпционально:")
-            print("MEME_ENABLED=False")
-            print("FEEDBACK_ENABLED=True")
+                logger.error(f"❌ {error}")
             return False
         
         # Успешная валидация
-        print("✅ Конфигурация успешно загружена!")
-        print(f"   🤖 Токен: {token[:10]}...{token[-10:]}")
-        print(f"   👑 Админы: {cls.get_admin_ids()}")
-        print(f"   💬 Отзывы: {'включены' if cls.is_feedback_enabled() else 'выключены'}")
-        print(f"   🎭 Мемы: {'включены' if cls.is_meme_enabled() else 'выключены'}")
-        print(f"   🛡️ Защита от спама: {'включена' if cls.is_spam_protection_enabled() else 'выключена'}")
+        logger.info("✅ Конфигурация успешно загружена!")
+        logger.info(f"   🤖 Токен: {token[:10]}...{token[-10:]}")
+        logger.info(f"   👑 Админы: {cls.get_admin_ids()}")
+        logger.info(f"   🗄️  БД: {'PostgreSQL' if cls.is_postgresql() else 'SQLite'}")
         return True
     
     # =========== МЕТОДЫ ДЛЯ ПОЛУЧЕНИЯ НАСТРОЕК ===========
@@ -91,7 +88,7 @@ class Config:
                     ids.append(int(id_str))
             return ids
         except ValueError as e:
-            print(f"❌ Ошибка в формате ADMIN_IDS: {e}")
+            logger.error(f"❌ Ошибка в формате ADMIN_IDS: {e}")
             return []
     
     @classmethod
@@ -132,32 +129,17 @@ class Config:
         return os.getenv('FEEDBACK_ENABLED', 'True').lower() in ['true', '1', 'yes', 'y']
     
     @classmethod
-    def is_meme_enabled(cls) -> bool:
-        """Проверить, включены ли мемы"""
-        return os.getenv('MEME_ENABLED', 'False').lower() in ['true', '1', 'yes', 'y']
-    
-    @classmethod
     def is_spam_protection_enabled(cls) -> bool:
         """Проверить, включена ли защита от спама"""
         return os.getenv('SPAM_PROTECTION_ENABLED', 'True').lower() in ['true', '1', 'yes', 'y']
     
     @classmethod
-    def is_filter_enabled(cls) -> bool:
-        """Проверить, включен ли фильтр мата (для мемов)"""
-        return os.getenv('MEME_FILTER_ENABLED', 'True').lower() in ['true', '1', 'yes', 'y']
-    
-    @classmethod
-    def force_russian_memes(cls) -> bool:
-        """Проверить, принудительно ли русские мемы"""
-        return os.getenv('FORCE_RUSSIAN_MEMES', 'True').lower() in ['true', '1', 'yes', 'y']
-    
-    @classmethod
-    def get_meme_max_attempts(cls) -> int:
-        """Получить максимальное количество попыток для мемов"""
+    def get_max_search_results(cls) -> int:
+        """Получить максимальное количество результатов поиска"""
         try:
-            return int(os.getenv('MEME_MAX_ATTEMPTS', cls.MEME_MAX_ATTEMPTS))
+            return int(os.getenv('MAX_SEARCH_RESULTS', cls.MAX_SEARCH_RESULTS))
         except ValueError:
-            return cls.MEME_MAX_ATTEMPTS
+            return cls.MAX_SEARCH_RESULTS
     
     # =========== МЕТОДЫ ДЛЯ РАБОТЫ С БАЗОЙ ДАННЫХ ===========
     
@@ -172,24 +154,36 @@ class Config:
         if cls.is_postgresql():
             # PostgreSQL для Render (Psycopg 3)
             try:
-                # Импортируем psycopg только при необходимости
                 from psycopg import connect
                 database_url = os.getenv('DATABASE_URL')
                 
-                # Простое подключение по URL (Psycopg 3)
+                # Fix для Render: замена postgres:// на postgresql://
+                if database_url.startswith('postgres://'):
+                    database_url = database_url.replace('postgres://', 'postgresql://', 1)
+                
+                logger.info(f"🔗 Подключение к PostgreSQL: {database_url[:30]}...")
                 conn = connect(database_url)
                 return conn
             except ImportError:
-                print("❌ Psycopg 3 не установлен. Установите: pip install psycopg[binary]")
+                logger.error("❌ Psycopg 3 не установлен. Установите: pip install psycopg[binary]")
+                raise
+            except Exception as e:
+                logger.error(f"❌ Ошибка подключения к PostgreSQL: {e}")
                 raise
         else:
             # SQLite для локальной разработки
+            logger.info(f"🔗 Подключение к SQLite: {cls.DB_PATH}")
             return sqlite3.connect(cls.DB_PATH)
     
     @classmethod
     def get_placeholder(cls) -> str:
         """Получить placeholder для SQL запросов"""
         return '%s' if cls.is_postgresql() else '?'
+    
+    @classmethod
+    def get_database_type(cls) -> str:
+        """Получить тип базы данных"""
+        return 'postgresql' if cls.is_postgresql() else 'sqlite'
 
 # Экспортируем экземпляр для удобства
 config = Config()

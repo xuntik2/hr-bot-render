@@ -1,3 +1,5 @@
+[file name]: render.yaml
+[file content begin]
 services:
   - type: web
     name: hr-bot-mechel
@@ -157,6 +159,35 @@ services:
       "
       
       echo ""
+      echo "🔄 ПРОВЕРКА И ЗАПОЛНЕНИЕ БАЗЫ ДАННЫХ"
+      echo "========================================================"
+      python -c "
+      import sys
+      sys.path.insert(0, '.')
+      from config import config
+      
+      try:
+          conn = config.get_db_connection()
+          cur = conn.cursor()
+          cur.execute('SELECT COUNT(*) FROM faq')
+          count = cur.fetchone()[0]
+          conn.close()
+          
+          print(f'📊 Текущее количество записей в базе: {count}')
+          
+          if count < 75:
+              print('⚠️  База данных содержит недостаточно записей')
+              print('   После запуска бота перейдите по адресу:')
+              print('   https://ваш-домен.onrender.com/admin/fill-db')
+              print('   для заполнения базы данных')
+          else:
+              print('✅ База данных полностью заполнена!')
+              
+      except Exception as e:
+          print(f'⚠️  Ошибка при проверке базы: {e}')
+      "
+      
+      echo ""
       echo "🔍 ФИНАЛЬНАЯ ПРОВЕРКА БАЗЫ ДАННЫХ"
       echo "========================================================"
       python -c "
@@ -232,6 +263,13 @@ services:
       except Exception as e:
           print(f'❌ Ошибка загрузки handlers.py: {e}')
       
+      try:
+          from admin_tools import check_database_status, fill_database_manual
+          print('✅ admin_tools.py загружен')
+      except Exception as e:
+          print(f'⚠️  Ошибка загрузки admin_tools.py: {e}')
+          print('   Но это не критично для работы бота')
+      
       print('✅ Все основные модули загружены корректно')
       "
       
@@ -263,3 +301,4 @@ services:
         value: "10000"
     healthCheckPath: /health
     healthCheckInterval: 60
+[file content end]

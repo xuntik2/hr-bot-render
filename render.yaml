@@ -9,25 +9,33 @@ services:
       pip install --upgrade pip
       pip install -r requirements.txt
       
-      echo "🗄️  Принудительная инициализация базы данных..."
+      echo "=========================================="
+      echo "🗄️  ПРИНУДИТЕЛЬНАЯ ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ"
+      echo "=========================================="
       python force_init_db.py
       
-      echo "🔍 Проверка результата..."
+      echo "=========================================="
+      echo "🔍 ПРОВЕРКА ЗАПОЛНЕНИЯ БАЗЫ ДАННЫХ"
+      echo "=========================================="
       python -c "
       import sys
       sys.path.insert(0, '.')
       from config import config
-      conn = config.get_db_connection()
-      cur = conn.cursor()
-      cur.execute('SELECT COUNT(*) FROM faq')
-      count = cur.fetchone()[0]
-      conn.close()
-      print(f'✅ В базе данных записей: {count}')
-      if count < 75:
-          print('❌ ОШИБКА: В базе меньше 75 записей!')
+      try:
+          conn = config.get_db_connection()
+          cur = conn.cursor()
+          cur.execute('SELECT COUNT(*) FROM faq')
+          count = cur.fetchone()[0]
+          conn.close()
+          print(f'Количество записей в таблице FAQ: {count}')
+          if count < 75:
+              print('❌ ОШИБКА: База данных содержит меньше 75 записей!')
+              sys.exit(1)
+          else:
+              print('✅ УСПЕХ: База данных заполнена корректно.')
+      except Exception as e:
+          print(f'❌ Ошибка при проверке базы данных: {e}')
           sys.exit(1)
-      else:
-          print('🎉 База данных успешно заполнена!')
       "
     startCommand: python bot.py
     envVars:

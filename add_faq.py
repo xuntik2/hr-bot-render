@@ -19,7 +19,6 @@ def add_questions():
         conn = config.get_db_connection()
         cursor = conn.cursor()
         
-        # Получаем данные из единого источника
         faq_data = get_faq_data()
         
         logger.info(f"Проверка {len(faq_data)} вопросов...")
@@ -29,10 +28,8 @@ def add_questions():
         placeholder = config.get_placeholder()
         
         for faq in faq_data:
-            # Проверяем, есть ли уже такой вопрос (по нормализованному вопросу)
-            # Используем параметризованный запрос
             cursor.execute(
-                "SELECT id FROM faq WHERE norm_question = " + placeholder,
+                f"SELECT id FROM faq WHERE norm_question = {placeholder}",
                 (faq['norm_question'],)
             )
             
@@ -40,12 +37,10 @@ def add_questions():
                 skipped_count += 1
                 continue
             
-            # Добавляем новый вопрос
-            # Формируем запрос с несколькими плейсхолдерами
-            query = '''
+            query = f'''
                 INSERT INTO faq (question, answer, keywords, norm_keywords, norm_question, category, usage_count)
-                VALUES ({0}, {0}, {0}, {0}, {0}, {0}, 0)
-            '''.format(placeholder)
+                VALUES ({placeholder}, {placeholder}, {placeholder}, {placeholder}, {placeholder}, {placeholder}, 0)
+            '''
             cursor.execute(query, (
                 faq['question'],
                 faq['answer'],
@@ -112,11 +107,8 @@ if __name__ == "__main__":
     print(f"🗄️  Тип БД: {'PostgreSQL' if config.is_postgresql() else 'SQLite'}")
     print("=" * 60)
     
-    # Показываем текущую статистику
     show_statistics()
     
-    # Добавляем вопросы
     add_questions()
     
-    # Показываем обновленную статистику
     show_statistics()

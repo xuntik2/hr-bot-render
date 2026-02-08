@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""
+АДМИНИСТРАТИВНЫЕ ИНСТРУМЕНТЫ ДЛЯ УПРАВЛЕНИЯ БАЗОЙ ДАННЫХ
+"""
+import os
+import sys
+import logging
+from config import config
+from faq_data import get_faq_data
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+def fill_database_manual():
+    """Ручное заполнение базы данных с подробным логированием"""
+    print("=" * 60)
+    print("🛠️  РУЧНОЕ ЗАПОЛНЕНИЕ БАЗЫ ДАННЫХ")
+    print("=" * 60)
+    
+    try:
+        # 1. Подключаемся к базе
+        conn = config.get_db_connection()
+        cursor = conn.cursor()
+        
+        # 2. Проверяем таблицу
+        print("🔍 Проверка таблицы 'faq'...")
+        cursor.execute("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_name = 'faq'
+            )
+        """)
+        table_exists = cursor.fetchone()[0]
+        
+        if not table_exists:
+            print("❌ Таблица 'faq' не существует!")
+            return {
+                "success": False,
+                "error": "Таблица 'faq' не существует",
+                "details": "Создайте таблицу через SQL: CREATE TABLE faq (...)"
+            }
+        
+        print("✅ Таблица 'faq' существует")
+        
+        # 3. Проверяем текущие данные
+        cursor.execute("SELECT COUNT(*) FROM faq")
+        count_before = cursor.fetchone()[0]
+        print(f"📊 Записей в базе до заполнения: {count_before}")
+        
+        # 4. Получаем данные из faq_data.py
+        print("📚 Загрузка вопросов из faq_data.py...")
+        faq_list = get_faq_data()
+        print(f"✅ Загружено {len(faq_list)} вопросов")
+        
+        # 5. Очищаем таблицу
+        print("🧹 Очистка таблицы...")
+        cursor.execute("TRUNCATE TABLE faq RESTART IDENTITY CASCADE")
+        
+        # 6. Вставляем данные
+        print("📝 Вставка вопросов в базу...")
+        inserted = 0
+        errors = []
+        
+        for idx, faq in enumerate(faq_list, 1):
+            try:
+                sql = """
+                INSERT INTO faq (question, answer, keywords, norm_keywords, norm_question, category)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """
+                cursor.execute(sql, (
+                    faq['question'],
+                    faq['answer'],
+                    faq['keywords'],
+                    faq['norm_keywords'],
+                    faq['norm_question'],
+                    faq['category']
+                ))
+                inserted += 1
+                
+                if idx % 10 == 0:
+                    print(f"   Добавлено {idx} из {len(faq_list)} вопросов...")
+                    
+            except Exception as e:
+                errors.append({
+                    "index": idx,
+                    "question": faq['question'][:50],
+                    "error": str(e)
+                })
+                print(f"   ❌ Ошибка при добавлении вопроса {idx}: {e}")
+        
+        # 7. Фиксируем изменения
+        conn.commit()
+        
+        # 8. Проверяем результат
+        cursor.execute("SELECT COUNT(*) FROM faq")
+        count_after = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(DISTINCT category) FROM faq")
+        categories_count = cursor.fetchone()[0]
+        
+        conn.close()
+        
+        # 9. Формируем результат
+        result = {
+            "success": True,
+            "stats": {
+                "total_questions": len(faq_list),
+                "inserted": inserted,
+                "errors": len(errors),
+                "final_count": count_after,
+                "categories": categories_count,
+                "before": count_before,
+                "after": count_after
+            },
+            "details": {
+                "expected": 75,
+                "actual": count_after,
+                "completion": f"{(count_after/75*100):.1f}%"
+            }
+        }
+        
+        if errors:
+            result["error_details"] = errors[:5]  # Первые 5 ошибок
+        
+        print("=" * 60)
+        print(f"✅ УСПЕХ: Добавлено {inserted} вопросов")
+        print(f"📊 Всего в базе: {count_after} записей")
+        print(f"📁 Категорий: {categories_count}")
+        
+        if errors:
+            print(f"⚠️  Ошибок при добавлении: {len(errors)}")
+        
+        return result
+        
+    except Exception as e:
+        print(f"❌ КРИТИЧЕСКАЯ ОШИБКА: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }
+
+def check_database_status():
+    """Проверка текущего состояния базы данных"""
+    try:
+        conn = config.get_db_connection()
+        cursor = conn.cursor()
+        
+        # Проверяем существование таблицы
+        cursor.execute("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_name = 'faq'
+            )
+        """)
+        table_exists = cursor.fetchone()[0]
+        
+        if not table_exists:
+            return {
+                "table_exists": False,
+                "error": "Таблица 'faq' не существует"
+            }
+        
+        # Получаем статистику
+        cursor.execute("SELECT COUNT(*) FROM faq")
+        total_count = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(DISTINCT category) FROM faq")
+        categories = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT category, COUNT(*) as count FROM faq GROUP BY category ORDER BY count DESC")
+        category_stats = cursor.fetchall()
+        
+        cursor.execute("SELECT question FROM faq LIMIT 5")
+        sample_questions = [row[0][:50] + "..." for row in cursor.fetchall()]
+        
+        conn.close()
+        
+        return {
+            "table_exists": True,
+            "total_records": total_count,
+            "categories_count": categories,
+            "expected_records": 75,
+            "completion_percentage": f"{(total_count/75*100):.1f}%",
+            "category_stats": [{"category": cat, "count": cnt} for cat, cnt in category_stats],
+            "sample_questions": sample_questions,
+            "status": "complete" if total_count >= 75 else "partial" if total_count > 0 else "empty"
+        }
+        
+    except Exception as e:
+        return {
+            "error": str(e),
+            "table_exists": False
+        }
+
+if __name__ == "__main__":
+    # Запуск из командной строки
+    print("🔧 Административные инструменты для базы данных")
+    print("1. Заполнить базу данных")
+    print("2. Проверить статус базы")
+    
+    choice = input("Выберите действие (1 или 2): ").strip()
+    
+    if choice == "1":
+        result = fill_database_manual()
+        print(f"\nРезультат: {result}")
+    elif choice == "2":
+        status = check_database_status()
+        print(f"\nСтатус базы данных: {status}")
+    else:
+        print("❌ Неверный выбор")

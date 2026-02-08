@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 СКРИПТ ПРИНУДИТЕЛЬНОГО ЗАПОЛНЕНИЯ БАЗЫ ДАННЫХ ДЛЯ RENDER
-Удаляет старые данные и вставляет 75 вопросов заново.
 """
 import os
 import sys
@@ -15,21 +14,36 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 def force_init():
+    print("=" * 60)
     print("🚀 ЗАПУСК ПРИНУДИТЕЛЬНОЙ ИНИЦИАЛИЗАЦИИ БАЗЫ...")
+    print("=" * 60)
     
     try:
         conn = config.get_db_connection()
         cursor = conn.cursor()
         
-        # 1. Очистка таблицы (для PostgreSQL)
+        # 1. Проверяем существование таблицы
+        logger.info("🔍 Проверка существования таблицы 'faq'...")
+        if config.is_postgresql():
+            cursor.execute("SELECT to_regclass('public.faq')")
+            table_exists = cursor.fetchone()[0]
+        else:
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='faq'")
+            table_exists = cursor.fetchone()
+        
+        if not table_exists:
+            logger.error("❌ Таблица 'faq' не существует. Создайте её сначала.")
+            sys.exit(1)
+        
+        # 2. Очистка таблицы (для PostgreSQL)
         logger.info("🗑️  Очистка таблицы 'faq'...")
         cursor.execute("TRUNCATE TABLE faq RESTART IDENTITY CASCADE;")
         
-        # 2. Получение данных
+        # 3. Получение данных
         faq_list = get_faq_data()
-        logger.info(f"📚 Загружено {len(faq_list)} вопросов.")
+        logger.info(f"📚 Загружено {len(faq_list)} вопросов из faq_data.py.")
         
-        # 3. Вставка всех 75 вопросов
+        # 4. Вставка всех 75 вопросов
         placeholder = config.get_placeholder()
         added = 0
         
@@ -49,16 +63,28 @@ def force_init():
             added += 1
         
         conn.commit()
+        
+        # 5. Проверка вставленных данных
+        cursor.execute("SELECT COUNT(*) FROM faq")
+        count = cursor.fetchone()[0]
         conn.close()
         
-        logger.info(f"✅ УСПЕХ! В базу добавлено {added} вопросов.")
-        return True
+        if count == added:
+            logger.info(f"✅ УСПЕХ! В базу добавлено {added} вопросов.")
+            print("=" * 60)
+            print(f"🎉 БАЗА ДАННЫХ ЗАПОЛНЕНА: {count} ЗАПИСЕЙ")
+            print("=" * 60)
+            return True
+        else:
+            logger.error(f"❌ ОШИБКА: Добавлено {added} записей, но в таблице {count} записей.")
+            return False
         
     except Exception as e:
         logger.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА: {e}")
         import traceback
         traceback.print_exc()
-        return False
+        # Принудительно завершаем с ошибкой
+        sys.exit(1)
 
 if __name__ == "__main__":
     success = force_init()

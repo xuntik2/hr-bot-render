@@ -13,7 +13,6 @@ from config import config
 from search_engine import SearchEngine
 from handlers import CommandHandler
 
-# Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -21,10 +20,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Инициализация приложения Flask
 app = Flask(__name__)
 
-# Глобальные объекты
 bot = None
 search_engine = None
 command_handler = None
@@ -37,15 +34,12 @@ def initialize_app():
     logger.info("🚀 ИНИЦИАЛИЗАЦИЯ КОРПОРАТИВНОГО БОТА МЕЧЕЛ")
     logger.info("=" * 60)
     
-    # Проверка конфигурации
     if not config.validate():
         raise RuntimeError("Конфигурация не прошла валидацию")
     
-    # Инициализация бота
     bot = telebot.TeleBot(config.get_bot_token(), threaded=False)
-    logger.info("✅ Бот инициализирован.")
+    logger.info(f"✅ Бот инициализирован. Токен: {config.get_bot_token()[:10]}...")
     
-    # Инициализация поискового движка
     try:
         search_engine = SearchEngine()
         logger.info(f"✅ Поисковый движок готов. FAQ: {len(search_engine.faq_data)}")
@@ -53,10 +47,8 @@ def initialize_app():
         logger.error(f"❌ Ошибка поискового движка: {e}", exc_info=True)
         search_engine = None
     
-    # Инициализация обработчиков
     command_handler = CommandHandler(search_engine) if search_engine else None
     
-    # Регистрация обработчиков команд Telegram
     _register_bot_handlers()
     
     logger.info("✅ Приложение полностью инициализировано")
@@ -98,7 +90,6 @@ def _register_bot_handlers():
         logger.info(f"📝 /очистить от {message.from_user.id}")
         command_handler.handle_clear_cache(message, bot)
     
-    # Обработка всех текстовых сообщений
     @bot.message_handler(func=lambda message: True)
     def handle_all_messages(message):
         logger.info(f"📝 Сообщение от {message.from_user.id}: {message.text[:100]}")
@@ -110,8 +101,6 @@ def _register_bot_handlers():
         except Exception as e:
             logger.error(f"❌ Ошибка обработки: {e}", exc_info=True)
             bot.reply_to(message, "❌ Произошла ошибка. Пожалуйста, попробуйте ещё раз.")
-
-# ================== FLASK РОУТЫ ==================
 
 @app.route('/')
 def index():
@@ -184,23 +173,17 @@ def set_webhook_endpoint():
         <p><a href="/">← Назад</a></p>
         '''
     
-    # POST запрос - установка вебхука
     try:
         domain = os.getenv('RENDER_EXTERNAL_URL', 'https://hr-bot-mechel.onrender.com')
-        # Удаляем протокол, если есть
-        for prefix in ['https://', 'http://']:
-            if domain.startswith(prefix):
-                domain = domain[len(prefix):]
-                break
+        if domain.startswith('https://'):
+            domain = domain[8:]
         
         webhook_url = f"https://{domain}/webhook"
         logger.info(f"🔄 Установка вебхука на {webhook_url}")
         
-        # Удаляем старый вебхук
         bot.remove_webhook()
         time.sleep(1)
         
-        # Устанавливаем новый вебхук
         success = bot.set_webhook(
             url=webhook_url,
             max_connections=40,
@@ -284,13 +267,9 @@ def telegram_webhook():
     
     return 'Bad Request', 400
 
-# ================== ИНИЦИАЛИЗАЦИЯ ==================
-
-# Инициализируем приложение сразу при импорте
 try:
     initialize_app()
     
-    # Автоматическая установка вебхука
     AUTO_SET_WEBHOOK = os.getenv('AUTO_SET_WEBHOOK', 'true').lower() == 'true'
     if AUTO_SET_WEBHOOK and bot:
         try:
@@ -315,7 +294,6 @@ except Exception as e:
     logger.critical(f"❌ КРИТИЧЕСКАЯ ОШИБКА ПРИ ИНИЦИАЛИЗАЦИИ: {e}", exc_info=True)
     raise
 
-# ================== ЛОКАЛЬНЫЙ ЗАПУСК ==================
 if __name__ == '__main__':
     logger.warning("⚠️ ЛОКАЛЬНЫЙ ЗАПУСК - только для разработки!")
     port = int(os.environ.get('PORT', 10000))

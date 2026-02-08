@@ -1,17 +1,30 @@
 services:
   - type: web
-    name: hr-bot-render
+    name: hr-bot-mechel
     env: python
-    buildCommand: pip install -r requirements.txt
+    region: frankfurt
+    plan: free
+    autoDeploy: true
+    buildCommand: |
+      pip install -r requirements.txt
+      python create_database.py
     startCommand: python bot.py
     envVars:
       - key: BOT_TOKEN
         sync: false
+      - key: ADMIN_IDS
+        sync: false
       - key: DATABASE_URL
-        fromDatabase:
-          name: hr-bot-db
-          property: connectionString
-      - key: WEBHOOK_DOMAIN
-        value: hr-bot-render.onrender.com
+        sync: false
+      - key: MEME_ENABLED
+        value: "false"
+      - key: FEEDBACK_ENABLED
+        value: "true"
+      - key: AUTO_SET_WEBHOOK
+        value: "true"
+      - key: RENDER_EXTERNAL_URL
+        fromService:
+          name: hr-bot-mechel
+          type: web
+          property: url
     healthCheckPath: /health
-    autoDeploy: true

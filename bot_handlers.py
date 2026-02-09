@@ -1,14 +1,6 @@
 """
 ОБРАБОТЧИКИ КОМАНД И СООБЩЕНИЙ ДЛЯ TELEGRAM БОТА
 Версия 4.2 - Исправленная и оптимизированная
-
-Исправления и улучшения:
-✅ Исправлен блокирующий вызов в асинхронном контексте
-✅ Добавлено экранирование Markdown для безопасности
-✅ Добавлена защита от спама (рейт-лимиты)
-✅ Улучшена безопасность логов (маскировка ПДн)
-✅ Добавлена обработка Forbidden ошибок
-✅ Улучшена архитектура Dependency Injection
 """
 
 import logging
@@ -17,12 +9,12 @@ import asyncio
 import time
 import html
 import hashlib
-from typing import Optional, Tuple, List, Dict, Any, Callable
+from typing import Optional, Tuple, List, Dict, Any
 from datetime import datetime, timedelta
 from collections import defaultdict
 from functools import wraps
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import ContextTypes
 from telegram.error import TimedOut, BadRequest, NetworkError, RetryAfter, Forbidden
 from telegram.helpers import escape_markdown
@@ -216,7 +208,6 @@ class BotCommandHandler:
         except Forbidden:
             # Пользователь заблокировал бота
             logger.warning(f"Пользователь {chat_id} заблокировал бота")
-            # Можно добавить логику очистки данных пользователя
             return False
             
         except Exception as e:
@@ -230,10 +221,8 @@ class BotCommandHandler:
         
         # Экранируем текст для безопасной отправки
         if parse_mode == 'Markdown':
-            # Используем escape_markdown из telegram.helpers
             text = escape_markdown(text, version=2)
         elif parse_mode == 'HTML':
-            # Для HTML экранируем специальные символы
             text = html.escape(text)
         
         try:
@@ -255,9 +244,6 @@ class BotCommandHandler:
     async def handle_welcome(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработка команд /start и /help"""
         user = update.effective_user
-        
-        # Маскируем имя пользователя для логов
-        user_log_name = f"{user.id} ({hash(str(user.id)) % 10000:04d})"
         
         welcome_text = f"""
 🤖 *Добро пожаловать в Корпоративный Бот Мечел, {user.first_name}!*
@@ -310,19 +296,18 @@ class BotCommandHandler:
         
         try:
             await self._safe_reply(update, welcome_text, parse_mode='Markdown')
-            logger.info(f"👋 Приветствие отправлено пользователю {user_log_name}")
+            logger.info(f"👋 Приветствие отправлено пользователю {user.id}")
             
         except Exception as e:
             logger.error(f"Ошибка отправки приветствия: {e}")
-            # Пробуем отправить упрощенное сообщение
             try:
                 simple_text = (
                     "Добро пожаловать в HR Bot Мечел! Я помогу вам с кадровыми вопросами. "
                     "Напишите ваш вопрос или используйте команду /categories для просмотра тем."
                 )
                 await update.message.reply_text(simple_text)
-            except Exception as inner_e:
-                logger.error(f"Даже упрощенное сообщение не удалось отправить: {inner_e}")
+            except Exception:
+                pass
     
     @rate_limit(max_requests=5, window_seconds=30)
     async def handle_categories(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -673,14 +658,11 @@ class BotCommandHandler:
             start_time = time.time()
             
             # Используем run_in_executor для неблокирующего поиска
-            # Правильно передаем функцию и аргументы
             loop = asyncio.get_event_loop()
-            
-            # Передаем метод и его аргументы правильно
             search_func = lambda: self.search_engine.search(query, user_id)
             result = await asyncio.wait_for(
                 loop.run_in_executor(None, search_func),
-                timeout=20.0  # Таймаут поиска
+                timeout=20.0
             )
             
             search_time = time.time() - start_time
@@ -949,3 +931,15 @@ class BotCommandHandler:
             
         except Exception as e:
             logger.error(f"Ошибка сохранения неотвеченного запроса: {e}")
+
+# Глобальная переменная для хранения экземпляра обработчика
+_bot_command_handler = None
+
+def get_bot_command_handler(search_engine: SearchEngine = None) -> BotCommandHandler:
+    """Фабрика для получения экземпляра обработчика команд"""
+    global _bot_command_handler
+    
+    if _bot_command_handler is None and search_engine is not None:
+        _bot_command_handler = BotCommandHandler(search_engine)
+    
+    return _bot_command_handler

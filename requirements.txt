@@ -1,17 +1,13 @@
-# Основные зависимости для Telegram бота
+# requirements.txt
 python-telegram-bot==20.7
 python-dotenv==1.0.0
 Flask==3.0.0
 psycopg2-binary==2.9.9
 Werkzeug==3.0.1
 gunicorn==21.2.0
-
-# Дополнительные утилиты
 requests==2.31.0
-pandas==2.1.4
-numpy==1.24.4
-
-# Для разработки
+- pandas==2.1.4
+- numpy==1.24.4
 black==23.11.0
 flake8==6.1.0
 pytest==7.4.3

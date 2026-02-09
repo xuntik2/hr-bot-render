@@ -1,135 +1,177 @@
 """
-КОНФИГУРАЦИЯ БОТА ДЛЯ RENDER
-Улучшенная версия с диагностикой
+УЛУЧШЕННАЯ КОНФИГУРАЦИЯ БОТА МЕЧЕЛ
+Версия 2.0 - С защитой от SQL-инъекций и гибкой конфигурацией
 """
+
 import os
 import logging
-from typing import List
 from dotenv import load_dotenv
-from urllib.parse import urlparse
 
+# Загружаем переменные окружения
 load_dotenv()
+
 logger = logging.getLogger(__name__)
 
 class Config:
-    """Конфигурация бота с улучшенной диагностикой"""
+    """Класс для работы с конфигурацией с защитой от SQL-инъекций"""
     
-    DB_PATH = 'faq_database.db'
-    MAX_MESSAGE_LENGTH = 500
-    FEEDBACK_MIN_LENGTH = 3
-    FEEDBACK_MAX_LENGTH = 500
-    SEARCH_THRESHOLD = 0.3
-    MAX_SEARCH_RESULTS = 5
-    CACHE_MAX_SIZE = 1000
-    CACHE_TTL_SECONDS = 1800
+    # Константы для имен таблиц (защита от опечаток и SQL-инъекций)
+    TABLE_FAQ = 'faq'
+    TABLE_FAQ_KEYWORDS = 'faq_keywords'
+    TABLE_UNANSWERED_QUERIES = 'unanswered_queries'
+    TABLE_BOT_METRICS = 'bot_metrics'
     
-    @classmethod
-    def validate(cls) -> bool:
-        """Валидация конфигурации"""
-        errors = []
-        
-        # Проверка токена бота
-        token = cls.get_bot_token()
-        if not token:
-            errors.append("BOT_TOKEN не найден")
-        elif token == 'ВАШ_ТОКЕН_ЗДЕСЬ':
-            errors.append("Замените BOT_TOKEN на реальный токен")
-        else:
-            logger.info(f"✅ Токен бота присутствует (первые 10 символов): {token[:10]}...")
-        
-        # Проверка PostgreSQL подключения
-        if cls.is_postgresql():
-            db_url = os.getenv('DATABASE_URL')
-            if not db_url:
-                errors.append("DATABASE_URL не установлен для PostgreSQL")
-            else:
-                try:
-                    parsed = urlparse(db_url)
-                    logger.info(f"✅ DATABASE_URL: {parsed.hostname}:{parsed.port}")
-                except:
-                    errors.append("Некорректный DATABASE_URL")
-        
-        if errors:
-            for error in errors:
-                logger.error(f"❌ {error}")
-            return False
-        
-        logger.info("✅ Конфигурация успешно загружена")
-        logger.info(f"   🗄️  БД: {'PostgreSQL' if cls.is_postgresql() else 'SQLite'}")
-        return True
+    # Минимальные требования для работы системы
+    MIN_FAQ_RECORDS = 70
+    MIN_DATABASE_CONNECTIONS = 1
     
-    @classmethod
-    def get_admin_ids(cls) -> List[int]:
-        admin_ids_str = os.getenv('ADMIN_IDS', '')
-        if not admin_ids_str:
-            return []
+    @staticmethod
+    def get_bot_token():
+        """Получение токена бота с проверкой"""
+        token = os.getenv('BOT_TOKEN')
+        if not token or token == 'ваш_токен_бота':
+            logger.error("❌ ТОКЕН БОТА НЕ НАЙДЕН ИЛИ УСТАНОВЛЕН ПО УМОЛЧАНИЮ")
+            logger.error("Установите переменную окружения BOT_TOKEN")
+            return None
+        return token
+    
+    @staticmethod
+    def get_db_connection():
+        """Безопасное получение соединения с базой данных с обработкой ошибок"""
+        import psycopg2
+        from psycopg2 import OperationalError
+        
+        database_url = os.getenv('DATABASE_URL')
+        if not database_url:
+            logger.error("❌ DATABASE_URL не указан в переменных окружения")
+            raise ConnectionError("DATABASE_URL не указан")
+        
         try:
-            return [int(id_str.strip()) for id_str in admin_ids_str.split(',') if id_str.strip()]
-        except ValueError:
-            return []
-    
-    @classmethod
-    def get_bot_token(cls) -> str:
-        return os.getenv('BOT_TOKEN', '').strip(" '\"")
-    
-    @classmethod
-    def is_postgresql(cls) -> bool:
-        return bool(os.getenv('DATABASE_URL'))
-    
-    @classmethod
-    def get_db_connection(cls):
-        if cls.is_postgresql():
-            import psycopg
-            db_url = os.getenv('DATABASE_URL')
-            if db_url and db_url.startswith('postgres://'):
-                db_url = db_url.replace('postgres://', 'postgresql://', 1)
-            logger.info(f"🔗 Подключение к PostgreSQL: {db_url.split('@')[1] if '@' in db_url else 'local'}")
-            return psycopg.connect(db_url)
-        else:
-            import sqlite3
-            logger.info("🔗 Подключение к SQLite")
-            return sqlite3.connect(cls.DB_PATH)
-    
-    @classmethod
-    def get_placeholder(cls) -> str:
-        return '%s' if cls.is_postgresql() else '?'
-    
-    @classmethod
-    def get_db_connection_params(cls):
-        """Получить параметры подключения для диагностики"""
-        if cls.is_postgresql():
-            db_url = os.getenv('DATABASE_URL')
-            if db_url and db_url.startswith('postgres://'):
-                db_url = db_url.replace('postgres://', 'postgresql://', 1)
-            parsed = urlparse(db_url)
-            return {
-                'host': parsed.hostname,
-                'port': parsed.port,
-                'database': parsed.path[1:] if parsed.path else None,
-                'user': parsed.username
+            # Параметры подключения с таймаутом
+            connection_params = {
+                'connect_timeout': 10,
+                'application_name': 'mechel-hr-bot'
             }
-        return {'path': cls.DB_PATH}
+            
+            # Парсим URL и создаем подключение
+            conn = psycopg2.connect(database_url, **connection_params)
+            
+            # Проверяем соединение
+            conn.autocommit = False
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1")
+            cursor.close()
+            
+            logger.info("✅ Успешное подключение к базе данных")
+            return conn
+            
+        except OperationalError as e:
+            logger.error(f"❌ Ошибка подключения к базе данных: {e}")
+            raise ConnectionError(f"Не удалось подключиться к базе данных: {e}")
+            
+        except Exception as e:
+            logger.error(f"❌ Неожиданная ошибка при подключении к БД: {e}")
+            raise ConnectionError(f"Неожиданная ошибка БД: {e}")
     
-    @classmethod
-    def is_meme_enabled(cls) -> bool:
-        return os.getenv('MEME_ENABLED', 'False').lower() in ['true', '1', 'yes', 'y']
+    @staticmethod
+    def get_webhook_url():
+        """Получение URL вебхука"""
+        return os.getenv('WEBHOOK_URL')
     
-    @classmethod
-    def is_feedback_enabled(cls) -> bool:
-        return os.getenv('FEEDBACK_ENABLED', 'True').lower() in ['true', '1', 'yes', 'y']
+    @staticmethod
+    def get_secret_token():
+        """Получение секретного токена для вебхука"""
+        return os.getenv('SECRET_TOKEN')
     
-    @classmethod
-    def get_search_threshold(cls) -> float:
+    @staticmethod
+    def get_port():
+        """Получение порта"""
         try:
-            return float(os.getenv('SEARCH_THRESHOLD', cls.SEARCH_THRESHOLD))
+            return int(os.getenv('PORT', 10000))
         except ValueError:
-            return cls.SEARCH_THRESHOLD
+            logger.warning("⚠️ Неверный формат PORT, используется значение по умолчанию: 10000")
+            return 10000
     
-    @classmethod
-    def get_rate_limit_seconds(cls) -> int:
-        try:
-            return int(os.getenv('RATE_LIMIT_SECONDS', 2))
-        except ValueError:
-            return 2
+    @staticmethod
+    def get_admin_ids():
+        """Безопасное получение списка ID администраторов"""
+        admin_ids_str = os.getenv('ADMIN_IDS', '')
+        admin_ids = []
+        
+        if admin_ids_str:
+            try:
+                for admin_id in admin_ids_str.split(','):
+                    admin_id = admin_id.strip()
+                    if admin_id:
+                        admin_ids.append(int(admin_id))
+            except ValueError as e:
+                logger.warning(f"⚠️ Неверный формат ADMIN_IDS: {e}")
+        
+        return admin_ids
+    
+    @staticmethod
+    def is_feedback_enabled():
+        """Проверка включения системы обратной связи"""
+        return os.getenv('FEEDBACK_ENABLED', 'true').lower() == 'true'
+    
+    @staticmethod
+    def is_meme_enabled():
+        """Проверка включения мемов"""
+        return os.getenv('MEME_ENABLED', 'false').lower() == 'true'
+    
+    @staticmethod
+    def get_webhook_path():
+        """Получение пути вебхука"""
+        return os.getenv('WEBHOOK_PATH', '/')
+    
+    @staticmethod
+    def get_table_name(table_key: str) -> str:
+        """
+        Безопасное получение имени таблицы по ключу
+        Защита от SQL-инъекций через белый список
+        """
+        table_mapping = {
+            'faq': Config.TABLE_FAQ,
+            'faq_keywords': Config.TABLE_FAQ_KEYWORDS,
+            'unanswered_queries': Config.TABLE_UNANSWERED_QUERIES,
+            'bot_metrics': Config.TABLE_BOT_METRICS,
+        }
+        
+        if table_key not in table_mapping:
+            raise ValueError(f"Неизвестный ключ таблицы: {table_key}")
+        
+        return table_mapping[table_key]
+    
+    @staticmethod
+    def get_health_thresholds():
+        """Получение пороговых значений для проверки здоровья"""
+        return {
+            'min_faq_records': Config.MIN_FAQ_RECORDS,
+            'max_response_time_ms': 5000,
+            'min_database_connections': Config.MIN_DATABASE_CONNECTIONS,
+            'max_database_size_mb': 100,
+        }
+    
+    @staticmethod
+    def validate_database_url():
+        """Валидация URL базы данных"""
+        db_url = os.getenv('DATABASE_URL', '')
+        
+        if not db_url:
+            return False, "DATABASE_URL не указан"
+        
+        # Проверяем формат PostgreSQL URL
+        if not (db_url.startswith('postgresql://') or db_url.startswith('postgres://')):
+            return False, "Неверный формат DATABASE_URL. Ожидается postgresql://"
+        
+        return True, "URL базы данных валиден"
 
+# Глобальный экземпляр конфигурации
 config = Config()
+
+# Экспортируем константы для использования в других модулях
+TABLE_FAQ = Config.TABLE_FAQ
+TABLE_FAQ_KEYWORDS = Config.TABLE_FAQ_KEYWORDS
+TABLE_UNANSWERED_QUERIES = Config.TABLE_UNANSWERED_QUERIES
+TABLE_BOT_METRICS = Config.TABLE_BOT_METRICS
+MIN_FAQ_RECORDS = Config.MIN_FAQ_RECORDS

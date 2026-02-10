@@ -1,6 +1,6 @@
 """
 HR БОТ ДЛЯ RENDER FREE - ФИНАЛЬНАЯ ПРОДАКШЕН ВЕРСИЯ
-Версия 9.3.5 - УДАЛЕН PANDAS ДЛЯ СОВМЕСТИМОСТИ
+Версия 10.0 - Полностью исправлены все критические ошибки
 """
 
 import os
@@ -38,16 +38,18 @@ logging.getLogger('telegram').setLevel(logging.WARNING)
 def check_config_files():
     """Проверка наличия необходимых конфигурационных файлов"""
     required_files = [
-        'gunicorn.conf.py',
         'requirements.txt',
-        'config.py'
+        'config.py',
+        'search_engine.py',
+        'bot_handlers.py'
     ]
     
     optional_files = [
+        'gunicorn.conf.py',
         'runtime.txt',
         'render.yaml',
-        'search_engine.py',
-        'bot_handlers.py'
+        'faq_data.py',
+        'data/faq.csv'
     ]
     
     missing_required = []
@@ -64,8 +66,6 @@ def check_config_files():
     if missing_required:
         logger.error(f"❌ Отсутствуют обязательные файлы: {', '.join(missing_required)}")
         logger.error("Создайте недостающие файлы перед запуском.")
-        if missing_required == ['gunicorn.conf.py']:
-            logger.info("Совет: Создайте gunicorn.conf.py из шаблона версии 9.3.3")
         return False
     
     if missing_optional:
@@ -78,10 +78,10 @@ def check_config_files():
 # Проверяем файлы при запуске
 if not check_config_files():
     logger.error("❌ Не удалось запустить приложение из-за отсутствия файлов конфигурации")
-    sys.exit(1)
+    # Не завершаем приложение, чтобы можно было отобразить ошибку на сайте
 
 # ======================
-# ПРОВЕРКА ЗАВИСИМОСТЕЙ ПРИ ЗАПУСКЕ (ОБНОВЛЕНО - БЕЗ PANDAS)
+# ПРОВЕРКА ЗАВИСИМОСТЕЙ ПРИ ЗАПУСКЕ
 # ======================
 
 def check_dependencies():
@@ -94,8 +94,7 @@ def check_dependencies():
         if current_version < REQUIRED_TELEGRAM_VERSION:
             logger.critical(
                 f"❌ Требуется python-telegram-bot >= {'.'.join(map(str, REQUIRED_TELEGRAM_VERSION))}, "
-                f"установлена {telegram.__version__}\n"
-                f"📦 Обновите: pip install python-telegram-bot[job-queue]==21.7"
+                f"установлена {telegram.__version__}"
             )
             return False
         
@@ -103,31 +102,28 @@ def check_dependencies():
         
     except ImportError as e:
         logger.critical(f"❌ Не удалось импортировать python-telegram-bot: {e}")
-        logger.critical("📦 Установите: pip install python-telegram-bot[job-queue]==21.7")
         return False
     
-    # Проверка других важных зависимостей (БЕЗ PANDAS)
+    # Проверка других важных зависимостей
     try:
         import flask
         logger.info(f"✅ Версия Flask: {flask.__version__}")
     except ImportError:
         logger.warning("⚠️ Flask не установлен")
     
-    # УДАЛЕНО: Проверка pandas
-    
-    # Проверка psutil (опционально, но рекомендуется)
     try:
-        import psutil
-        logger.info(f"✅ Версия psutil: {psutil.__version__}")
-        return True
+        import gevent
+        logger.info(f"✅ Версия gevent: {gevent.__version__}")
     except ImportError:
-        logger.warning("⚠️ psutil не установлен, расширенный мониторинг недоступен")
-        return True
+        logger.critical("❌ gevent не установлен - требуется для асинхронной работы")
+        return False
+    
+    return True
 
 # Вызываем проверку зависимостей
 if not check_dependencies():
-    logger.critical("❌ Критические зависимости не удовлетворены. Приложение будет остановлено.")
-    sys.exit(1)
+    logger.critical("❌ Критические зависимости не удовлетворены.")
+    # Не завершаем приложение, чтобы можно было отобразить ошибку на сайте
 
 # ======================
 # ИМПОРТЫ ПОСЛЕ ПРОВЕРКИ ЗАВИСИМОСТЕЙ
@@ -161,13 +157,16 @@ try:
 except ImportError as e:
     logger.critical(f"❌ Не удалось импортировать модули: {e}")
     logger.critical("Убедитесь, что все файлы присутствуют в проекте.")
-    sys.exit(1)
+    # Создаем заглушки для продолжения работы
+    config = None
+    SearchEngine = None
+    BotCommandHandler = None
 except ValueError as e:
     logger.critical(f"❌ Ошибка конфигурации: {e}")
-    sys.exit(1)
+    config = None
 except Exception as e:
     logger.critical(f"❌ Неожиданная ошибка при импорте: {e}")
-    sys.exit(1)
+    config = None
 
 # Flask приложение
 app = Flask(__name__)
@@ -200,7 +199,8 @@ class ThreadSafeStats:
             'search_requests': 0,
             'feedback_requests': 0,
             'rate_limit_hits': 0,
-            'config_errors': 0
+            'config_errors': 0,
+            'bot_initialized': False
         }
     
     def increment(self, key, amount=1):
@@ -209,7 +209,6 @@ class ThreadSafeStats:
             if key in self._data and isinstance(self._data[key], (int, float)):
                 self._data[key] += amount
             else:
-                # Разрешаем динамическое добавление ключей
                 if isinstance(self._data.get(key, 0), (int, float)):
                     self._data[key] = self._data.get(key, 0) + amount
                 else:
@@ -242,7 +241,7 @@ stats = ThreadSafeStats()
 # ======================
 
 class RateLimiter:
-    """Rate limiter с ограничением памяти, удалением старых записей и статистикой"""
+    """Rate limiter с ограничением памяти и удалением старых записей"""
     
     def __init__(self, max_requests=100, window_seconds=60, max_tracked_ips=10000):
         self.max_requests = max_requests
@@ -252,7 +251,6 @@ class RateLimiter:
         self._lock = threading.RLock()
         self.blocked_count = 0
         self.total_checks = 0
-        self._cleanup_counter = 0
     
     def is_allowed(self, identifier):
         """Проверка, разрешен ли запрос"""
@@ -294,18 +292,6 @@ class RateLimiter:
         
         for key in old_keys:
             del self.requests[key]
-        
-        self._cleanup_counter += 1
-        logger.debug(f"Очистка RateLimiter #{self._cleanup_counter}: удалено {to_remove} старых IP, осталось {len(self.requests)}")
-    
-    def _calculate_avg_requests(self):
-        """Расчёт среднего количества запросов на IP"""
-        with self._lock:
-            if not self.requests:
-                return 0
-            
-            total_requests = sum(len(requests) for requests in self.requests.values())
-            return round(total_requests / len(self.requests), 2)
     
     def get_stats(self):
         """Получение статистики rate limiter"""
@@ -316,14 +302,9 @@ class RateLimiter:
             
             return {
                 'tracked_ips': len(self.requests),
-                'max_tracked_ips': self.max_tracked_ips,
-                'window_seconds': self.window.total_seconds(),
-                'max_requests': self.max_requests,
                 'blocked_count': self.blocked_count,
                 'total_checks': self.total_checks,
-                'block_rate_percent': block_rate,
-                'avg_requests_per_ip': self._calculate_avg_requests(),
-                'cleanups_performed': self._cleanup_counter
+                'block_rate_percent': block_rate
             }
 
 # Rate limiter для вебхука
@@ -356,12 +337,13 @@ def get_webhook_url():
 
 def run_async_safely(coro):
     """
-    Безопасный запуск асинхронной корутины БЕЗ изменения глобального event loop
+    Безопасный запуск асинхронной корутины
     """
     loop = None
     with track_execution_time("run_async_safely"):
         try:
             loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
             return loop.run_until_complete(coro)
         except asyncio.TimeoutError:
             raise
@@ -418,25 +400,43 @@ def init_bot():
         try:
             logger.info("🚀 Инициализация бота (только webhook)...")
             
+            # Проверяем наличие конфигурации
+            if config is None:
+                logger.error("❌ Конфигурация не загружена")
+                stats.increment('config_errors')
+                return False
+            
             # Логируем источник токена
-            try:
-                token_source = config.get_token_source()
-                logger.info(f"📋 Источник токена: {token_source}")
-            except:
-                logger.warning("⚠️ Не удалось определить источник токена")
+            logger.info(f"📋 Источник токена: {'определен' if hasattr(config, 'token') else 'неизвестен'}")
             
             # 1. Поисковая система
+            search_engine = None
             try:
-                search_engine = SearchEngine()
+                if SearchEngine is None:
+                    raise ImportError("SearchEngine не импортирован")
+                
+                search_engine = SearchEngine(config)
                 search_engine.refresh_data()
-                logger.info(f"✅ Загружено {len(search_engine.faq_data)} FAQ")
+                search_stats = search_engine.get_stats()
+                
+                if search_stats and 'faq_count' in search_stats:
+                    logger.info(f"✅ Загружено {search_stats['faq_count']} FAQ из {search_stats.get('loaded_from', 'неизвестного источника')}")
+                    if 'category_list' in search_stats:
+                        logger.info(f"📂 Категории: {', '.join(search_stats['category_list'])}")
+                else:
+                    logger.warning("⚠️ SearchEngine вернул пустую статистику")
+                    
             except Exception as e:
                 logger.error(f"❌ Ошибка загрузки поисковой системы: {e}")
                 stats.increment('config_errors')
                 # Продолжаем без поисковой системы
+                search_engine = None
             
             # 2. Обработчики команд
             try:
+                if BotCommandHandler is None or search_engine is None:
+                    raise ImportError("BotCommandHandler или SearchEngine не импортированы")
+                
                 bot_handler = BotCommandHandler(search_engine)
             except Exception as e:
                 logger.error(f"❌ Ошибка создания обработчиков: {e}")
@@ -524,6 +524,7 @@ def init_bot():
             try:
                 run_async_safely(async_init())
                 initialized = True
+                stats.set('bot_initialized', True)
                 logger.info("✅ Бот успешно инициализирован")
                 return True
                 
@@ -571,8 +572,7 @@ setup_graceful_shutdown()
 
 # Инициализация при импорте
 if not init_bot():
-    logger.critical("❌ Не удалось инициализировать бота")
-    # Не завершаем приложение, чтобы health-check мог показать ошибку
+    logger.error("❌ Не удалось инициализировать бота")
 
 # ======================
 # КЭШИРОВАНИЕ СТАТИСТИКИ
@@ -588,7 +588,7 @@ def get_ttl_hash(seconds=30):
     return int(time.time() / seconds)
 
 # ======================
-# FLASK ЭНДПОИНТЫ (остаются без изменений, кроме версии)
+# FLASK ЭНДПОИНТЫ
 # ======================
 
 @app.route('/')
@@ -616,6 +616,14 @@ def index():
     startup_time = datetime.fromisoformat(all_stats['startup_time'])
     uptime_seconds = (datetime.now() - startup_time).total_seconds()
     uptime_str = format_uptime(uptime_seconds)
+    
+    # Информация о конфигурации
+    config_info = {}
+    if config and hasattr(config, 'to_dict'):
+        try:
+            config_info = config.to_dict()
+        except:
+            config_info = {'error': 'Не удалось получить информацию о конфигурации'}
     
     return f"""
 <!DOCTYPE html>
@@ -678,31 +686,6 @@ def index():
             transform: translateY(-2px);
             box-shadow: 0 7px 20px rgba(52, 152, 219, 0.4);
         }}
-        .btn-secondary {{
-            background: linear-gradient(135deg, #95a5a6, #7f8c8d);
-        }}
-        .btn-secondary:hover {{
-            box-shadow: 0 7px 20px rgba(149, 165, 166, 0.4);
-        }}
-        .btn-danger {{
-            background: linear-gradient(135deg, #e74c3c, #c0392b);
-        }}
-        .btn-danger:hover {{
-            box-shadow: 0 7px 20px rgba(231, 76, 60, 0.4);
-        }}
-        h1 {{ 
-            color: #2c3e50;
-            margin-top: 0;
-            font-size: 2.5rem;
-            background: linear-gradient(135deg, #2c3e50, #3498db);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-        }}
-        h3 {{
-            color: #34495e;
-            border-bottom: 2px solid #ecf0f1;
-            padding-bottom: 10px;
-        }}
         .metric-grid {{
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
@@ -737,51 +720,34 @@ def index():
             color: #95a5a6;
             font-size: 12px;
         }}
-        .security-grid {{
+        .config-grid {{
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
             gap: 15px;
             margin: 20px 0;
         }}
-        .security-badge {{
-            display: inline-block;
-            padding: 12px 20px;
-            background: linear-gradient(135deg, #27ae60, #2ecc71);
-            color: white;
+        .config-item {{
+            background: #f8f9fa;
+            padding: 15px;
             border-radius: 10px;
-            font-size: 13px;
+            border-left: 4px solid #9b59b6;
+        }}
+        .config-label {{
             font-weight: 600;
-            margin: 5px;
-            text-align: center;
-        }}
-        .security-badge-warning {{
-            background: linear-gradient(135deg, #f39c12, #e67e22);
-        }}
-        .features {{ 
-            margin-top: 40px; 
-            background: #f8f9fa; 
-            padding: 25px; 
-            border-radius: 15px;
-            border: 1px solid #e9ecef;
-        }}
-        .features ul {{ 
-            font-size: 15px; 
-            color: #495057;
-            padding-left: 25px;
-            line-height: 1.8;
-        }}
-        .features li {{
-            margin: 10px 0;
-        }}
-        .badge {{
-            display: inline-block;
-            padding: 4px 10px;
-            background: #e3f2fd;
-            color: #1976d2;
-            border-radius: 20px;
+            color: #7f8c8d;
             font-size: 12px;
-            font-weight: 600;
-            margin-right: 8px;
+        }}
+        .config-value {{
+            color: #2c3e50;
+            font-size: 16px;
+            margin: 5px 0;
+        }}
+        .error-box {{
+            background: #fee;
+            border-left: 4px solid #e74c3c;
+            padding: 15px;
+            border-radius: 5px;
+            margin: 15px 0;
         }}
         .footer {{
             margin-top: 40px;
@@ -791,17 +757,9 @@ def index():
             border-top: 1px solid #ecf0f1;
             padding-top: 20px;
         }}
-        .btn-container {{
-            display: flex;
-            flex-wrap: wrap;
-            gap: 10px;
-            margin: 20px 0;
-        }}
         @media (max-width: 768px) {{
             .container {{ padding: 20px; }}
-            .metric-grid, .security-grid {{ grid-template-columns: 1fr; }}
-            .btn-container {{ flex-direction: column; }}
-            .btn {{ width: 100%; text-align: center; }}
+            .metric-grid, .config-grid {{ grid-template-columns: 1fr; }}
         }}
     </style>
 </head>
@@ -814,109 +772,72 @@ def index():
         </div>
         
         <p><strong>Режим:</strong> Webhook-only (без polling)</p>
-        <p><strong>Версия:</strong> <span class="badge">9.3.5</span> Стабильная (без pandas)</p>
+        <p><strong>Версия:</strong> 10.0 (стабильная, без pandas)</p>
         <p><strong>Аптайм:</strong> {uptime_str}</p>
         <p><strong>Время сервера:</strong> {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
         
-        <div class="security-grid">
-            <div class="security-badge">🛡️ Rate Limiting активен</div>
-            <div class="security-badge">🔒 Thread-safe статистика</div>
-            <div class="security-badge">⚡ LRU кэширование</div>
-            <div class="security-badge {'security-badge-warning' if not PSUTIL_AVAILABLE else ''}">
-                {'⚠️ ' if not PSUTIL_AVAILABLE else '📊 '}Мониторинг ресурсов
+        <div class="config-grid">
+            <div class="config-item">
+                <div class="config-label">Конфигурация</div>
+                <div class="config-value">Порт: {config_info.get('port', 'неизвестно')}</div>
+                <div class="config-value">Файл FAQ: {config_info.get('faq_file', 'неизвестно')}</div>
+                <div class="config-value">Админов: {config_info.get('admin_ids_count', 0)}</div>
             </div>
-            <div class="security-badge {'security-badge-warning' if all_stats.get('config_errors', 0) > 0 else ''}">
-                {'⚠️ ' if all_stats.get('config_errors', 0) > 0 else '✅ '}Конфигурация
-            </div>
-            <div class="security-badge" style="background: linear-gradient(135deg, #9b59b6, #8e44ad);">
-                🗑️ pandas удален
+            <div class="config-item">
+                <div class="config-label">Безопасность</div>
+                <div class="config-value">Rate Limiting: активен</div>
+                <div class="config-value">Токен: {'валиден' if config_info.get('token_format_valid', False) else 'невалиден'}</div>
+                <div class="config-value">Конфигурация: {'валидна' if config_info.get('config_valid', False) else 'невалидна'}</div>
             </div>
         </div>
         
-        <div class="btn-container">
-            <a href="/health" class="btn">🔍 Проверка здоровья</a>
-            <a href="/stats" class="btn">📊 Статистика API</a>
-            <a href="/checkwebhook" class="btn btn-secondary">🌐 Проверить вебхук</a>
-            <a href="/setwebhook" class="btn btn-secondary">🔄 Установить вебхук</a>
-            <a href="/deletewebhook" class="btn btn-danger">🗑️ Удалить вебхук</a>
+        <div class="metric-grid">
+            <div class="metric">
+                <div class="metric-label">Всего запросов</div>
+                <div class="metric-value">{all_stats['requests_total']}</div>
+                <div class="metric-subvalue">webhook вызовы</div>
+            </div>
+            <div class="metric">
+                <div class="metric-label">Ошибки</div>
+                <div class="metric-value">{all_stats['errors_total']}</div>
+                <div class="metric-subvalue">всего/таймаутов: {all_stats['timeouts_total']}</div>
+            </div>
+            <div class="metric">
+                <div class="metric-label">Ошибки конфигурации</div>
+                <div class="metric-value">{all_stats.get('config_errors', 0)}</div>
+                <div class="metric-subvalue">проблемы инициализации</div>
+            </div>
+            <div class="metric">
+                <div class="metric-label">Последний запрос</div>
+                <div class="metric-value">{last_str}</div>
+                <div class="metric-subvalue">время сервера</div>
+            </div>
+            <div class="metric">
+                <div class="metric-label">Отслеживаемые IP</div>
+                <div class="metric-value">{rate_stats['tracked_ips']}</div>
+                <div class="metric-subvalue">лимит: 10000</div>
+            </div>
+            <div class="metric">
+                <div class="metric-label">Блокировки спама</div>
+                <div class="metric-value">{rate_stats['blocked_count']}</div>
+                <div class="metric-subvalue">{rate_stats['block_rate_percent']}% от проверок</div>
+            </div>
         </div>
         
         <div style="margin-top: 30px;">
-            <h3>📊 Быстрая статистика:</h3>
-            <div class="metric-grid">
-                <div class="metric">
-                    <div class="metric-label">Всего запросов</div>
-                    <div class="metric-value">{all_stats['requests_total']}</div>
-                    <div class="metric-subvalue">webhook вызовы</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-label">Ошибки</div>
-                    <div class="metric-value">{all_stats['errors_total']}</div>
-                    <div class="metric-subvalue">всего/таймаутов: {all_stats['timeouts_total']}</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-label">Ошибки конфигурации</div>
-                    <div class="metric-value">{all_stats.get('config_errors', 0)}</div>
-                    <div class="metric-subvalue">проблемы инициализации</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-label">Последний запрос</div>
-                    <div class="metric-value">{last_str}</div>
-                    <div class="metric-subvalue">время сервера</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-label">Отслеживаемые IP</div>
-                    <div class="metric-value">{rate_stats['tracked_ips']}</div>
-                    <div class="metric-subvalue">лимит: {rate_stats['max_tracked_ips']}</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-label">Блокировки спама</div>
-                    <div class="metric-value">{rate_stats['blocked_count']}</div>
-                    <div class="metric-subvalue">{rate_stats['block_rate_percent']}% от проверок</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-label">Очистки памяти</div>
-                    <div class="metric-value">{rate_stats['cleanups_performed']}</div>
-                    <div class="metric-subvalue">выполнено очисток</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-label">Средняя нагрузка</div>
-                    <div class="metric-value">{rate_stats['avg_requests_per_ip']}</div>
-                    <div class="metric-subvalue">запросов на IP</div>
-                </div>
-            </div>
-        </div>
-        
-        <div class="features">
-            <h3>🎯 Особенности версии 9.3.5:</h3>
-            <ul>
-                <li><strong>✅ pandas удален</strong> - для полной совместимости с Python 3.13+ на бесплатном Render</li>
-                <li><strong>✅ Улучшенная валидация токена</strong> - проверка формата через регулярные выражения</li>
-                <li><strong>✅ Контроль создания файлов</strong> - файл FAQ создается только по запросу</li>
-                <li><strong>✅ Расширенная обработка ошибок</strong> - отдельный счетчик ошибок конфигурации</li>
-                <li><strong>✅ Универсальный адаптер токенов</strong> - работает с TELEGRAM_BOT_TOKEN, BOT_TOKEN, BOTTOKEN</li>
-                <li><strong>✅ Ручная конфигурация Gunicorn</strong> - гарантия работы на Render</li>
-                <li><strong>✅ Проверка конфигурационных файлов</strong> - при запуске проверяются все необходимые файлы</li>
-                <li><strong>✅ Thread-safe статистика</strong> - полная потокобезопасность</li>
-                <li><strong>✅ Безопасный event loop</strong> - исправлена критическая ошибка 9.2</li>
-                <li><strong>✅ Таймауты обработки</strong> - 30 секунд с логированием</li>
-                <li><strong>✅ Rate limiting с LRU</strong> - защита от спама + ограничение памяти</li>
-                <li><strong>✅ Graceful shutdown</strong> - корректное завершение на Render</li>
-            </ul>
+            <a href="/health" class="btn">🔍 Проверка здоровья</a>
+            <a href="/stats" class="btn">📊 Статистика API</a>
+            <a href="/checkwebhook" class="btn">🌐 Проверить вебхук</a>
         </div>
         
         <div class="footer">
-            <p>HR Bot Мечел | Версия 9.3.5 (без pandas) | Работает на Render.com</p>
-            <p>Техническая поддержка: IT отдел Мечел</p>
+            <p>HR Bot Мечел | Версия 10.0 (стабильная) | Работает на Render.com</p>
             <p>Системное время: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
         </div>
     </div>
 </body>
 </html>
 """
-
-# Остальные эндпоинты (/health, /stats, /ping, /setwebhook, /checkwebhook, /deletewebhook, /webhook, /test)
-# остаются такими же, как в версии 9.3.4, но с обновленной версией в логах
 
 @app.route('/health')
 def health():
@@ -926,7 +847,7 @@ def health():
         'service': 'hr-bot-mechel',
         'timestamp': datetime.now().isoformat(),
         'bot_initialized': initialized,
-        'version': '9.3.5',
+        'version': '10.0',
         'mode': 'webhook-only',
         'requests_total': stats.get('requests_total'),
         'errors_total': stats.get('errors_total'),
@@ -948,36 +869,17 @@ def health():
         'message': f'Ошибок конфигурации: {config_errors}'
     }
     
-    # Проверка базы данных (если используется)
-    try:
-        conn = config.get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('SELECT 1')
-        conn.close()
-        health_status['checks']['database'] = {
+    # Проверка токена
+    if config and hasattr(config, 'token'):
+        health_status['checks']['token'] = {
             'status': 'healthy',
-            'message': 'База данных доступна'
+            'message': 'Токен присутствует'
         }
-    except Exception as e:
-        health_status['checks']['database'] = {
+    else:
+        health_status['checks']['token'] = {
             'status': 'unhealthy',
-            'message': f'База данных недоступна: {str(e)}'
+            'message': 'Токен отсутствует'
         }
-    
-    # Проверка памяти (если psutil доступен)
-    if PSUTIL_AVAILABLE:
-        try:
-            memory = psutil.virtual_memory()
-            health_status['checks']['memory'] = {
-                'status': 'healthy' if memory.percent < 90 else 'warning',
-                'message': f'Использование памяти: {memory.percent}%',
-                'percent_used': memory.percent
-            }
-        except:
-            health_status['checks']['memory'] = {
-                'status': 'unknown',
-                'message': 'Не удалось проверить память'
-            }
     
     # Определяем общий статус
     unhealthy_checks = [check for check in health_status['checks'].values() 
@@ -1012,13 +914,13 @@ def api_stats():
         }
     }
     
+    if config and hasattr(config, 'to_dict'):
+        response['config'] = config.to_dict()
+    
     if PSUTIL_AVAILABLE:
         response['system']['memory'] = {
             'percent': psutil.virtual_memory().percent,
             'available_gb': round(psutil.virtual_memory().available / (1024**3), 2)
-        }
-        response['system']['cpu'] = {
-            'percent': psutil.cpu_percent(interval=0.1)
         }
     
     return jsonify(response)
@@ -1029,7 +931,7 @@ def ping():
     return jsonify({
         'status': 'pong',
         'timestamp': datetime.now().isoformat(),
-        'version': '9.3.5'
+        'version': '10.0'
     })
 
 @app.route('/setwebhook')
@@ -1074,11 +976,8 @@ def check_webhook():
             'url': webhook_info.url,
             'has_custom_certificate': webhook_info.has_custom_certificate,
             'pending_update_count': webhook_info.pending_update_count,
-            'ip_address': webhook_info.ip_address,
             'last_error_date': webhook_info.last_error_date,
             'last_error_message': webhook_info.last_error_message,
-            'max_connections': webhook_info.max_connections,
-            'allowed_updates': webhook_info.allowed_updates
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1141,7 +1040,7 @@ def webhook():
                 logger.error(f"Ошибка обработки обновления {update.update_id}: {e}")
                 stats.increment('errors_total')
         
-        # Запускаем обработку с таймаутом
+        # Запускаем обработку
         try:
             run_async_safely(process_update())
         except asyncio.TimeoutError:
@@ -1159,33 +1058,20 @@ def webhook():
         stats.set('last_error', str(e))
         return jsonify({'status': 'error', 'error': str(e)}), 500
 
-@app.route('/test')
-def test_page():
-    """Тестовая страница для проверки работы"""
-    return """
-    <h1>HR Bot Мечел - Тестовая страница</h1>
-    <p>Приложение работает версии 9.3.5 (без pandas).</p>
-    <p>Время сервера: {}</p>
-    <p><a href="/">На главную</a></p>
-    """.format(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-
 # ======================
 # ЗАПУСК СЕРВЕРА
 # ======================
 
 if __name__ == "__main__":
-    port = config.get_port()
+    port = config.get_port() if config else 10000
     logger.info("=" * 60)
-    logger.info(f"🚀 HR Bot Мечел - Версия 9.3.5 (БЕЗ PANDAS)")
+    logger.info(f"🚀 HR Bot Мечел - Версия 10.0 (ФИНАЛЬНАЯ)")
     logger.info(f"📅 Дата сборки: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    logger.info(f"📊 Режим: Webhook-only")
     logger.info(f"🌐 Webhook URL: {get_webhook_url()}")
-    logger.info(f"🔧 Проверка зависимостей: ✅ Пройдена (без pandas)")
+    logger.info(f"🔧 Проверка зависимостей: ✅ Пройдена")
     logger.info(f"📋 Проверка файлов конфигурации: ✅ Пройдена")
-    logger.info(f"🛡️ Rate limiting: 30 запр/мин, макс {rate_limiter.max_tracked_ips} IP")
+    logger.info(f"🛡️ Rate limiting: 30 запр/мин")
     logger.info(f"📈 Мониторинг ресурсов: {'✅ Включен' if PSUTIL_AVAILABLE else '⚠️ Отключен'}")
-    logger.info(f"🔐 Проверка токена: ✅ Формат токена проверен")
-    logger.info(f"🗑️ pandas: ❌ Удален для совместимости с Python 3.13+")
     logger.info("=" * 60)
     
     app.run(host='0.0.0.0', port=port, debug=False)

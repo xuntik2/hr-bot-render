@@ -8,35 +8,22 @@ services:
     
     buildCommand: |
       pip install --no-cache-dir -r requirements.txt
-      echo "✅ Зависимости установлены"
     
     startCommand: |
-      gunicorn bot:app \
-        --bind 0.0.0.0:$PORT \
-        --workers 1 \
-        --timeout 60 \
-        --log-level info \
-        --access-logfile -
+      gunicorn bot:app --bind 0.0.0.0:$PORT --workers 1 --timeout 60 --log-level info
     
     envVars:
       - key: BOT_TOKEN
         sync: false
-        required: true
       - key: DATABASE_URL
         sync: false
-        required: true
       - key: PORT
         value: "10000"
       - key: AUTO_SET_WEBHOOK
         value: "true"
-      - key: PYTHONUNBUFFERED
-        value: "1"
-      - key: RENDER_EXTERNAL_HOSTNAME
-        fromService:
-          name: hr-bot-mechel
-          type: web
-          property: hostname
+      - key: DELETE_WEBHOOK_ON_EXIT
+        value: "false"
     
     healthCheckPath: /health
     healthCheckInterval: 30
-    healthCheckTimeout: 30  # ✅ Увеличенный таймаут для инициализации
+    healthCheckTimeout: 30

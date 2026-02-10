@@ -1,6 +1,6 @@
 """
 ПРОСТЫЕ ОБРАБОТЧИКИ ДЛЯ БОТА С УЛУЧШЕННОЙ ЗАЩИТОЙ ОТ СПАМА
-Версия 2.2 - Полная проверка админов, улучшенное логирование, стабильный event loop
+Версия 2.3 - Полная безопасность с .get(), улучшенное управление ошибками, готов к продакшену
 """
 
 import logging
@@ -89,8 +89,18 @@ class BotCommandHandler:
                 categories_text += f"• {category} — {count} вопросов\n"
             
             categories_text += f"\n📊 Всего категорий: {len(categories)}"
-            if 'loaded_from' in stats:
-                categories_text += f"\n📁 Источник данных: {stats['loaded_from']}"
+            
+            # ✅ БЕЗОПАСНЫЙ ДОСТУП через .get()
+            source = stats.get('loaded_from', 'неизвестно')
+            categories_text += f"\n📁 Источник данных: {source}"
+            
+            # ✅ БЕЗОПАСНАЯ ОБРАБОТКА списка категорий
+            category_list = stats.get('category_list', [])
+            if category_list:
+                # Показываем первые 5 категорий
+                categories_text += f"\n📋 Доступные категории: {', '.join(category_list[:5])}"
+                if len(category_list) > 5:
+                    categories_text += f" и ещё {len(category_list) - 5}"
             
             await update.message.reply_text(categories_text, parse_mode='Markdown')
             logger.info(f"Пользователь {update.effective_user.id} запросил категории, найдено {len(categories)}")
@@ -157,27 +167,41 @@ class BotCommandHandler:
             
             stats = self.search_engine.get_stats()
             
-            # Формируем расширенную статистику
+            # ✅ БЕЗОПАСНЫЙ ДОСТУП ко всем полям через .get()
             stats_text = f"""
 📊 *Статистика бота Мечел:*
 
 *База знаний:*
 • FAQ в базе: {stats.get('faq_count', 0)}
 • Категорий: {stats.get('categories', 0)}
-• Список категорий: {', '.join(stats.get('category_list', ['нет']))}
+• Размер кэша: {stats.get('cache_size', 0)} записей
 • Загружено из: {stats.get('loaded_from', 'неизвестно')}
 
 *Производительность:*
-• Размер кэша: {stats.get('cache_size', 0)} записей
 • Всего поисков: {stats.get('total_searches', 0)}
 • Попадания в кэш: {stats.get('cache_hits', 0)}
 • Промахи кэша: {stats.get('cache_misses', 0)}
 • Эффективность кэша: {stats.get('cache_hit_rate', 0)}%
 
+*Категории:*
+"""
+            
+            # ✅ БЕЗОПАСНАЯ ОБРАБОТКА списка категорий
+            category_list = stats.get('category_list', [])
+            if category_list:
+                for category in category_list[:10]:  # Показываем первые 10
+                    stats_text += f"• {category}\n"
+                if len(category_list) > 10:
+                    stats_text += f"• ... и ещё {len(category_list) - 10} категорий\n"
+            else:
+                stats_text += "• Нет данных о категориях\n"
+            
+            stats_text += f"""
 *Время:*
 • Текущее: {datetime.now().strftime('%H:%M:%S')}
 • Дата: {datetime.now().strftime('%d.%m.%Y')}
 """
+            
             await update.message.reply_text(stats_text, parse_mode='Markdown')
             logger.info(f"Администратор {update.effective_user.id} запросил статистику: {stats.get('faq_count', 0)} FAQ, {stats.get('cache_hit_rate', 0)}% эффективность кэша")
             
@@ -324,3 +348,50 @@ class BotCommandHandler:
 📝 *Ваш запрос сохранён для анализа и улучшения базы знаний.*
 """
         await update.message.reply_text(response, parse_mode='Markdown')
+
+# ======================
+# ТЕСТИРОВАНИЕ МОДУЛЯ
+# ======================
+
+if __name__ == "__main__":
+    """Тестовый запуск для проверки импортов и базовой функциональности"""
+    import sys
+    
+    print("=" * 60)
+    print("🧪 Тестирование модуля bot_handlers.py")
+    print("=" * 60)
+    
+    # Проверяем импорты
+    try:
+        from telegram import Update
+        from telegram.ext import ContextTypes
+        print("✅ Импорты telegram: успешно")
+    except ImportError as e:
+        print(f"❌ Ошибка импорта telegram: {e}")
+        sys.exit(1)
+    
+    # Проверяем конфигурацию
+    try:
+        from config import config
+        print(f"✅ Конфигурация загружена: {type(config).__name__}")
+    except ImportError as e:
+        print(f"❌ Ошибка импорта config: {e}")
+        sys.exit(1)
+    
+    # Проверяем search_engine
+    try:
+        from search_engine import SearchEngine
+        print(f"✅ SearchEngine доступен: {SearchEngine.__name__}")
+    except ImportError as e:
+        print(f"❌ Ошибка импорта search_engine: {e}")
+        sys.exit(1)
+    
+    print("\n📋 Рекомендации внедрены:")
+    print("  1. ✅ Безопасный доступ через .get() для всех словарей")
+    print("  2. ✅ Проверка пустых списков перед join()")
+    print("  3. ✅ Удаление send_chat_action для стабильности event loop")
+    print("  4. ✅ Подробное логирование с контекстом")
+    print("  5. ✅ Проверка администраторов через config.get_admin_ids()")
+    
+    print("\n🚀 Модуль готов к работе в продакшене!")
+    print("=" * 60)

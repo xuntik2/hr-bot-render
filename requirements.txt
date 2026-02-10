@@ -1,8 +1,9 @@
-# Основные зависимости для HR бота Мечел — БЕЗ PANDAS
+# Основные зависимости для HR бота Мечел — БЕЗ PANDAS, с gevent
 python-telegram-bot[job-queue]==21.7
 Flask==3.0.0
 gunicorn==21.2.0
-openpyxl==3.1.2          # Используется напрямую для чтения Excel
+gevent==23.9.1  # Асинхронный воркер для Gunicorn
+openpyxl==3.1.2
 psutil==5.9.7
 python-dotenv==1.0.0
 requests==2.31.0

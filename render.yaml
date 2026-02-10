@@ -2,300 +2,41 @@ services:
   - type: web
     name: hr-bot-mechel
     env: python
-    region: frankfurt
     plan: free
+    region: frankfurt
     autoDeploy: true
+    
     buildCommand: |
-      echo "========================================================"
-      echo "🚀 НАЧАЛО СБОРКИ HR-БОТА МЕЧЕЛ"
-      echo "========================================================"
-      
-      echo ""
-      echo "🔧 УСТАНОВКА ЗАВИСИМОСТЕЙ"
-      echo "========================================================"
-      pip install --upgrade pip
-      pip install -r requirements.txt
-      
-      echo ""
-      echo "🗄️  ПРОВЕРКА ПОДКЛЮЧЕНИЯ К POSTGRESQL"
-      echo "========================================================"
-      python -c "
-      import sys
-      sys.path.insert(0, '.')
-      from config import config
-      try:
-          conn = config.get_db_connection()
-          cur = conn.cursor()
-          cur.execute('SELECT version()')
-          version = cur.fetchone()[0]
-          conn.close()
-          print(f'✅ Подключение к PostgreSQL успешно')
-          print(f'   Версия: {version.split(',')[0]}')
-      except Exception as e:
-          print(f'❌ ОШИБКА подключения к базе данных: {e}')
-          sys.exit(1)
-      "
-      
-      echo ""
-      echo "🔍 ПРОВЕРКА СТРУКТУРЫ БАЗЫ ДАННЫХ"
-      echo "========================================================"
-      python -c "
-      import sys
-      sys.path.insert(0, '.')
-      from config import config
-      try:
-          conn = config.get_db_connection()
-          cur = conn.cursor()
-          # Проверяем существование таблицы faq
-          cur.execute('''
-              SELECT EXISTS (
-                  SELECT FROM information_schema.tables 
-                  WHERE table_schema = 'public' 
-                  AND table_name = 'faq'
-              )
-          ''')
-          table_exists = cur.fetchone()[0]
-          
-          if table_exists:
-              print('✅ Таблица \"faq\" существует')
-              # Проверяем структуру таблицы
-              cur.execute('''
-                  SELECT column_name, data_type 
-                  FROM information_schema.columns 
-                  WHERE table_name = 'faq' 
-                  ORDER BY ordinal_position
-              ''')
-              columns = cur.fetchall()
-              print(f'   Столбцы таблицы:')
-              for col_name, col_type in columns:
-                  print(f'   - {col_name} ({col_type})')
-          else:
-              print('❌ Таблица \"faq\" не существует!')
-              print('   Создайте таблицу вручную или используйте create_database.py')
-              # Создаем таблицу
-              print('   Попытка создания таблицы...')
-              from faq_data import get_faq_data
-              cur.execute('''
-                  CREATE TABLE IF NOT EXISTS faq (
-                      id SERIAL PRIMARY KEY,
-                      question TEXT NOT NULL,
-                      answer TEXT NOT NULL,
-                      keywords TEXT,
-                      norm_keywords TEXT,
-                      norm_question TEXT,
-                      category TEXT,
-                      usage_count INTEGER DEFAULT 0,
-                      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                  )
-              ''')
-              print('   ✅ Таблица создана')
-          
-          conn.close()
-      except Exception as e:
-          print(f'❌ Ошибка при проверке структуры БД: {e}')
-          # Не прерываем сборку, попробуем продолжить
-      "
-      
-      echo ""
-      echo "📝 ЗАПОЛНЕНИЕ БАЗЫ ДАННЫХ 75 ВОПРОСАМИ"
-      echo "========================================================"
-      python -c "
-      import sys
-      sys.path.insert(0, '.')
-      from config import config
-      from faq_data import get_faq_data
-      import traceback
-      
-      try:
-          print('📚 Получение данных из faq_data.py...')
-          faq_list = get_faq_data()
-          print(f'✅ Загружено {len(faq_list)} вопросов')
-          
-          conn = config.get_db_connection()
-          cur = conn.cursor()
-          
-          # Считаем текущее количество записей
-          cur.execute('SELECT COUNT(*) FROM faq')
-          count_before = cur.fetchone()[0]
-          print(f'📊 Записей в базе до заполнения: {count_before}')
-          
-          if count_before >= 75:
-              print('✅ База уже содержит достаточно записей. Пропускаем заполнение.')
-              conn.close()
-          else:
-              print('🧹 Очистка таблицы...')
-              cur.execute('TRUNCATE TABLE faq RESTART IDENTITY CASCADE')
-              
-              print('📝 Вставка вопросов...')
-              inserted = 0
-              for faq in faq_list:
-                  sql = '''
-                  INSERT INTO faq (question, answer, keywords, norm_keywords, norm_question, category)
-                  VALUES (%s, %s, %s, %s, %s, %s)
-                  '''
-                  cur.execute(sql, (
-                      faq['question'],
-                      faq['answer'],
-                      faq['keywords'],
-                      faq['norm_keywords'],
-                      faq['norm_question'],
-                      faq['category']
-                  ))
-                  inserted += 1
-                  
-                  if inserted % 10 == 0:
-                      print(f'   Добавлено {inserted} вопросов...')
-              
-              conn.commit()
-              conn.close()
-              print(f'✅ Успешно добавлено {inserted} вопросов')
-              
-      except Exception as e:
-          print(f'❌ ОШИБКА при заполнении базы данных: {e}')
-          traceback.print_exc()
-          # Не прерываем сборку - бот может работать с пустой/частично заполненной базой
-      "
-      
-      echo ""
-      echo "🔄 ПРОВЕРКА И ЗАПОЛНЕНИЕ БАЗЫ ДАННЫХ"
-      echo "========================================================"
-      python -c "
-      import sys
-      sys.path.insert(0, '.')
-      from config import config
-      
-      try:
-          conn = config.get_db_connection()
-          cur = conn.cursor()
-          cur.execute('SELECT COUNT(*) FROM faq')
-          count = cur.fetchone()[0]
-          conn.close()
-          
-          print(f'📊 Текущее количество записей в базе: {count}')
-          
-          if count < 75:
-              print('⚠️  База данных содержит недостаточно записей')
-              print('   После запуска бота перейдите по адресу:')
-              print('   https://hr-bot-mechel.onrender.com/admin/fill-db')
-              print('   для заполнения базы данных')
-          else:
-              print('✅ База данных полностью заполнена!')
-              
-      except Exception as e:
-          print(f'⚠️  Ошибка при проверке базы: {e}')
-      "
-      
-      echo ""
-      echo "🔍 ФИНАЛЬНАЯ ПРОВЕРКА БАЗЫ ДАННЫХ"
-      echo "========================================================"
-      python -c "
-      import sys
-      sys.path.insert(0, '.')
-      from config import config
-      
-      try:
-          conn = config.get_db_connection()
-          cur = conn.cursor()
-          
-          # Проверяем количество записей
-          cur.execute('SELECT COUNT(*) FROM faq')
-          total_count = cur.fetchone()[0]
-          
-          # Проверяем количество категорий
-          cur.execute('SELECT COUNT(DISTINCT category) FROM faq')
-          category_count = cur.fetchone()[0]
-          
-          # Проверяем уникальность вопросов
-          cur.execute('SELECT COUNT(DISTINCT norm_question) FROM faq')
-          unique_count = cur.fetchone()[0]
-          
-          conn.close()
-          
-          print('📊 РЕЗУЛЬТАТ ЗАПОЛНЕНИЯ БАЗЫ ДАННЫХ:')
-          print(f'   • Всего записей: {total_count}')
-          print(f'   • Уникальных категорий: {category_count}')
-          print(f'   • Уникальных вопросов: {unique_count}')
-          
-          if total_count >= 75:
-              print('✅ УСПЕХ: База данных полностью заполнена!')
-          elif total_count > 0:
-              print(f'⚠️  ВНИМАНИЕ: В базе только {total_count} из 75 записей')
-              print('   Бот будет работать с ограниченной базой знаний')
-          else:
-              print('❌ ПРЕДУПРЕЖДЕНИЕ: База данных пустая!')
-              print('   Бот не сможет отвечать на вопросы')
-              
-      except Exception as e:
-          print(f'⚠️  Ошибка при проверке базы данных: {e}')
-      "
-      
-      echo ""
-      echo "🧪 ПРОВЕРКА КОРРЕКТНОСТИ КОДА"
-      echo "========================================================"
-      python -c "
-      import sys
-      sys.path.insert(0, '.')
-      
-      # Проверяем импорт основных модулей
-      try:
-          from config import config
-          print('✅ config.py загружен')
-      except Exception as e:
-          print(f'❌ Ошибка загрузки config.py: {e}')
-      
-      try:
-          from faq_data import get_faq_data
-          print('✅ faq_data.py загружен')
-      except Exception as e:
-          print(f'❌ Ошибка загрузки faq_data.py: {e}')
-      
-      try:
-          from search_engine import SearchEngine
-          print('✅ search_engine.py загружен')
-      except Exception as e:
-          print(f'❌ Ошибка загрузки search_engine.py: {e}')
-      
-      try:
-          from handlers import CommandHandler
-          print('✅ handlers.py загружен')
-      except Exception as e:
-          print(f'❌ Ошибка загрузки handlers.py: {e}')
-      
-      try:
-          from admin_tools import check_database_status, fill_database_manual
-          print('✅ admin_tools.py загружен')
-      except Exception as e:
-          print(f'⚠️  Ошибка загрузки admin_tools.py: {e}')
-          print('   Но это не критично для работы бота')
-      
-      print('✅ Все основные модули загружены корректно')
-      "
-      
-      echo ""
-      echo "========================================================"
-      echo "🎉 СБОРКА УСПЕШНО ЗАВЕРШЕНА"
-      echo "========================================================"
-    startCommand: python bot.py
+      pip install --no-cache-dir -r requirements.txt
+      echo "✅ Зависимости установлены"
+    
+    startCommand: |
+      gunicorn bot:app \
+        --bind 0.0.0.0:$PORT \
+        --workers 1 \
+        --timeout 60 \
+        --log-level info \
+        --access-logfile -
+    
     envVars:
       - key: BOT_TOKEN
         sync: false
         required: true
-      - key: ADMIN_IDS
-        sync: false
       - key: DATABASE_URL
         sync: false
-      - key: MEME_ENABLED
-        value: "false"
-      - key: FEEDBACK_ENABLED
-        value: "true"
+        required: true
+      - key: PORT
+        value: "10000"
       - key: AUTO_SET_WEBHOOK
         value: "true"
-      - key: RENDER_EXTERNAL_URL
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: RENDER_EXTERNAL_HOSTNAME
         fromService:
           name: hr-bot-mechel
           type: web
-          property: url
-      - key: PORT
-        value: "10000"
+          property: hostname
+    
     healthCheckPath: /health
-    healthCheckInterval: 60
+    healthCheckInterval: 30
+    healthCheckTimeout: 30  # ✅ Увеличенный таймаут для инициализации

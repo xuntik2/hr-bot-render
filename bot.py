@@ -1,6 +1,6 @@
 """
 HR БОТ ДЛЯ RENDER FREE - ФИНАЛЬНАЯ ПРОДАКШЕН ВЕРСИЯ
-Версия 9.3.4 - УЛУЧШЕННАЯ ВАЛИДАЦИЯ ТОКЕНА И ОБРАБОТКА ОШИБОК
+Версия 9.3.5 - УДАЛЕН PANDAS ДЛЯ СОВМЕСТИМОСТИ
 """
 
 import os
@@ -81,7 +81,7 @@ if not check_config_files():
     sys.exit(1)
 
 # ======================
-# ПРОВЕРКА ЗАВИСИМОСТЕЙ ПРИ ЗАПУСКЕ
+# ПРОВЕРКА ЗАВИСИМОСТЕЙ ПРИ ЗАПУСКЕ (ОБНОВЛЕНО - БЕЗ PANDAS)
 # ======================
 
 def check_dependencies():
@@ -106,18 +106,14 @@ def check_dependencies():
         logger.critical("📦 Установите: pip install python-telegram-bot[job-queue]==21.7")
         return False
     
-    # Проверка других важных зависимостей
+    # Проверка других важных зависимостей (БЕЗ PANDAS)
     try:
         import flask
         logger.info(f"✅ Версия Flask: {flask.__version__}")
     except ImportError:
         logger.warning("⚠️ Flask не установлен")
     
-    try:
-        import pandas
-        logger.info(f"✅ Версия pandas: {pandas.__version__}")
-    except ImportError:
-        logger.warning("⚠️ pandas не установлен")
+    # УДАЛЕНО: Проверка pandas
     
     # Проверка psutil (опционально, но рекомендуется)
     try:
@@ -818,7 +814,7 @@ def index():
         </div>
         
         <p><strong>Режим:</strong> Webhook-only (без polling)</p>
-        <p><strong>Версия:</strong> <span class="badge">9.3.4</span> Стабильная</p>
+        <p><strong>Версия:</strong> <span class="badge">9.3.5</span> Стабильная (без pandas)</p>
         <p><strong>Аптайм:</strong> {uptime_str}</p>
         <p><strong>Время сервера:</strong> {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
         
@@ -831,6 +827,9 @@ def index():
             </div>
             <div class="security-badge {'security-badge-warning' if all_stats.get('config_errors', 0) > 0 else ''}">
                 {'⚠️ ' if all_stats.get('config_errors', 0) > 0 else '✅ '}Конфигурация
+            </div>
+            <div class="security-badge" style="background: linear-gradient(135deg, #9b59b6, #8e44ad);">
+                🗑️ pandas удален
             </div>
         </div>
         
@@ -889,8 +888,9 @@ def index():
         </div>
         
         <div class="features">
-            <h3>🎯 Особенности версии 9.3.4:</h3>
+            <h3>🎯 Особенности версии 9.3.5:</h3>
             <ul>
+                <li><strong>✅ pandas удален</strong> - для полной совместимости с Python 3.13+ на бесплатном Render</li>
                 <li><strong>✅ Улучшенная валидация токена</strong> - проверка формата через регулярные выражения</li>
                 <li><strong>✅ Контроль создания файлов</strong> - файл FAQ создается только по запросу</li>
                 <li><strong>✅ Расширенная обработка ошибок</strong> - отдельный счетчик ошибок конфигурации</li>
@@ -906,7 +906,7 @@ def index():
         </div>
         
         <div class="footer">
-            <p>HR Bot Мечел | Версия 9.3.4 | Работает на Render.com</p>
+            <p>HR Bot Мечел | Версия 9.3.5 (без pandas) | Работает на Render.com</p>
             <p>Техническая поддержка: IT отдел Мечел</p>
             <p>Системное время: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
         </div>
@@ -916,7 +916,7 @@ def index():
 """
 
 # Остальные эндпоинты (/health, /stats, /ping, /setwebhook, /checkwebhook, /deletewebhook, /webhook, /test)
-# остаются такими же, как в версии 9.3.3, но с учетом новой статистики config_errors
+# остаются такими же, как в версии 9.3.4, но с обновленной версией в логах
 
 @app.route('/health')
 def health():
@@ -926,7 +926,7 @@ def health():
         'service': 'hr-bot-mechel',
         'timestamp': datetime.now().isoformat(),
         'bot_initialized': initialized,
-        'version': '9.3.4',
+        'version': '9.3.5',
         'mode': 'webhook-only',
         'requests_total': stats.get('requests_total'),
         'errors_total': stats.get('errors_total'),
@@ -935,10 +935,239 @@ def health():
         'checks': {}
     }
     
-    # ... остальной код health-check без изменений ...
-    # (добавлена проверка config_errors в итоговый статус)
+    # Проверка бота
+    health_status['checks']['bot_initialization'] = {
+        'status': 'healthy' if initialized else 'unhealthy',
+        'message': 'Бот инициализирован' if initialized else 'Бот не инициализирован'
+    }
+    
+    # Проверка конфигурации
+    config_errors = stats.get('config_errors', 0)
+    health_status['checks']['configuration'] = {
+        'status': 'healthy' if config_errors == 0 else 'unhealthy',
+        'message': f'Ошибок конфигурации: {config_errors}'
+    }
+    
+    # Проверка базы данных (если используется)
+    try:
+        conn = config.get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT 1')
+        conn.close()
+        health_status['checks']['database'] = {
+            'status': 'healthy',
+            'message': 'База данных доступна'
+        }
+    except Exception as e:
+        health_status['checks']['database'] = {
+            'status': 'unhealthy',
+            'message': f'База данных недоступна: {str(e)}'
+        }
+    
+    # Проверка памяти (если psutil доступен)
+    if PSUTIL_AVAILABLE:
+        try:
+            memory = psutil.virtual_memory()
+            health_status['checks']['memory'] = {
+                'status': 'healthy' if memory.percent < 90 else 'warning',
+                'message': f'Использование памяти: {memory.percent}%',
+                'percent_used': memory.percent
+            }
+        except:
+            health_status['checks']['memory'] = {
+                'status': 'unknown',
+                'message': 'Не удалось проверить память'
+            }
+    
+    # Определяем общий статус
+    unhealthy_checks = [check for check in health_status['checks'].values() 
+                       if check['status'] not in ['healthy', 'unknown']]
+    
+    if not initialized:
+        health_status['status'] = 'unhealthy'
+        health_status['message'] = 'Бот не инициализирован'
+    elif unhealthy_checks:
+        health_status['status'] = 'unhealthy'
+        health_status['message'] = f'Найдено проблем: {len(unhealthy_checks)}'
+    else:
+        health_status['status'] = 'healthy'
+        health_status['message'] = 'Все системы работают нормально'
     
     return jsonify(health_status), 200
+
+@app.route('/stats')
+def api_stats():
+    """API статистики в JSON формате"""
+    all_stats = stats.get_all()
+    rate_stats = rate_limiter.get_stats()
+    
+    response = {
+        'bot': all_stats,
+        'rate_limiter': rate_stats,
+        'system': {
+            'python_version': sys.version,
+            'platform': sys.platform,
+            'initialized': initialized,
+            'psutil_available': PSUTIL_AVAILABLE
+        }
+    }
+    
+    if PSUTIL_AVAILABLE:
+        response['system']['memory'] = {
+            'percent': psutil.virtual_memory().percent,
+            'available_gb': round(psutil.virtual_memory().available / (1024**3), 2)
+        }
+        response['system']['cpu'] = {
+            'percent': psutil.cpu_percent(interval=0.1)
+        }
+    
+    return jsonify(response)
+
+@app.route('/ping')
+def ping():
+    """Простой ping для проверки доступности"""
+    return jsonify({
+        'status': 'pong',
+        'timestamp': datetime.now().isoformat(),
+        'version': '9.3.5'
+    })
+
+@app.route('/setwebhook')
+def set_webhook():
+    """Ручная установка вебхука"""
+    if not application:
+        return jsonify({'error': 'Application не инициализировано'}), 500
+    
+    try:
+        async def async_set():
+            webhook_url = get_webhook_url()
+            await application.bot.delete_webhook(drop_pending_updates=True)
+            await application.bot.set_webhook(
+                url=webhook_url,
+                drop_pending_updates=True,
+                allowed_updates=["message", "callback_query"],
+                max_connections=40
+            )
+            return webhook_url
+        
+        webhook_url = run_async_safely(async_set())
+        return jsonify({
+            'success': True,
+            'message': 'Вебхук установлен',
+            'url': webhook_url
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/checkwebhook')
+def check_webhook():
+    """Проверка состояния вебхука"""
+    if not application:
+        return jsonify({'error': 'Application не инициализировано'}), 500
+    
+    try:
+        async def async_check():
+            return await application.bot.get_webhook_info()
+        
+        webhook_info = run_async_safely(async_check())
+        return jsonify({
+            'url': webhook_info.url,
+            'has_custom_certificate': webhook_info.has_custom_certificate,
+            'pending_update_count': webhook_info.pending_update_count,
+            'ip_address': webhook_info.ip_address,
+            'last_error_date': webhook_info.last_error_date,
+            'last_error_message': webhook_info.last_error_message,
+            'max_connections': webhook_info.max_connections,
+            'allowed_updates': webhook_info.allowed_updates
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/deletewebhook')
+def delete_webhook():
+    """Удаление вебхука"""
+    if not application:
+        return jsonify({'error': 'Application не инициализировано'}), 500
+    
+    try:
+        async def async_delete():
+            return await application.bot.delete_webhook(drop_pending_updates=True)
+        
+        result = run_async_safely(async_delete())
+        return jsonify({
+            'success': result,
+            'message': 'Вебхук удален'
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """Основной endpoint для вебхука Telegram"""
+    stats.update_last_request()
+    
+    # Rate limiting по IP
+    client_ip = request.remote_addr
+    if not rate_limiter.is_allowed(client_ip):
+        stats.increment('rate_limit_hits')
+        logger.warning(f"🚫 Rate limit превышен для IP: {client_ip}")
+        return jsonify({'status': 'rate_limit_exceeded'}), 429
+    
+    stats.increment('requests_total')
+    stats.increment('webhook_calls')
+    
+    if not application:
+        logger.error("Application не инициализировано при получении вебхука")
+        stats.increment('errors_total')
+        return jsonify({'status': 'application_not_initialized'}), 500
+    
+    try:
+        # Получаем данные обновления
+        data = request.get_json()
+        if not data:
+            logger.error("Получен пустой запрос вебхука")
+            stats.increment('errors_total')
+            return jsonify({'status': 'invalid_data'}), 400
+        
+        update = Update.de_json(data, application.bot)
+        
+        # Обрабатываем обновление
+        async def process_update():
+            try:
+                await application.process_update(update)
+                stats.increment('successful_responses')
+                logger.debug(f"✅ Обработано обновление {update.update_id}")
+            except Exception as e:
+                logger.error(f"Ошибка обработки обновления {update.update_id}: {e}")
+                stats.increment('errors_total')
+        
+        # Запускаем обработку с таймаутом
+        try:
+            run_async_safely(process_update())
+        except asyncio.TimeoutError:
+            logger.warning(f"⏱️ Таймаут обработки обновления {update.update_id}")
+            stats.increment('timeouts_total')
+        except Exception as e:
+            logger.error(f"Ошибка выполнения асинхронной задачи: {e}")
+            stats.increment('errors_total')
+        
+        return jsonify({'status': 'ok'}), 200
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка обработки вебхука: {e}", exc_info=True)
+        stats.increment('errors_total')
+        stats.set('last_error', str(e))
+        return jsonify({'status': 'error', 'error': str(e)}), 500
+
+@app.route('/test')
+def test_page():
+    """Тестовая страница для проверки работы"""
+    return """
+    <h1>HR Bot Мечел - Тестовая страница</h1>
+    <p>Приложение работает версии 9.3.5 (без pandas).</p>
+    <p>Время сервера: {}</p>
+    <p><a href="/">На главную</a></p>
+    """.format(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
 # ======================
 # ЗАПУСК СЕРВЕРА
@@ -947,15 +1176,16 @@ def health():
 if __name__ == "__main__":
     port = config.get_port()
     logger.info("=" * 60)
-    logger.info(f"🚀 HR Bot Мечел - Версия 9.3.4")
+    logger.info(f"🚀 HR Bot Мечел - Версия 9.3.5 (БЕЗ PANDAS)")
     logger.info(f"📅 Дата сборки: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info(f"📊 Режим: Webhook-only")
     logger.info(f"🌐 Webhook URL: {get_webhook_url()}")
-    logger.info(f"🔧 Проверка зависимостей: ✅ Пройдена")
+    logger.info(f"🔧 Проверка зависимостей: ✅ Пройдена (без pandas)")
     logger.info(f"📋 Проверка файлов конфигурации: ✅ Пройдена")
     logger.info(f"🛡️ Rate limiting: 30 запр/мин, макс {rate_limiter.max_tracked_ips} IP")
     logger.info(f"📈 Мониторинг ресурсов: {'✅ Включен' if PSUTIL_AVAILABLE else '⚠️ Отключен'}")
     logger.info(f"🔐 Проверка токена: ✅ Формат токена проверен")
+    logger.info(f"🗑️ pandas: ❌ Удален для совместимости с Python 3.13+")
     logger.info("=" * 60)
     
     app.run(host='0.0.0.0', port=port, debug=False)

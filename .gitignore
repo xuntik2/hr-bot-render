@@ -1,24 +1,9 @@
-# Секретные файлы
-.env                    # ← САМЫЙ ВАЖНЫЙ! Токены и пароли
-.env.local
-
-# Временные файлы Python
-__pycache__/            # ← Автоматически создается Python
+__pycache__/
 *.pyc
 *.pyo
-
-# Базы данных
-*.db                    # ← Ваши локальные базы данных
-*.sqlite3
-
-# Настройки редакторов
-.vscode/                # ← Настройки VS Code (только у вас)
-.idea/                  # ← Настройки PyCharm (только у вас)
-
-# Системные файлы
-.DS_Store              # ← Только на Mac
-Thumbs.db              # ← Только на Windows
-
-# Логи и кэш
+.env
 *.log
-logs/
+data/*.xlsx
+*.db
+instance/
+.DS_Store

@@ -7,7 +7,7 @@ services:
     plan: free
     branch: main
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn -c gunicorn.conf.py bot:app
+    startCommand: hypercorn --bind 0.0.0.0:$PORT --worker-class asyncio --workers 1 --access-logfile - --error-logfile - bot:app
     healthCheckPath: /health
     healthCheckTimeout: 30
     healthCheckInterval: 60
@@ -20,8 +20,6 @@ services:
         value: "10000"
       - key: LOG_LEVEL
         value: "INFO"
-      - key: GUNICORN_LOG_LEVEL
-        value: "info"
       - key: AUTO_SET_WEBHOOK
         value: "true"
       - key: DELETE_WEBHOOK_ON_EXIT

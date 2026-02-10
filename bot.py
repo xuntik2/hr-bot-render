@@ -1,6 +1,6 @@
 """
 HR БОТ ДЛЯ RENDER FREE - ФИНАЛЬНАЯ ПРОДАКШЕН ВЕРСИЯ
-Версия 10.0 - Полностью исправлены все критические ошибки
+Версия 10.1 - Исправлен Event loop is closed, перешли на hypercorn
 """
 
 import os
@@ -45,7 +45,6 @@ def check_config_files():
     ]
     
     optional_files = [
-        'gunicorn.conf.py',
         'runtime.txt',
         'render.yaml',
         'faq_data.py',
@@ -112,10 +111,10 @@ def check_dependencies():
         logger.warning("⚠️ Flask не установлен")
     
     try:
-        import gevent
-        logger.info(f"✅ Версия gevent: {gevent.__version__}")
+        import hypercorn
+        logger.info(f"✅ Версия Hypercorn: {hypercorn.__version__}")
     except ImportError:
-        logger.critical("❌ gevent не установлен - требуется для асинхронной работы")
+        logger.critical("❌ hypercorn не установлен - требуется для асинхронной работы")
         return False
     
     return True
@@ -123,7 +122,6 @@ def check_dependencies():
 # Вызываем проверку зависимостей
 if not check_dependencies():
     logger.critical("❌ Критические зависимости не удовлетворены.")
-    # Не завершаем приложение, чтобы можно было отобразить ошибку на сайте
 
 # ======================
 # ИМПОРТЫ ПОСЛЕ ПРОВЕРКИ ЗАВИСИМОСТЕЙ
@@ -337,25 +335,30 @@ def get_webhook_url():
 
 def run_async_safely(coro):
     """
-    Безопасный запуск асинхронной корутины
+    Безопасный запуск асинхронной корутины.
+    БЛОКИРУЮЩЕЕ выполнение - ждём завершения для синхронных вебхуков.
     """
-    loop = None
-    with track_execution_time("run_async_safely"):
+    try:
+        # Получаем существующий event loop
         try:
+            loop = asyncio.get_running_loop()
+            # Event loop уже запущен (hypercorn работает)
+            # Для вебхуков создаём новую loop, чтобы не блокировать основной event loop
+            new_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(new_loop)
+            result = new_loop.run_until_complete(coro)
+            new_loop.close()
+            return result
+        except RuntimeError:
+            # Нет запущенного event loop
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            return loop.run_until_complete(coro)
-        except asyncio.TimeoutError:
-            raise
-        except Exception as e:
-            logger.error(f"Ошибка выполнения асинхронной задачи: {e}", exc_info=True)
-            raise
-        finally:
-            if loop and not loop.is_closed():
-                try:
-                    loop.close()
-                except Exception:
-                    pass
+            result = loop.run_until_complete(coro)
+            loop.close()
+            return result
+    except Exception as e:
+        logger.error(f"Ошибка выполнения асинхронной задачи: {e}")
+        raise
 
 def format_uptime(seconds):
     """Форматирование времени работы"""
@@ -772,7 +775,7 @@ def index():
         </div>
         
         <p><strong>Режим:</strong> Webhook-only (без polling)</p>
-        <p><strong>Версия:</strong> 10.0 (стабильная, без pandas)</p>
+        <p><strong>Версия:</strong> 10.1 (стабильная, hypercorn)</p>
         <p><strong>Аптайм:</strong> {uptime_str}</p>
         <p><strong>Время сервера:</strong> {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
         
@@ -831,7 +834,7 @@ def index():
         </div>
         
         <div class="footer">
-            <p>HR Bot Мечел | Версия 10.0 (стабильная) | Работает на Render.com</p>
+            <p>HR Bot Мечел | Версия 10.1 (стабильная) | Работает на Render.com с hypercorn</p>
             <p>Системное время: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
         </div>
     </div>
@@ -847,7 +850,7 @@ def health():
         'service': 'hr-bot-mechel',
         'timestamp': datetime.now().isoformat(),
         'bot_initialized': initialized,
-        'version': '10.0',
+        'version': '10.1',
         'mode': 'webhook-only',
         'requests_total': stats.get('requests_total'),
         'errors_total': stats.get('errors_total'),
@@ -931,7 +934,7 @@ def ping():
     return jsonify({
         'status': 'pong',
         'timestamp': datetime.now().isoformat(),
-        'version': '10.0'
+        'version': '10.1'
     })
 
 @app.route('/setwebhook')
@@ -1030,8 +1033,8 @@ def webhook():
         
         update = Update.de_json(data, application.bot)
         
-        # Обрабатываем обновление
-        async def process_update():
+        # Обрабатываем обновление СИНХРОННО (блокируем до завершения)
+        async def process_update_sync():
             try:
                 await application.process_update(update)
                 stats.increment('successful_responses')
@@ -1040,17 +1043,20 @@ def webhook():
                 logger.error(f"Ошибка обработки обновления {update.update_id}: {e}")
                 stats.increment('errors_total')
         
-        # Запускаем обработку
         try:
-            run_async_safely(process_update())
+            # БЛОКИРУЮЩЕЕ выполнение - ждём завершения обработки
+            run_async_safely(process_update_sync())
+            return jsonify({'status': 'ok'}), 200
+            
         except asyncio.TimeoutError:
             logger.warning(f"⏱️ Таймаут обработки обновления {update.update_id}")
             stats.increment('timeouts_total')
+            return jsonify({'status': 'timeout'}), 202  # 202 Accepted - Telegram не будет повторять
+            
         except Exception as e:
             logger.error(f"Ошибка выполнения асинхронной задачи: {e}")
             stats.increment('errors_total')
-        
-        return jsonify({'status': 'ok'}), 200
+            return jsonify({'status': 'error', 'error': str(e)}), 500
         
     except Exception as e:
         logger.error(f"❌ Ошибка обработки вебхука: {e}", exc_info=True)
@@ -1065,12 +1071,13 @@ def webhook():
 if __name__ == "__main__":
     port = config.get_port() if config else 10000
     logger.info("=" * 60)
-    logger.info(f"🚀 HR Bot Мечел - Версия 10.0 (ФИНАЛЬНАЯ)")
+    logger.info(f"🚀 HR Bot Мечел - Версия 10.1 (ФИНАЛЬНАЯ с hypercorn)")
     logger.info(f"📅 Дата сборки: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info(f"🌐 Webhook URL: {get_webhook_url()}")
     logger.info(f"🔧 Проверка зависимостей: ✅ Пройдена")
     logger.info(f"📋 Проверка файлов конфигурации: ✅ Пройдена")
     logger.info(f"🛡️ Rate limiting: 30 запр/мин")
+    logger.info(f"⚡ Сервер: Hypercorn с asyncio worker")
     logger.info(f"📈 Мониторинг ресурсов: {'✅ Включен' if PSUTIL_AVAILABLE else '⚠️ Отключен'}")
     logger.info("=" * 60)
     

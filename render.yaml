@@ -1,64 +1,85 @@
-# Конфигурация Render.com для HR бота Мечел
-# Версия 9.3.5 - ФИНАЛЬНОЕ ИСПРАВЛЕНИЕ СИНТАКСИСА И ВЕРСИИ PYTHON
+# УПРОЩЕННАЯ конфигурация Render.com для HR бота Мечел
+# Версия для бесплатного тарифа (Free)
 
 services:
   - type: web
     name: hr-bot-mechel
     env: python
-    pythonVersion: "3.11.9"
     region: frankfurt
     plan: free
     branch: main
+    pythonVersion: "3.11.9"  # ✅ Явное указание стабильной версии
+    
+    # СБОРКА И ЗАПУСК
     buildCommand: |
-      echo "🔧 Начало сборки. Проверка версии Python:"
+      echo "🔧 Проверка среды сборки..."
       python --version
-      python -c "import sys; print(f'Путь к интерпретатору: {sys.executable}')"
+      pip install --upgrade pip
       pip install -r requirements.txt
-      echo "✅ Все зависимости успешно установлены"
+      echo "✅ Зависимости установлены"
     startCommand: gunicorn --config gunicorn.conf.py bot:app
+    
+    # HEALTH CHECK
     healthCheckPath: /health
     healthCheckTimeout: 30
     healthCheckInterval: 60
+    
+    # АВТОДЕПЛОЙ
     autoDeploy: true
+    
+    # ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
         required: true
         description: "Токен бота от @BotFather"
+      
       - key: PORT
         value: "10000"
         description: "Порт приложения"
+      
       - key: AUTO_SET_WEBHOOK
         value: "true"
         description: "Автоматическая установка вебхука при запуске"
+      
       - key: DELETE_WEBHOOK_ON_EXIT
         value: "false"
-        description: "Удалять вебхук при завершении"
+        description: "Удалять вебхук при завершении (не рекомендуется)"
+      
       - key: DATA_DIR
         value: "data"
         description: "Директория с данными"
+      
       - key: FAQ_FILE
         value: "faq.csv"
         description: "Файл FAQ в формате CSV"
+      
       - key: CONTENT_FILE
         value: "контент.xlsx"
         description: "Файл с дополнительным контентом"
+      
       - key: LOG_LEVEL
         value: "INFO"
         description: "Уровень логирования"
+      
       - key: GUNICORN_LOG_LEVEL
         value: "info"
         description: "Уровень логирования Gunicorn"
+    
+    # ЗАГОЛОВКИ БЕЗОПАСНОСТИ
     headers:
       - path: /*
         name: X-Content-Type-Options
         value: nosniff
+      
       - path: /*
         name: X-Frame-Options
         value: DENY
+      
       - path: /*
         name: X-XSS-Protection
         value: "1; mode=block"
+      
       - path: /*
         name: Strict-Transport-Security
         value: "max-age=31536000; includeSubDomains"

@@ -1,19 +1,17 @@
 # Конфигурация Render.com для HR бота Мечел
-# Версия 9.3.3 - Оптимизировано для Render 2026
+# Версия 9.3.4 - ОПТИМИЗИРОВАНО ДЛЯ PYTHON 3.11 (Финальное исправление)
+# ✅ ИСПРАВЛЕНИЕ: Явное указание версии Python в двух местах (runtime.txt + параметр runtime)
 
 services:
   - type: web
     name: hr-bot-mechel
     env: python
-    region: frankfurt  # Оптимальный регион для RU/Европа
+    runtime: python-3.11.9  # ✅ КЛЮЧЕВОЙ ПАРАМЕТР: Принудительно задает версию Python
+    region: frankfurt
     plan: free
     branch: main
     
-    # ======================
     # СБОРКА И ЗАПУСК
-    # ======================
-    
-    # Команда установки зависимостей
     buildCommand: |
       pip install -r requirements.txt
       echo "✅ Зависимости установлены"
@@ -21,45 +19,24 @@ services:
     # Команда запуска с нашей конфигурацией Gunicorn
     startCommand: gunicorn --config gunicorn.conf.py bot:app
     
-    # ======================
     # HEALTH CHECK
-    # ======================
-    
-    # Путь для проверки здоровья
     healthCheckPath: /health
-    
-    # Таймаут health check (Render по умолчанию 30 сек)
     healthCheckTimeout: 30
-    
-    # Интервал проверки здоровья
     healthCheckInterval: 60
     
-    # ======================
     # АВТОДЕПЛОЙ
-    # ======================
-    
-    # Автоматический деплой при пуше в main
     autoDeploy: true
     
-    # ======================
     # ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
-    # ======================
-    
     envVars:
-      # Токен бота (универсальный адаптер в config.py)
       - key: TELEGRAM_BOT_TOKEN
-        sync: false  # ⚠️ Установите вручную в Dashboard!
+        sync: false
         required: true
         description: "Токен бота от @BotFather"
       
-      # Порт (Render устанавливает автоматически)
       - key: PORT
         value: "10000"
         description: "Порт приложения"
-      
-      # ======================
-      # НАСТРОЙКИ БОТА
-      # ======================
       
       - key: AUTO_SET_WEBHOOK
         value: "true"
@@ -67,7 +44,7 @@ services:
       
       - key: DELETE_WEBHOOK_ON_EXIT
         value: "false"
-        description: "Удалять вебхук при завершении (не рекомендуется для продакшена)"
+        description: "Удалять вебхук при завершении"
       
       - key: DATA_DIR
         value: "data"
@@ -83,87 +60,26 @@ services:
       
       - key: LOG_LEVEL
         value: "INFO"
-        description: "Уровень логирования (DEBUG, INFO, WARNING, ERROR)"
-      
-      # ======================
-      # ОПЦИОНАЛЬНЫЕ НАСТРОЙКИ
-      # ======================
-      
-      # ID администраторов через запятую (опционально)
-      # - key: ADMIN_IDS
-      #   sync: false
-      #   description: "ID администраторов Telegram через запятую"
-      
-      # Кастомный домен (опционально)
-      # - key: RENDER_EXTERNAL_HOSTNAME
-      #   sync: false
-      #   description: "Кастомный домен для вебхука"
-      
-      # ======================
-      # МОНИТОРИНГ И ОПТИМИЗАЦИЯ
-      # ======================
+        description: "Уровень логирования"
       
       - key: GUNICORN_LOG_LEVEL
         value: "info"
         description: "Уровень логирования Gunicorn"
     
-    # ======================
     # ЗАГОЛОВКИ БЕЗОПАСНОСТИ
-    # ======================
-    
     headers:
-      # Безопасность контента
       - path: /*
         name: X-Content-Type-Options
         value: nosniff
       
-      # Защита от кликджекинга
       - path: /*
         name: X-Frame-Options
         value: DENY
       
-      # Защита от XSS
       - path: /*
         name: X-XSS-Protection
         value: "1; mode=block"
       
-      # HSTS (принудительный HTTPS)
       - path: /*
         name: Strict-Transport-Security
         value: "max-age=31536000; includeSubDomains"
-      
-      # CSP (опционально, может ломать некоторые функции)
-      # - path: /*
-      #   name: Content-Security-Policy
-      #   value: "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline';"
-    
-    # ======================
-    # ДОПОЛНИТЕЛЬНЫЕ НАСТРОЙКИ
-    # ======================
-    
-    # Диски для хранения данных (опционально для Free плана)
-    # disk:
-    #   name: data
-    #   mountPath: /opt/render/project/src/data
-    #   sizeGB: 1
-    
-    # Автоматическое масштабирование (только для платных планов)
-    # autoScaling:
-    #   minInstances: 1
-    #   maxInstances: 3
-    #   targetMemoryPercent: 70
-    #   targetCPUPercent: 70
-
-# ======================
-# CRON ЗАДАЧИ (ОПЦИОНАЛЬНО)
-# ======================
-
-# Обновление данных по расписанию (только для платных планов)
-# jobs:
-#   - name: update-faq-data
-#     env: python
-#     region: frankfurt
-#     plan: starter
-#     schedule: "0 2 * * *"  # Каждый день в 2:00 UTC
-#     buildCommand: pip install -r requirements.txt
-#     startCommand: python scripts/update_data.py

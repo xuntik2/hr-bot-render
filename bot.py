@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Telegram-бот для HR-отдела компании "Мечел"
-Версия 12.14 (Render-Ultimate) — полная устойчивость к внешним модулям,
-автоопределение несовместимости, нормализация FAQ.
+Версия 12.15 (Render-Ultimate) — ПОЛНЫЙ класс статистики,
+автоопределение несовместимости внешних модулей, защита от частичной инициализации.
 """
 
 import os
@@ -309,14 +309,9 @@ class ExternalSearchEngineAdapter:
             if self._supports_top_k:
                 result = self._engine.search(query, category, top_k=top_k)
             else:
-                # Пробуем без top_k, затем обрезаем результат
                 result = self._engine.search(query, category)
                 if isinstance(result, list):
                     result = result[:top_k]
-                else:
-                    # Если результат не список, возвращаем как есть
-                    pass
-            # Нормализуем результат к списку кортежей (question, answer, score)
             return self._normalize_result(result)
         except Exception as e:
             logger.error(f"❌ Ошибка во внешнем поисковом движке: {e}. Используйте BuiltinSearchEngine.")
@@ -335,22 +330,18 @@ class ExternalSearchEngineAdapter:
                     score = item.get('score', item.get('Score', 0.0))
                     normalized.append((question, answer, float(score)))
                 elif hasattr(item, 'question') and hasattr(item, 'answer'):
-                    # Объект с атрибутами
                     score = getattr(item, 'score', getattr(item, 'Score', 0.0))
                     normalized.append((item.question, item.answer, float(score)))
         return normalized
 
     @property
     def cache(self):
-        """Для совместимости с веб-интерфейсом."""
         return getattr(self._engine, 'cache', {})
 
     @property
     def faq_data(self):
-        """Для совместимости с веб-интерфейсом."""
         if hasattr(self._engine, 'faq_data'):
             raw = self._engine.faq_data
-            # Нормализуем в список словарей
             normalized = []
             for item in raw:
                 if isinstance(item, dict):
@@ -366,25 +357,195 @@ class ExternalSearchEngineAdapter:
         return []
 
 # ------------------------------------------------------------
-#  ГЛОБАЛЬНЫЙ ПОИСКОВЫЙ ДВИЖОК (ВЫБИРАЕТСЯ АВТОМАТИЧЕСКИ)
-# ------------------------------------------------------------
-SearchEngine = BuiltinSearchEngine  # по умолчанию
-
-# ------------------------------------------------------------
-#  КЛАСС СТАТИСТИКИ (БЕЗ ИЗМЕНЕНИЙ)
+#  ПОЛНЫЙ КЛАСС СТАТИСТИКИ (СО ВСЕМИ МЕТОДАМИ И АТРИБУТАМИ)
 # ------------------------------------------------------------
 class BotStatistics:
-    # ... (полностью идентично версии 12.13, экономии места я не копирую,
-    #      но в финальном коде он должен быть полным. Здесь для краткости опущен,
-    #      в реальном ответе я его вставлю целиком)
-    pass
+    """Промышленный трекер статистики с автоочисткой и всеми метриками."""
+
+    def __init__(self, max_history_days: int = 90):
+        self.start_time = datetime.now()
+        self.user_stats = defaultdict(lambda: {
+            'messages': 0, 'commands': 0, 'searches': 0,
+            'last_active': None, 'first_seen': None, 'feedback_count': 0
+        })
+        self.daily_stats = defaultdict(lambda: {
+            'messages': 0, 'commands': 0, 'searches': 0,
+            'users': set(), 'feedback': 0, 'response_times': []
+        })
+        self.command_stats = defaultdict(int)
+        self.feedback_list = []
+        self.error_log = deque(maxlen=1000)
+        self.response_times = deque(maxlen=100)
+        self.cache = {}
+        self.cache_ttl = {}
+        self.max_history_days = max_history_days
+        self._last_cleanup = datetime.now()
+        self._cleanup_lock = asyncio.Lock()
+
+    async def track_user(self, user_id: int):
+        """Учёт уникального пользователя."""
+        date_key = datetime.now().strftime("%Y-%m-%d")
+        self.daily_stats[date_key]['users'].add(user_id)
+        await self._cleanup_old_data()
+
+    def track_query(self):
+        """Учёт запроса."""
+        date_key = datetime.now().strftime("%Y-%m-%d")
+        self.daily_stats[date_key]['queries'] += 1
+
+    def track_feedback(self):
+        """Учёт обратной связи."""
+        date_key = datetime.now().strftime("%Y-%m-%d")
+        self.daily_stats[date_key]['feedback'] += 1
+
+    def track_response_time(self, response_time: float):
+        """Учёт времени ответа."""
+        self.response_times.append({
+            'timestamp': datetime.now(),
+            'response_time': response_time
+        })
+        date_key = datetime.now().strftime("%Y-%m-%d")
+        self.daily_stats[date_key]['response_times'].append(response_time)
+
+    async def _cleanup_old_data(self):
+        """Асинхронная очистка устаревших данных (раз в час)."""
+        now = datetime.now()
+        if (now - self._last_cleanup).seconds < 3600:
+            return
+
+        async with self._cleanup_lock:
+            cutoff_date = (now - timedelta(days=self.max_history_days)).strftime("%Y-%m-%d")
+            keys_to_delete = [k for k in self.daily_stats.keys() if k < cutoff_date]
+            for k in keys_to_delete:
+                del self.daily_stats[k]
+
+            expired_keys = [k for k, t in self.cache_ttl.items() if now > t]
+            for k in expired_keys:
+                self.cache.pop(k, None)
+                self.cache_ttl.pop(k, None)
+
+            self._last_cleanup = now
+
+    def get_total_users(self) -> int:
+        """Общее количество уникальных пользователей за всю историю."""
+        all_users = set()
+        for day in self.daily_stats.values():
+            all_users.update(day['users'])
+        return len(all_users)
+
+    def get_avg_response_time(self) -> float:
+        """Среднее время ответа (последние 100 запросов)."""
+        if not self.response_times:
+            return 0.0
+        return sum(rt['response_time'] for rt in self.response_times) / len(self.response_times)
+
+    def get_response_time_status(self) -> Tuple[str, str]:
+        """Статус производительности с цветом."""
+        avg = self.get_avg_response_time()
+        if avg < 1.0:
+            return "Хорошо", "green"
+        elif avg < 3.0:
+            return "Нормально", "yellow"
+        else:
+            return "Медленно", "red"
+
+    def log_message(self, user_id: int, username: str, msg_type: str, text: str = ""):
+        """Логирование сообщения (синхронная версия, вызывает очистку в фоне)."""
+        # Запускаем очистку асинхронно, но не ждём её
+        asyncio.create_task(self._cleanup_old_data())
+        now = datetime.now()
+        date_key = now.strftime("%Y-%m-%d")
+
+        if self.user_stats[user_id]['first_seen'] is None:
+            self.user_stats[user_id]['first_seen'] = now
+        self.user_stats[user_id]['last_active'] = now
+
+        if msg_type == 'command':
+            self.user_stats[user_id]['commands'] += 1
+            self.command_stats[text] = self.command_stats.get(text, 0) + 1
+            self.daily_stats[date_key]['commands'] += 1
+        elif msg_type == 'message':
+            self.user_stats[user_id]['messages'] += 1
+            self.daily_stats[date_key]['messages'] += 1
+        elif msg_type == 'search':
+            self.user_stats[user_id]['searches'] += 1
+            self.daily_stats[date_key]['searches'] += 1
+        elif msg_type == 'feedback':
+            self.user_stats[user_id]['feedback_count'] += 1
+            self.daily_stats[date_key]['feedback'] += 1
+            self.feedback_list.append({
+                'user_id': user_id, 'username': username,
+                'text': text, 'timestamp': now
+            })
+
+        self.daily_stats[date_key]['users'].add(user_id)
+
+    def log_error(self, error_type: str, error_msg: str, user_id: int = None):
+        """Логирование ошибок."""
+        self.error_log.append({
+            'timestamp': datetime.now(),
+            'type': error_type,
+            'message': error_msg,
+            'user_id': user_id
+        })
+
+    def get_summary_stats(self) -> Dict[str, Any]:
+        """Полная сводка статистики."""
+        total_users = len(self.user_stats)
+        active_24h = sum(
+            1 for u in self.user_stats.values()
+            if u['last_active'] and (datetime.now() - u['last_active']) < timedelta(hours=24)
+        )
+        days_stats = {}
+        for date in sorted(self.daily_stats.keys(), reverse=True)[:30]:
+            ds = self.daily_stats[date]
+            days_stats[date] = {
+                'messages': ds['messages'],
+                'commands': ds['commands'],
+                'searches': ds['searches'],
+                'users': len(ds['users']),
+                'feedback': ds['feedback'],
+                'avg_response_time': sum(ds['response_times']) / len(ds['response_times']) if ds['response_times'] else 0
+            }
+        avg_resp = self.get_avg_response_time()
+        status, color = self.get_response_time_status()
+        return {
+            'uptime': str(datetime.now() - self.start_time),
+            'start_time': self.start_time.strftime("%Y-%m-%d %H:%M:%S"),
+            'total_users': total_users,
+            'active_users_24h': active_24h,
+            'total_messages': sum(u['messages'] for u in self.user_stats.values()),
+            'total_commands': sum(u['commands'] for u in self.user_stats.values()),
+            'total_searches': sum(u['searches'] for u in self.user_stats.values()),
+            'total_feedback': len(self.feedback_list),
+            'avg_response_time': avg_resp,
+            'response_time_status': status,
+            'response_time_color': color,
+            'daily_stats': days_stats,
+            'top_commands': dict(sorted(self.command_stats.items(), key=lambda x: x[1], reverse=True)[:10]),
+            'cache_size': len(self.cache),
+            'error_count': len(self.error_log)
+        }
 
 # ------------------------------------------------------------
 #  ДЕКОРАТОР ИЗМЕРЕНИЯ ВРЕМЕНИ
 # ------------------------------------------------------------
 def measure_response_time(func):
-    # ... (без изменений)
-    pass
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        start = time.time()
+        try:
+            result = await func(*args, **kwargs)
+            resp_time = time.time() - start
+            if bot_stats:
+                bot_stats.track_response_time(resp_time)
+            return result
+        except Exception as e:
+            resp_time = time.time() - start
+            if bot_stats:
+                bot_stats.track_response_time(resp_time)
+            raise e
+    return wrapper
 
 # ------------------------------------------------------------
 #  ГЛОБАЛЬНЫЕ ОБЪЕКТЫ
@@ -400,22 +561,19 @@ async def post_init(application: Application):
     logger.info("✅ Приложение Telegram полностью готово и запущено")
 
 # ------------------------------------------------------------
-#  ИНИЦИАЛИЗАЦИЯ БОТА (С АВТОВЫБОРОМ ДВИЖКА)
+#  ИНИЦИАЛИЗАЦИЯ БОТА (С АВТОВЫБОРОМ ДВИЖКА И ЗАЩИТОЙ)
 # ------------------------------------------------------------
 async def init_bot():
     global application, search_engine, bot_stats
-    logger.info("🚀 Инициализация бота версии 12.14...")
+    logger.info("🚀 Инициализация бота версии 12.15...")
 
     try:
         # 1. ИНИЦИАЛИЗАЦИЯ ПОИСКОВОГО ДВИЖКА С АВТОВЫБОРОМ
         use_builtin = False
         try:
-            # Пытаемся импортировать улучшенный внешний движок
             from search_engine import EnhancedSearchEngine
             ext_engine = EnhancedSearchEngine(max_cache_size=1000)
-            # Проверяем, подходит ли он
             search_engine = ExternalSearchEngineAdapter(ext_engine)
-            # Делаем тестовый поиск
             test_result = search_engine.search("тест", top_k=1)
             if test_result is not None:
                 logger.info("✅ Загружен EnhancedSearchEngine из search_engine.py (адаптирован)")
@@ -490,10 +648,13 @@ async def init_bot():
 
     except Exception as e:
         logger.critical(f"❌ Ошибка инициализации бота: {e}", exc_info=True)
+        # Сбрасываем application, чтобы webhook не пытался обрабатывать запросы
+        global application
+        application = None
         return False
 
 # ------------------------------------------------------------
-#  ОБРАБОТЧИКИ КОМАНД (С ЗАЩИТОЙ ОТ НЕСОВМЕСТИМОСТИ)
+#  ОБРАБОТЧИКИ КОМАНД
 # ------------------------------------------------------------
 @measure_response_time
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -534,7 +695,6 @@ async def categories_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("⚠️ Категории временно недоступны (поисковый движок не загружен).")
         return
 
-    # БЕЗОПАСНОЕ ПОЛУЧЕНИЕ КАТЕГОРИЙ ИЗ FAQ (РАБОТАЕТ С ЛЮБЫМ ТИПОМ ДАННЫХ)
     categories = {}
     for item in search_engine.faq_data:
         if isinstance(item, dict):
@@ -618,10 +778,12 @@ async def export_to_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Ошибка: {str(e)}")
 
 async def generate_excel_report() -> io.BytesIO:
+    """Генерация Excel-отчёта (полностью защищена от None)."""
     output = io.BytesIO()
     wb = Workbook()
     stats = bot_stats.get_summary_stats() if bot_stats else {}
 
+    # Лист 1: Общая статистика
     ws1 = wb.active
     ws1.title = "Общая статистика"
     ws1['A1'] = "Статистика HR-бота Мечел"
@@ -647,6 +809,7 @@ async def generate_excel_report() -> io.BytesIO:
     for i, (k, v) in enumerate(rows, 4):
         ws1[f'A{i}'] = k; ws1[f'B{i}'] = v
 
+    # Лист 2: Время ответа
     ws2 = wb.create_sheet("Время ответа")
     ws2['A1'] = "История времени ответа"
     ws2['A1'].font = Font(bold=True, size=14)
@@ -660,6 +823,7 @@ async def generate_excel_report() -> io.BytesIO:
             t = rt['response_time']
             ws2[f'C{i}'] = "Хорошо" if t < 1 else "Нормально" if t < 3 else "Медленно"
 
+    # Лист 3: FAQ База
     ws3 = wb.create_sheet("FAQ База")
     ws3['A1'] = "База знаний FAQ"
     ws3['A1'].font = Font(bold=True, size=14)
@@ -667,7 +831,7 @@ async def generate_excel_report() -> io.BytesIO:
     headers = ["Категория", "Вопрос", "Ответ", "Ключевые слова"]
     for col, h in enumerate(headers, 1):
         cell = ws3.cell(row=3, column=col); cell.value = h; cell.font = Font(bold=True)
-    if search_engine and hasattr(search_engine, 'faq_data'):
+    if search_engine:
         for i, item in enumerate(search_engine.faq_data, 4):
             if isinstance(item, dict):
                 cat = item.get('category', 'Без категории')
@@ -686,6 +850,7 @@ async def generate_excel_report() -> io.BytesIO:
     else:
         ws3.cell(row=4, column=1, value="Поисковый движок недоступен")
 
+    # Лист 4: Пользователи
     ws4 = wb.create_sheet("Пользователи")
     ws4['A1'] = "Статистика пользователей"
     ws4['A1'].font = Font(bold=True, size=14)
@@ -704,6 +869,7 @@ async def generate_excel_report() -> io.BytesIO:
             last = udata['last_active']
             ws4.cell(row=i, column=7, value=last.strftime("%Y-%m-%d %H:%M:%S") if last else '')
 
+    # Автоширина колонок
     for ws in [ws1, ws2, ws3, ws4]:
         for col in ws.columns:
             max_len = 0
@@ -752,7 +918,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if ':' in text:
         parts = text.split(':', 1)
         cat_candidate = parts[0].strip().lower()
-        # Безопасное получение категорий
         for item in search_engine.faq_data:
             if isinstance(item, dict):
                 cat = item.get('category')
@@ -766,12 +931,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         results = search_engine.search(text, category, top_k=3)
     except TypeError:
-        # Если внешний движок не принимает top_k, пробуем без него
+        # Внешний движок не поддерживает top_k
         logger.warning("⚠️ Внешний поисковый движок не поддерживает top_k, пробуем без параметра")
-        results = search_engine.search(text, category)
-        if isinstance(results, list):
-            results = results[:3]
-        else:
+        try:
+            results = search_engine.search(text, category)
+            if isinstance(results, list):
+                results = results[:3]
+            else:
+                results = []
+        except Exception as e:
+            logger.error(f"❌ Ошибка поиска: {e}", exc_info=True)
             results = []
     except Exception as e:
         logger.error(f"❌ Ошибка поиска: {e}", exc_info=True)
@@ -873,16 +1042,228 @@ async def set_webhook_manual():
 
 @app.route('/')
 async def index():
-    # ... (полный код index, как в версии 12.13, опущен для краткости)
-    # Он полностью идентичен предыдущей версии
-    pass
+    start_time = time.time()
+    s = bot_stats.get_summary_stats() if bot_stats else {}
+    avg = s.get('avg_response_time', 0)
+    if avg < 1:
+        perf_color = "metric-good"; perf_text = "Хорошо"
+    elif avg < 3:
+        perf_color = "metric-warning"; perf_text = "Нормально"
+    else:
+        perf_color = "metric-bad"; perf_text = "Медленно"
+
+    bot_status = "🟢 Online" if application else "🔴 Offline"
+    bot_status_class = "online" if application else "offline"
+
+    total_users = s.get('total_users', 0)
+    today_key = datetime.now().strftime('%Y-%m-%d')
+    active_today = len(bot_stats.daily_stats.get(today_key, {}).get('users', [])) if bot_stats else 0
+    total_searches = s.get('total_searches', 0)
+    cache_size = len(search_engine.cache) if search_engine else 0
+    admin_count = len(ADMIN_IDS)
+    memory_usage = psutil.Process().memory_info().rss / 1024 / 1024
+    start_time_str = bot_stats.start_time.strftime('%d.%m.%Y %H:%M') if bot_stats else 'N/A'
+
+    html = f"""
+    <!DOCTYPE html>
+    <html lang="ru">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>HR Бот Мечел — Метрики</title>
+        <style>
+            :root {{
+                --bg-dark: #0B1C2F;
+                --bg-card: #152A3A;
+                --accent: #3E7B91;
+                --good: #4CAF50;
+                --warning: #FF9800;
+                --bad: #F44336;
+                --text-light: #E0E7F0;
+            }}
+            body {{
+                font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+                background: var(--bg-dark);
+                color: var(--text-light);
+                margin: 0;
+                padding: 2rem;
+                line-height: 1.6;
+            }}
+            .container {{
+                max-width: 1200px;
+                margin: 0 auto;
+            }}
+            h1 {{
+                font-weight: 600;
+                font-size: 2.2rem;
+                margin-bottom: 0.5rem;
+                color: white;
+            }}
+            .subtitle {{
+                color: #A0C0D0;
+                margin-bottom: 2rem;
+                font-size: 1.1rem;
+            }}
+            .grid {{
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+                gap: 1.5rem;
+                margin-bottom: 2rem;
+            }}
+            .card {{
+                background: var(--bg-card);
+                border-radius: 16px;
+                padding: 1.5rem;
+                box-shadow: 0 8px 24px rgba(0,0,0,0.3);
+                border: 1px solid #2A4C5E;
+            }}
+            .stat-value {{
+                font-size: 2.8rem;
+                font-weight: 700;
+                color: white;
+                line-height: 1.2;
+                margin-bottom: 0.5rem;
+            }}
+            .metric-badge {{
+                display: inline-block;
+                padding: 0.25rem 0.75rem;
+                border-radius: 20px;
+                font-size: 0.85rem;
+                font-weight: 600;
+                margin-left: 0.5rem;
+            }}
+            .metric-good {{ background: var(--good); color: white; }}
+            .metric-warning {{ background: var(--warning); color: black; }}
+            .metric-bad {{ background: var(--bad); color: white; }}
+            .status-online {{ color: var(--good); font-weight: 600; }}
+            .status-offline {{ color: var(--bad); font-weight: 600; }}
+            .btn {{
+                background: var(--accent);
+                color: white;
+                border: none;
+                padding: 0.8rem 1.8rem;
+                border-radius: 40px;
+                font-size: 1rem;
+                font-weight: 600;
+                cursor: pointer;
+                transition: 0.2s;
+                text-decoration: none;
+                display: inline-block;
+                margin-top: 1rem;
+            }}
+            .btn:hover {{
+                background: #4F9DB0;
+                transform: translateY(-2px);
+            }}
+            table {{
+                width: 100%;
+                border-collapse: collapse;
+                background: var(--bg-card);
+                border-radius: 12px;
+                overflow: hidden;
+            }}
+            th {{
+                background: #1E3A47;
+                padding: 0.75rem;
+                text-align: left;
+            }}
+            td {{
+                padding: 0.75rem;
+                border-bottom: 1px solid #2A4C5E;
+            }}
+            .footer {{
+                margin-top: 3rem;
+                color: #809AA8;
+                font-size: 0.9rem;
+                text-align: center;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🤖 HR Бот «Мечел»</h1>
+            <div class="subtitle">Версия 12.15 · Render-Ultimate (полный класс статистики)</div>
+
+            <div class="grid">
+                <div class="card">
+                    <h3>⚙️ Производительность</h3>
+                    <div class="stat-value">{avg:.2f}с</div>
+                    <p>Ср. время ответа (100 запросов)
+                        <span class="metric-badge {perf_color}">{perf_text}</span>
+                    </p>
+                    <p>Кэш поиска: {cache_size} записей</p>
+                    <p>Запущен: {start_time_str}</p>
+                </div>
+                <div class="card">
+                    <h3>📊 Аудитория</h3>
+                    <div class="stat-value">{total_users}</div>
+                    <p>Уникальных пользователей (всего)</p>
+                    <p>Активных сегодня: {active_today}</p>
+                    <p>Всего запросов: {total_searches}</p>
+                </div>
+                <div class="card">
+                    <h3>🔌 Система</h3>
+                    <div class="stat-value">
+                        <span class="status-{bot_status_class}">{bot_status}</span>
+                    </div>
+                    <p>Webhook: {'✅ Активен' if WEBHOOK_URL else '⏹ Локальный'}</p>
+                    <p>Администраторы: {admin_count}</p>
+                    <p>Память: {memory_usage:.1f} МБ</p>
+                </div>
+            </div>
+
+            <div style="display: flex; gap: 1rem; margin-bottom: 2rem;">
+                <a href="/export/excel" class="btn">📥 Экспорт в Excel</a>
+                <a href="/health" class="btn" style="background: #2E5C4E;">🩺 Health Check</a>
+                <a href="/setwebhook?key={WEBHOOK_SECRET}" class="btn" style="background: #9C27B0;">🔧 Установить webhook</a>
+            </div>
+
+            <h2>📈 Статистика за последние 7 дней</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Дата</th>
+                        <th>Пользователи</th>
+                        <th>Сообщения</th>
+                        <th>Команды</th>
+                        <th>Поиски</th>
+                        <th>Время ответа</th>
+                    </tr>
+                </thead>
+                <tbody>
+    """
+    if bot_stats:
+        for date, ds in sorted(bot_stats.daily_stats.items(), reverse=True)[:7]:
+            avg_resp = sum(ds['response_times']) / len(ds['response_times']) if ds['response_times'] else 0
+            html += f"""
+                    <tr>
+                        <td>{date}</td>
+                        <td>{len(ds['users'])}</td>
+                        <td>{ds['messages']}</td>
+                        <td>{ds['commands']}</td>
+                        <td>{ds['searches']}</td>
+                        <td>{avg_resp:.2f}с</td>
+                    </tr>
+            """
+    html += f"""
+                </tbody>
+            </table>
+            <div class="footer">
+                Время генерации: {(time.time() - start_time)*1000:.1f} мс · 
+                {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    return html
 
 @app.route('/health')
 async def health_check():
     return jsonify({
         'status': 'ok',
         'bot': 'running' if application else 'stopped',
-        'users': len(bot_stats.user_stats) if bot_stats else 0,
+        'users': bot_stats.get_total_users() if bot_stats else 0,
         'uptime': str(datetime.now() - bot_stats.start_time) if bot_stats else 'N/A',
         'avg_response': bot_stats.get_avg_response_time() if bot_stats else 0,
         'cache_size': len(search_engine.cache) if search_engine else 0,
@@ -910,6 +1291,7 @@ async def webhook():
     if request.headers.get('X-Telegram-Bot-Api-Secret-Token') != WEBHOOK_SECRET:
         return 'Forbidden', 403
     if not application:
+        logger.error("❌ Webhook: бот не инициализирован")
         return jsonify({'error': 'Bot not initialized'}), 503
     try:
         data = await request.get_json()

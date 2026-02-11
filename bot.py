@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Telegram-бот для HR-отдела компании "Мечел"
-Версия 12.16 (Render-Ultimate) — исправлен синтаксис global,
-полный класс статистики, адаптер для внешних модулей.
+Версия 12.18 (Render-Ultimate) — Quart ≥0.20.0, оптимизированный адаптер,
+полная проверка статистики, корректный экспорт.
 """
 
 import os
@@ -15,6 +15,7 @@ import functools
 import hashlib
 import re
 import io
+import inspect
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Tuple, Union
 from collections import defaultdict, deque
@@ -170,11 +171,7 @@ class BuiltinSearchEngine:
         }
         logger.info(f"✅ Загружено {len(self.faq_data)} вопросов во встроенный поиск")
 
-    # --------------------------------------------------------
-    #  НОРМАЛИЗАЦИЯ FAQ (ЕДИНЫЙ ФОРМАТ СЛОВАРЕЙ)
-    # --------------------------------------------------------
     def _normalize_faq_item(self, item: Any) -> Dict[str, Any]:
-        """Преобразует элемент FAQ в словарь независимо от исходного типа."""
         if isinstance(item, dict):
             return {
                 'question': item.get('question', ''),
@@ -182,7 +179,6 @@ class BuiltinSearchEngine:
                 'category': item.get('category', 'Без категории'),
                 'keywords': item.get('keywords', [])
             }
-        # Предполагаем, что это объект с атрибутами
         return {
             'question': getattr(item, 'question', ''),
             'answer': getattr(item, 'answer', ''),
@@ -191,7 +187,6 @@ class BuiltinSearchEngine:
         }
 
     def _load_faq_data(self) -> List[Dict[str, Any]]:
-        """Загружает FAQ, нормализуя к единому формату словарей."""
         data = []
         try:
             from faq_data import get_faq_data
@@ -256,7 +251,6 @@ class BuiltinSearchEngine:
         return len(common) / len(q_words)
 
     def search(self, query: str, category: Optional[str] = None, top_k: int = 5) -> List[Tuple[str, str, float]]:
-        """Основной метод поиска с поддержкой top_k."""
         cache_key = f"{query}_{category}_{top_k}"
         if cache_key in self.cache and datetime.now() < self.cache_ttl.get(cache_key, datetime.now()):
             return self.cache[cache_key]
@@ -287,38 +281,45 @@ class BuiltinSearchEngine:
         return top
 
 # ------------------------------------------------------------
-#  АДАПТЕР ДЛЯ ВНЕШНЕГО SEARCH ENGINE
+#  ОПТИМИЗИРОВАННЫЙ АДАПТЕР ВНЕШНЕГО ПОИСКА
 # ------------------------------------------------------------
 class ExternalSearchEngineAdapter:
-    """Адаптирует внешний SearchEngine к нашему интерфейсу."""
+    """Адаптирует внешний SearchEngine к нашему интерфейсу.
+       Однократно анализирует сигнатуру и использует предвычисленный флаг.
+    """
     def __init__(self, external_engine):
         self._engine = external_engine
-        # Пытаемся определить, поддерживает ли внешний движок top_k
-        self._supports_top_k = self._check_top_k_support()
-        logger.info(f"🔧 Внешний поисковый движок {'' if self._supports_top_k else 'НЕ '}поддерживает top_k")
+        self._search_method = getattr(external_engine, 'search', None)
+        if not self._search_method:
+            raise AttributeError("Внешний движок не имеет метода search")
 
-    def _check_top_k_support(self) -> bool:
-        """Проверяет, принимает ли внешний метод search параметр top_k."""
-        import inspect
-        sig = inspect.signature(self._engine.search)
-        return 'top_k' in sig.parameters
+        # Анализ сигнатуры один раз
+        sig = inspect.signature(self._search_method)
+        self._param_count = len(sig.parameters) - 1  # исключаем self
+        self._supports_top_k = 'top_k' in sig.parameters
+
+        logger.info(f"🔧 Внешний поисковый движок: параметров search = {self._param_count}, "
+                    f"поддержка top_k = {self._supports_top_k}")
 
     def search(self, query: str, category: Optional[str] = None, top_k: int = 5) -> List[Tuple[str, str, float]]:
-        """Унифицированный метод поиска."""
+        """Единый метод поиска без избыточных try/except."""
         try:
             if self._supports_top_k:
-                result = self._engine.search(query, category, top_k=top_k)
+                result = self._search_method(query, category, top_k=top_k)
             else:
-                result = self._engine.search(query, category)
+                # Вызов с 1 или 2 параметрами в зависимости от реальной сигнатуры
+                if self._param_count == 1:
+                    result = self._search_method(query)
+                else:  # 2 параметра (query, category) — наиболее частый случай
+                    result = self._search_method(query, category)
                 if isinstance(result, list):
                     result = result[:top_k]
             return self._normalize_result(result)
         except Exception as e:
-            logger.error(f"❌ Ошибка во внешнем поисковом движке: {e}. Используйте BuiltinSearchEngine.")
+            logger.error(f"❌ Ошибка во внешнем поисковом движке: {e}")
             return []
 
     def _normalize_result(self, result: Any) -> List[Tuple[str, str, float]]:
-        """Приводит результат поиска к единому формату."""
         normalized = []
         if isinstance(result, list):
             for item in result:
@@ -357,11 +358,9 @@ class ExternalSearchEngineAdapter:
         return []
 
 # ------------------------------------------------------------
-#  ПОЛНЫЙ КЛАСС СТАТИСТИКИ (СО ВСЕМИ МЕТОДАМИ И АТРИБУТАМИ)
+#  ПОЛНЫЙ КЛАСС СТАТИСТИКИ
 # ------------------------------------------------------------
 class BotStatistics:
-    """Промышленный трекер статистики с автоочисткой и всеми метриками."""
-
     def __init__(self, max_history_days: int = 90):
         self.start_time = datetime.now()
         self.user_stats = defaultdict(lambda: {
@@ -383,23 +382,19 @@ class BotStatistics:
         self._cleanup_lock = asyncio.Lock()
 
     async def track_user(self, user_id: int):
-        """Учёт уникального пользователя."""
         date_key = datetime.now().strftime("%Y-%m-%d")
         self.daily_stats[date_key]['users'].add(user_id)
         await self._cleanup_old_data()
 
     def track_query(self):
-        """Учёт запроса."""
         date_key = datetime.now().strftime("%Y-%m-%d")
         self.daily_stats[date_key]['queries'] += 1
 
     def track_feedback(self):
-        """Учёт обратной связи."""
         date_key = datetime.now().strftime("%Y-%m-%d")
         self.daily_stats[date_key]['feedback'] += 1
 
     def track_response_time(self, response_time: float):
-        """Учёт времени ответа."""
         self.response_times.append({
             'timestamp': datetime.now(),
             'response_time': response_time
@@ -408,39 +403,32 @@ class BotStatistics:
         self.daily_stats[date_key]['response_times'].append(response_time)
 
     async def _cleanup_old_data(self):
-        """Асинхронная очистка устаревших данных (раз в час)."""
         now = datetime.now()
         if (now - self._last_cleanup).seconds < 3600:
             return
-
         async with self._cleanup_lock:
             cutoff_date = (now - timedelta(days=self.max_history_days)).strftime("%Y-%m-%d")
             keys_to_delete = [k for k in self.daily_stats.keys() if k < cutoff_date]
             for k in keys_to_delete:
                 del self.daily_stats[k]
-
             expired_keys = [k for k, t in self.cache_ttl.items() if now > t]
             for k in expired_keys:
                 self.cache.pop(k, None)
                 self.cache_ttl.pop(k, None)
-
             self._last_cleanup = now
 
     def get_total_users(self) -> int:
-        """Общее количество уникальных пользователей за всю историю."""
         all_users = set()
         for day in self.daily_stats.values():
             all_users.update(day['users'])
         return len(all_users)
 
     def get_avg_response_time(self) -> float:
-        """Среднее время ответа (последние 100 запросов)."""
         if not self.response_times:
             return 0.0
         return sum(rt['response_time'] for rt in self.response_times) / len(self.response_times)
 
     def get_response_time_status(self) -> Tuple[str, str]:
-        """Статус производительности с цветом."""
         avg = self.get_avg_response_time()
         if avg < 1.0:
             return "Хорошо", "green"
@@ -450,12 +438,9 @@ class BotStatistics:
             return "Медленно", "red"
 
     def log_message(self, user_id: int, username: str, msg_type: str, text: str = ""):
-        """Логирование сообщения (синхронная версия, вызывает очистку в фоне)."""
-        # Запускаем очистку асинхронно, но не ждём её
         asyncio.create_task(self._cleanup_old_data())
         now = datetime.now()
         date_key = now.strftime("%Y-%m-%d")
-
         if self.user_stats[user_id]['first_seen'] is None:
             self.user_stats[user_id]['first_seen'] = now
         self.user_stats[user_id]['last_active'] = now
@@ -481,7 +466,6 @@ class BotStatistics:
         self.daily_stats[date_key]['users'].add(user_id)
 
     def log_error(self, error_type: str, error_msg: str, user_id: int = None):
-        """Логирование ошибок."""
         self.error_log.append({
             'timestamp': datetime.now(),
             'type': error_type,
@@ -490,7 +474,6 @@ class BotStatistics:
         })
 
     def get_summary_stats(self) -> Dict[str, Any]:
-        """Полная сводка статистики."""
         total_users = len(self.user_stats)
         active_24h = sum(
             1 for u in self.user_stats.values()
@@ -561,42 +544,50 @@ async def post_init(application: Application):
     logger.info("✅ Приложение Telegram полностью готово и запущено")
 
 # ------------------------------------------------------------
-#  ИНИЦИАЛИЗАЦИЯ БОТА (С АВТОВЫБОРОМ ДВИЖКА)
+#  ИНИЦИАЛИЗАЦИЯ БОТА (УЛУЧШЕННЫЙ ВЫБОР ДВИЖКА)
 # ------------------------------------------------------------
 async def init_bot():
-    global application, search_engine, bot_stats  # ⬅️ ЕДИНСТВЕННОЕ объявление global
-    logger.info("🚀 Инициализация бота версии 12.16...")
+    global application, search_engine, bot_stats
+    logger.info("🚀 Инициализация бота версии 12.18...")
 
     try:
-        # 1. ИНИЦИАЛИЗАЦИЯ ПОИСКОВОГО ДВИЖКА С АВТОВЫБОРОМ
-        use_builtin = False
-        try:
-            from search_engine import EnhancedSearchEngine
-            ext_engine = EnhancedSearchEngine(max_cache_size=1000)
-            search_engine = ExternalSearchEngineAdapter(ext_engine)
-            test_result = search_engine.search("тест", top_k=1)
-            if test_result is not None:
-                logger.info("✅ Загружен EnhancedSearchEngine из search_engine.py (адаптирован)")
-            else:
-                raise ImportError("Тест не пройден")
-        except (ImportError, Exception) as e:
-            logger.debug(f"EnhancedSearchEngine не подходит: {e}")
+        # 1. ВЫБОР ПОИСКОВОГО ДВИЖКА — ТОЛЬКО ОДИН РАБОЧИЙ
+        engine_initialized = False
+
+        # Попытка 1: EnhancedSearchEngine
+        if not engine_initialized:
+            try:
+                from search_engine import EnhancedSearchEngine
+                ext = EnhancedSearchEngine(max_cache_size=1000)
+                adapter = ExternalSearchEngineAdapter(ext)
+                # Тестовый поиск
+                test = adapter.search("тест", top_k=1)
+                if test is not None:
+                    search_engine = adapter
+                    logger.info("✅ Загружен EnhancedSearchEngine (адаптирован, работает)")
+                    engine_initialized = True
+            except Exception as e:
+                logger.debug(f"EnhancedSearchEngine не подходит: {e}")
+
+        # Попытка 2: Обычный SearchEngine
+        if not engine_initialized:
             try:
                 from search_engine import SearchEngine as ExternalSearchEngine
-                ext_engine = ExternalSearchEngine()
-                search_engine = ExternalSearchEngineAdapter(ext_engine)
-                test_result = search_engine.search("тест", top_k=1)
-                if test_result is not None:
-                    logger.info("✅ Загружен SearchEngine из search_engine.py (адаптирован)")
-                else:
-                    raise ImportError("Тест не пройден")
-            except (ImportError, Exception) as e2:
-                logger.debug(f"Внешний SearchEngine не подходит: {e2}")
-                use_builtin = True
+                ext = ExternalSearchEngine()
+                adapter = ExternalSearchEngineAdapter(ext)
+                test = adapter.search("тест", top_k=1)
+                if test is not None:
+                    search_engine = adapter
+                    logger.info("✅ Загружен SearchEngine из search_engine.py (адаптирован, работает)")
+                    engine_initialized = True
+            except Exception as e:
+                logger.debug(f"Внешний SearchEngine не подходит: {e}")
 
-        if use_builtin:
+        # Попытка 3: Встроенный движок
+        if not engine_initialized:
             search_engine = BuiltinSearchEngine()
             logger.info("✅ Используется встроенный BuiltinSearchEngine")
+            engine_initialized = True
 
         # 2. ИНИЦИАЛИЗАЦИЯ СТАТИСТИКИ
         bot_stats = BotStatistics()
@@ -648,7 +639,6 @@ async def init_bot():
 
     except Exception as e:
         logger.critical(f"❌ Ошибка инициализации бота: {e}", exc_info=True)
-        # ❗ НЕ ПОВТОРЯЕМ global application — оно уже объявлено в начале функции
         application = None
         return False
 
@@ -777,12 +767,10 @@ async def export_to_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Ошибка: {str(e)}")
 
 async def generate_excel_report() -> io.BytesIO:
-    """Генерация Excel-отчёта (полностью защищена от None)."""
     output = io.BytesIO()
     wb = Workbook()
     stats = bot_stats.get_summary_stats() if bot_stats else {}
 
-    # Лист 1: Общая статистика
     ws1 = wb.active
     ws1.title = "Общая статистика"
     ws1['A1'] = "Статистика HR-бота Мечел"
@@ -808,7 +796,6 @@ async def generate_excel_report() -> io.BytesIO:
     for i, (k, v) in enumerate(rows, 4):
         ws1[f'A{i}'] = k; ws1[f'B{i}'] = v
 
-    # Лист 2: Время ответа
     ws2 = wb.create_sheet("Время ответа")
     ws2['A1'] = "История времени ответа"
     ws2['A1'].font = Font(bold=True, size=14)
@@ -822,7 +809,6 @@ async def generate_excel_report() -> io.BytesIO:
             t = rt['response_time']
             ws2[f'C{i}'] = "Хорошо" if t < 1 else "Нормально" if t < 3 else "Медленно"
 
-    # Лист 3: FAQ База
     ws3 = wb.create_sheet("FAQ База")
     ws3['A1'] = "База знаний FAQ"
     ws3['A1'].font = Font(bold=True, size=14)
@@ -830,7 +816,7 @@ async def generate_excel_report() -> io.BytesIO:
     headers = ["Категория", "Вопрос", "Ответ", "Ключевые слова"]
     for col, h in enumerate(headers, 1):
         cell = ws3.cell(row=3, column=col); cell.value = h; cell.font = Font(bold=True)
-    if search_engine:
+    if search_engine and hasattr(search_engine, 'faq_data'):
         for i, item in enumerate(search_engine.faq_data, 4):
             if isinstance(item, dict):
                 cat = item.get('category', 'Без категории')
@@ -849,7 +835,6 @@ async def generate_excel_report() -> io.BytesIO:
     else:
         ws3.cell(row=4, column=1, value="Поисковый движок недоступен")
 
-    # Лист 4: Пользователи
     ws4 = wb.create_sheet("Пользователи")
     ws4['A1'] = "Статистика пользователей"
     ws4['A1'].font = Font(bold=True, size=14)
@@ -868,7 +853,6 @@ async def generate_excel_report() -> io.BytesIO:
             last = udata['last_active']
             ws4.cell(row=i, column=7, value=last.strftime("%Y-%m-%d %H:%M:%S") if last else '')
 
-    # Автоширина колонок
     for ws in [ws1, ws2, ws3, ws4]:
         for col in ws.columns:
             max_len = 0
@@ -927,20 +911,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text = parts[1].strip()
                 break
 
+    # Поиск через адаптер или встроенный движок
     try:
         results = search_engine.search(text, category, top_k=3)
-    except TypeError:
-        # Внешний движок не поддерживает top_k
-        logger.warning("⚠️ Внешний поисковый движок не поддерживает top_k, пробуем без параметра")
-        try:
-            results = search_engine.search(text, category)
-            if isinstance(results, list):
-                results = results[:3]
-            else:
-                results = []
-        except Exception as e:
-            logger.error(f"❌ Ошибка поиска: {e}", exc_info=True)
-            results = []
     except Exception as e:
         logger.error(f"❌ Ошибка поиска: {e}", exc_info=True)
         results = []
@@ -1181,7 +1154,7 @@ async def index():
     <body>
         <div class="container">
             <h1>🤖 HR Бот «Мечел»</h1>
-            <div class="subtitle">Версия 12.16 · Render-Ultimate (исправлен global)</div>
+            <div class="subtitle">Версия 12.18 · Render-Ultimate (Quart ≥0.20.0, оптимизированный адаптер)</div>
 
             <div class="grid">
                 <div class="card">
@@ -1278,7 +1251,7 @@ async def export_excel_web():
         return await send_file(
             excel_file,
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            download_name=f'mechel_bot_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xlsx',
+            download_name=f'mechel_bot_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xlsx',  # ✅ Quart ≥0.20.0
             as_attachment=True
         )
     except Exception as e:

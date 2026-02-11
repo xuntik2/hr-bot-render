@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram-бот для HR-отдела компании "Мечел"
-Версия 12.2 (ультимативная, Render-ready) — промышленный стандарт
+Версия 12.3 (ультимативная, Render-ready) — промышленный стандарт
 """
 
 import os
@@ -22,24 +22,38 @@ from collections import defaultdict, deque
 from urllib.parse import quote_plus
 
 # ------------------------------------------------------------
-#  ПРОВЕРКА КРИТИЧЕСКИХ ЗАВИСИМОСТЕЙ (ДО ВСЕГО)
+#  ПРОВЕРКА КРИТИЧЕСКИХ ЗАВИСИМОСТЕЙ (ИСПРАВЛЕНО!)
 # ------------------------------------------------------------
 def check_critical_dependencies():
-    """Проверка наличия критических зависимостей"""
+    """Проверка наличия критических зависимостей через importlib.metadata"""
+    try:
+        from importlib.metadata import version, PackageNotFoundError
+    except ImportError:
+        # Для очень старых версий Python (на Render не актуально)
+        try:
+            from importlib_metadata import version, PackageNotFoundError
+        except ImportError:
+            print("❌ Не удалось импортировать importlib.metadata", file=sys.stderr)
+            print("Установите importlib-metadata: pip install importlib-metadata", file=sys.stderr)
+            sys.exit(1)
+
     critical_deps = ['quart', 'python-telegram-bot', 'hypercorn']
     missing = []
+
     for dep in critical_deps:
         try:
-            __import__(dep.replace('-', '_'))
-        except ImportError:
+            ver = version(dep)
+            print(f"✅ {dep} версия {ver} установлена")
+        except PackageNotFoundError:
             missing.append(dep)
 
     if missing:
         print(f"❌ Отсутствуют критические зависимости: {', '.join(missing)}", file=sys.stderr)
-        print("Установите их: pip install " + ' '.join(missing), file=sys.stderr)
+        print(f"Установите их: pip install {' '.join(missing)}", file=sys.stderr)
         sys.exit(1)
     print("✅ Все критические зависимости установлены")
 
+# Выполняем проверку немедленно
 check_critical_dependencies()
 
 # ------------------------------------------------------------
@@ -1095,7 +1109,7 @@ async def index():
             </div>
             <div class="footer">
                 <p>Страница сгенерирована за {{ "%.3f"|format(time.time() - page_start) }} сек</p>
-                <p>HR-бот Мечел • Версия 12.2 • {{ now.strftime('%Y-%m-%d %H:%M:%S') }}</p>
+                <p>HR-бот Мечел • Версия 12.3 • {{ now.strftime('%Y-%m-%d %H:%M:%S') }}</p>
             </div>
         </div>
     </body>
@@ -1243,7 +1257,6 @@ async def export_excel_web():
         output.seek(0)
 
         filename = f"mechel_hr_bot_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-        # 🔹 ИСПРАВЛЕНО: attachment_filename -> download_name
         return await send_file(
             output,
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -1262,7 +1275,6 @@ async def webhook():
 
     try:
         data = await request.get_json()
-        # 🔹 ДОБАВЛЕНО: проверка на пустой запрос
         if not data:
             logger.error("Получен пустой запрос вебхука")
             return 'Bad Request', 400
@@ -1303,7 +1315,6 @@ async def init_bot():
     try:
         # 1. Поисковый движок — сначала пробуем внешний, потом локальный
         try:
-            # Попытка импортировать внешний класс из search_engine.py
             from search_engine import SearchEngine as ExternalSearchEngine
             search_engine = ExternalSearchEngine()
             logger.info("✅ Загружен внешний поисковый движок (search_engine.py)")

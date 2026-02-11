@@ -1,4 +1,4 @@
-quart>=0.20.0,<0.21.0
+quart>=0.21.0,<0.22.0   # ✅ новейшая стабильная версия
 python-telegram-bot[job-queue]==21.7
 hypercorn==0.14.4
 pandas==3.0.0

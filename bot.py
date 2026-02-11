@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Telegram-бот для HR-отдела компании "Мечел"
-Версия 12.10 (Render-Ultimate) — гибкое чтение токена, pandas 3.0, без aiofiles.
+Версия 12.12 (Render-Ultimate) — гарантированная инициализация через before_serving,
+подтверждение webhook, ручная установка webhook, полная обратная совместимость.
 """
 
 import os
@@ -88,12 +89,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------
-#  ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ (ГИБКОЕ ЧТЕНИЕ ТОКЕНА)
+#  ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
 # ------------------------------------------------------------
 load_dotenv()
 
 def get_bot_token() -> str:
-    """Возвращает токен бота из TELEGRAM_BOT_TOKEN или BOT_TOKEN."""
     token = os.getenv('TELEGRAM_BOT_TOKEN')
     if token:
         return token
@@ -422,6 +422,84 @@ async def post_init(application: Application):
     logger.info("✅ Приложение Telegram полностью готово и запущено")
 
 # ------------------------------------------------------------
+#  ИНИЦИАЛИЗАЦИЯ БОТА (ВОЗВРАЩАЕТ BOOL, ПОДТВЕРЖДАЕТ WEBHOOK)
+# ------------------------------------------------------------
+async def init_bot():
+    global application, search_engine, bot_stats
+    logger.info("🚀 Инициализация бота версии 12.12...")
+
+    try:
+        # 1. Поисковый движок
+        try:
+            from search_engine import EnhancedSearchEngine
+            search_engine = EnhancedSearchEngine(max_cache_size=1000)
+            logger.info("✅ Загружен EnhancedSearchEngine из search_engine.py")
+        except ImportError:
+            try:
+                from search_engine import SearchEngine as ExternalSearchEngine
+                search_engine = ExternalSearchEngine()
+                logger.info("✅ Загружен SearchEngine из search_engine.py")
+            except ImportError:
+                search_engine = SearchEngine()
+                logger.info("✅ Используется встроенный SearchEngine")
+
+        # 2. Статистика
+        bot_stats = BotStatistics()
+        logger.info("✅ Инициализирован модуль статистики")
+
+        # 3. Приложение Telegram
+        builder = ApplicationBuilder().token(BOT_TOKEN)
+        if RENDER:
+            builder = builder.webhook_url(WEBHOOK_URL).webhook_path(WEBHOOK_PATH)
+        builder = builder.post_init(post_init)
+        application = builder.build()
+
+        # 4. Регистрация обработчиков
+        application.add_handler(CommandHandler("start", start_command))
+        application.add_handler(CommandHandler("help", help_command))
+        application.add_handler(CommandHandler("categories", categories_command))
+        application.add_handler(CommandHandler("feedback", feedback_command))
+        application.add_handler(CommandHandler("stats", stats_command))
+        application.add_handler(CommandHandler("export", export_command))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+        application.add_handler(CallbackQueryHandler(handle_callback_query))
+        application.add_error_handler(error_handler)
+
+        # 5. Инициализация и настройка webhook
+        await application.initialize()
+        if RENDER:
+            webhook_url = WEBHOOK_URL + WEBHOOK_PATH
+            logger.info(f"🔄 Установка webhook на {webhook_url}...")
+            result = await application.bot.set_webhook(
+                url=webhook_url,
+                secret_token=WEBHOOK_SECRET,
+                drop_pending_updates=True,
+                max_connections=40
+            )
+            if result:
+                logger.info(f"✅ Webhook успешно установлен на {webhook_url}")
+                # Подтверждение
+                info = await application.bot.get_webhook_info()
+                if info.url == webhook_url:
+                    logger.info("✅ Webhook подтверждён")
+                else:
+                    logger.error(f"❌ Webhook не совпадает: {info.url}")
+                    return False
+            else:
+                logger.error("❌ Не удалось установить webhook")
+                return False
+        else:
+            await application.bot.delete_webhook(drop_pending_updates=True)
+            logger.info("✅ Режим поллинга (локальная разработка)")
+
+        logger.info("✅ Бот полностью инициализирован и готов к работе")
+        return True
+
+    except Exception as e:
+        logger.critical(f"❌ Ошибка инициализации бота: {e}", exc_info=True)
+        return False
+
+# ------------------------------------------------------------
 #  ОБРАБОТЧИКИ КОМАНД
 # ------------------------------------------------------------
 @measure_response_time
@@ -719,6 +797,68 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ------------------------------------------------------------
 app = Quart(__name__)
 
+# ------------------------------------------------------------
+#  ИНИЦИАЛИЗАЦИЯ ПРИ СТАРТЕ ВЕБ-СЕРВЕРА (КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ!)
+# ------------------------------------------------------------
+@app.before_serving
+async def startup():
+    """Инициализация бота при запуске веб-сервера (вызывается Hypercorn)"""
+    logger.info("🔧 Запуск инициализации бота через before_serving...")
+    success = await init_bot()
+    if success:
+        logger.info("✅ Бот успешно инициализирован через before_serving")
+    else:
+        logger.error("❌ Не удалось инициализировать бота")
+        # На Render не завершаем процесс, чтобы веб-интерфейс оставался доступен
+        # но бот будет в статусе stopped
+
+@app.after_serving
+async def shutdown():
+    """Корректное завершение работы бота"""
+    logger.info("🔴 Остановка бота...")
+    if application:
+        try:
+            await application.stop()
+            await application.shutdown()
+            logger.info("✅ Бот остановлен")
+        except Exception as e:
+            logger.error(f"❌ Ошибка при остановке бота: {e}")
+
+# ------------------------------------------------------------
+#  ДОПОЛНИТЕЛЬНЫЙ ЭНДПОИНТ ДЛЯ РУЧНОЙ УСТАНОВКИ WEBHOOK
+# ------------------------------------------------------------
+@app.route('/setwebhook')
+async def set_webhook_manual():
+    """Ручная установка webhook (защищена секретом)"""
+    key = request.args.get('key')
+    if key != WEBHOOK_SECRET:
+        return jsonify({'error': 'Forbidden'}), 403
+    if not application:
+        return jsonify({'error': 'Bot not initialized'}), 503
+    try:
+        webhook_url = WEBHOOK_URL + WEBHOOK_PATH
+        result = await application.bot.set_webhook(
+            url=webhook_url,
+            secret_token=WEBHOOK_SECRET,
+            drop_pending_updates=True,
+            max_connections=40
+        )
+        if result:
+            info = await application.bot.get_webhook_info()
+            return jsonify({
+                'success': True,
+                'message': 'Вебхук установлен',
+                'url': info.url,
+                'pending_update_count': info.pending_update_count
+            })
+        else:
+            return jsonify({'success': False, 'message': 'Не удалось установить вебхук'}), 500
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ------------------------------------------------------------
+#  ОСНОВНЫЕ МАРШРУТЫ
+# ------------------------------------------------------------
 @app.route('/')
 async def index():
     start_time = time.time()
@@ -861,7 +1001,7 @@ async def index():
     <body>
         <div class="container">
             <h1>🤖 HR Бот «Мечел»</h1>
-            <div class="subtitle">Версия 12.10 · Render-Ultimate (токен-агностик, pandas 3.0)</div>
+            <div class="subtitle">Версия 12.12 · Render-Ultimate (гарантированный запуск)</div>
 
             <div class="grid">
                 <div class="card">
@@ -894,6 +1034,7 @@ async def index():
             <div style="display: flex; gap: 1rem; margin-bottom: 2rem;">
                 <a href="/export/excel" class="btn">📥 Экспорт в Excel</a>
                 <a href="/health" class="btn" style="background: #2E5C4E;">🩺 Health Check</a>
+                <a href="/setwebhook?key={WEBHOOK_SECRET}" class="btn" style="background: #9C27B0;">🔧 Установить webhook</a>
             </div>
 
             <h2>📈 Статистика за последние 7 дней</h2>
@@ -983,73 +1124,17 @@ async def webhook():
         return jsonify({'error': str(e)}), 500
 
 # ------------------------------------------------------------
-#  ИНИЦИАЛИЗАЦИЯ ПРИЛОЖЕНИЯ TELEGRAM
-# ------------------------------------------------------------
-async def init_bot():
-    global application, search_engine, bot_stats
-    logger.info("🚀 Инициализация бота версии 12.10...")
-
-    try:
-        from search_engine import EnhancedSearchEngine
-        search_engine = EnhancedSearchEngine(max_cache_size=1000)
-        logger.info("✅ Загружен EnhancedSearchEngine из search_engine.py")
-    except ImportError:
-        try:
-            from search_engine import SearchEngine as ExternalSearchEngine
-            search_engine = ExternalSearchEngine()
-            logger.info("✅ Загружен SearchEngine из search_engine.py")
-        except ImportError:
-            search_engine = SearchEngine()
-            logger.info("✅ Используется встроенный SearchEngine")
-
-    bot_stats = BotStatistics()
-    logger.info("✅ Инициализирован модуль статистики")
-
-    builder = ApplicationBuilder().token(BOT_TOKEN)
-    if RENDER:
-        builder = builder.webhook_url(WEBHOOK_URL).webhook_path(WEBHOOK_PATH)
-    builder = builder.post_init(post_init)
-    application = builder.build()
-
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("categories", categories_command))
-    application.add_handler(CommandHandler("feedback", feedback_command))
-    application.add_handler(CommandHandler("stats", stats_command))
-    application.add_handler(CommandHandler("export", export_command))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.add_handler(CallbackQueryHandler(handle_callback_query))
-    application.add_error_handler(error_handler)
-
-    await application.initialize()
-    if RENDER:
-        await application.bot.set_webhook(
-            url=WEBHOOK_URL + WEBHOOK_PATH,
-            secret_token=WEBHOOK_SECRET,
-            drop_pending_updates=True,
-            max_connections=40
-        )
-        logger.info(f"✅ Webhook установлен на {WEBHOOK_URL}{WEBHOOK_PATH}")
-    else:
-        await application.bot.delete_webhook(drop_pending_updates=True)
-
-    logger.info("✅ Бот полностью инициализирован и готов к работе")
-    return True
-
-# ------------------------------------------------------------
-#  ЗАПУСК
+#  ТОЧКА ВХОДА ДЛЯ ЛОКАЛЬНОГО ЗАПУСКА
 # ------------------------------------------------------------
 async def main():
+    """Локальный запуск: polling + веб-интерфейс"""
     if not await init_bot():
         logger.critical("Не удалось инициализировать бота")
         sys.exit(1)
 
     if RENDER:
-        config = Config()
-        config.bind = [f"0.0.0.0:{PORT}"]
-        config.worker_class = "asyncio"
-        logger.info(f"🌐 Запуск веб-сервера на порту {PORT}")
-        await serve(app, config)
+        # На Render используется before_serving, этот блок не должен выполняться
+        logger.warning("⚠️ main() вызван на Render — используйте before_serving")
     else:
         logger.info("🔄 Запуск в режиме поллинга")
         polling_task = asyncio.create_task(application.start_polling(allowed_updates=Update.ALL_TYPES))

@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram-бот для HR-отдела компании "Мечел"
-Версия 12.7 (Render-Ultimate) — нефатальные проверки, инициализация в init_bot, защита webhook.
-Исправлены: проверка файлов (только warning), проверка пустого webhook, перенос инициализации.
+Версия 12.10 (Render-Ultimate) — гибкое чтение токена, pandas 3.0, без aiofiles.
 """
 
 import os
@@ -20,7 +19,7 @@ from typing import Dict, List, Optional, Any, Tuple
 from collections import defaultdict, deque
 
 # ------------------------------------------------------------
-#  ПРОВЕРКА КРИТИЧЕСКИХ ЗАВИСИМОСТЕЙ (importlib.metadata)
+#  ПРОВЕРКА КРИТИЧЕСКИХ ЗАВИСИМОСТЕЙ
 # ------------------------------------------------------------
 def check_critical_dependencies():
     try:
@@ -48,7 +47,7 @@ def check_critical_dependencies():
 check_critical_dependencies()
 
 # ------------------------------------------------------------
-#  ИМПОРТЫ (после проверки зависимостей)
+#  ИМПОРТЫ
 # ------------------------------------------------------------
 from quart import Quart, request, jsonify, send_file
 import hypercorn
@@ -74,7 +73,6 @@ from openpyxl.utils import get_column_letter
 from dotenv import load_dotenv
 
 import psutil
-import aiofiles
 
 # ------------------------------------------------------------
 #  КОНФИГУРАЦИЯ ЛОГИРОВАНИЯ
@@ -90,16 +88,27 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------
-#  ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
+#  ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ (ГИБКОЕ ЧТЕНИЕ ТОКЕНА)
 # ------------------------------------------------------------
 load_dotenv()
+
+def get_bot_token() -> str:
+    """Возвращает токен бота из TELEGRAM_BOT_TOKEN или BOT_TOKEN."""
+    token = os.getenv('TELEGRAM_BOT_TOKEN')
+    if token:
+        return token
+    token = os.getenv('BOT_TOKEN')
+    if token:
+        logger.warning("⚠️ Используется устаревшее имя переменной BOT_TOKEN. Рекомендуется переименовать в TELEGRAM_BOT_TOKEN.")
+        return token
+    return ''
 
 def validate_token(token: str) -> bool:
     return bool(token and len(token) > 30 and ':' in token)
 
-BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
+BOT_TOKEN = get_bot_token()
 if not validate_token(BOT_TOKEN):
-    logger.critical("❌ TELEGRAM_BOT_TOKEN не установлен или неверный формат")
+    logger.critical("❌ TELEGRAM_BOT_TOKEN (или BOT_TOKEN) не установлен или неверный формат")
     sys.exit(1)
 
 RENDER = os.getenv('RENDER', 'false').lower() == 'true'
@@ -128,10 +137,9 @@ except Exception as e:
     logger.error(f"❌ Ошибка парсинга ADMIN_IDS: {e}")
 
 # ------------------------------------------------------------
-#  НЕФАТАЛЬНАЯ ПРОВЕРКА ОПЦИОНАЛЬНЫХ ФАЙЛОВ (ДОБАВЛЕНО)
+#  НЕФАТАЛЬНАЯ ПРОВЕРКА ОПЦИОНАЛЬНЫХ ФАЙЛОВ
 # ------------------------------------------------------------
 def check_optional_files():
-    """Проверяет наличие файлов с пользовательскими данными, не завершает программу."""
     optional_files = ['search_engine.py', 'faq_data.py']
     missing = []
     for file in optional_files:
@@ -146,7 +154,7 @@ def check_optional_files():
 check_optional_files()
 
 # ------------------------------------------------------------
-#  ВСТРОЕННЫЙ ПОИСКОВЫЙ ДВИЖОК (полностью автономный)
+#  ВСТРОЕННЫЙ ПОИСКОВЫЙ ДВИЖОК
 # ------------------------------------------------------------
 class SearchEngine:
     def __init__(self, max_cache_size: int = 1000):
@@ -180,7 +188,6 @@ class SearchEngine:
         return ' '.join(norm)
 
     def _load_faq_data(self) -> List[Dict[str, Any]]:
-        # Сначала пытаемся импортировать из внешнего файла
         try:
             from faq_data import get_faq_data
             return get_faq_data()
@@ -249,7 +256,7 @@ class SearchEngine:
         return len(common) / len(q_words)
 
 # ------------------------------------------------------------
-#  КЛАСС СТАТИСТИКИ (С АВТООЧИСТКОЙ)
+#  КЛАСС СТАТИСТИКИ
 # ------------------------------------------------------------
 class BotStatistics:
     def __init__(self, max_history_days: int = 90):
@@ -402,7 +409,7 @@ def measure_response_time(func):
     return wrapper
 
 # ------------------------------------------------------------
-#  ГЛОБАЛЬНЫЕ ОБЪЕКТЫ (ИНИЦИАЛИЗИРУЮТСЯ В init_bot)
+#  ГЛОБАЛЬНЫЕ ОБЪЕКТЫ
 # ------------------------------------------------------------
 application: Optional[Application] = None
 search_engine: Optional[SearchEngine] = None
@@ -412,7 +419,6 @@ bot_stats: Optional[BotStatistics] = None
 #  POST_INIT
 # ------------------------------------------------------------
 async def post_init(application: Application):
-    """Вызывается после полной инициализации приложения Telegram."""
     logger.info("✅ Приложение Telegram полностью готово и запущено")
 
 # ------------------------------------------------------------
@@ -535,12 +541,10 @@ async def export_to_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Ошибка: {str(e)}")
 
 async def generate_excel_report() -> io.BytesIO:
-    """Генерация Excel-отчёта (полностью защищена от None)."""
     output = io.BytesIO()
     wb = Workbook()
     stats = bot_stats.get_summary_stats() if bot_stats else {}
 
-    # Лист 1: Общая статистика
     ws1 = wb.active
     ws1.title = "Общая статистика"
     ws1['A1'] = "Статистика HR-бота Мечел"
@@ -566,7 +570,6 @@ async def generate_excel_report() -> io.BytesIO:
     for i, (k, v) in enumerate(rows, 4):
         ws1[f'A{i}'] = k; ws1[f'B{i}'] = v
 
-    # Лист 2: Время ответа
     ws2 = wb.create_sheet("Время ответа")
     ws2['A1'] = "История времени ответа"
     ws2['A1'].font = Font(bold=True, size=14)
@@ -580,7 +583,6 @@ async def generate_excel_report() -> io.BytesIO:
             t = rt['response_time']
             ws2[f'C{i}'] = "Хорошо" if t < 1 else "Нормально" if t < 3 else "Медленно"
 
-    # Лист 3: FAQ (с защитой)
     ws3 = wb.create_sheet("FAQ База")
     ws3['A1'] = "База знаний FAQ"
     ws3['A1'].font = Font(bold=True, size=14)
@@ -597,7 +599,6 @@ async def generate_excel_report() -> io.BytesIO:
     else:
         ws3.cell(row=4, column=1, value="Поисковый движок недоступен")
 
-    # Лист 4: Пользователи
     ws4 = wb.create_sheet("Пользователи")
     ws4['A1'] = "Статистика пользователей"
     ws4['A1'].font = Font(bold=True, size=14)
@@ -616,7 +617,6 @@ async def generate_excel_report() -> io.BytesIO:
             last = udata['last_active']
             ws4.cell(row=i, column=7, value=last.strftime("%Y-%m-%d %H:%M:%S") if last else '')
 
-    # Автоширина
     for ws in [ws1, ws2, ws3, ws4]:
         for col in ws.columns:
             max_len = 0
@@ -715,7 +715,7 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
 
 # ------------------------------------------------------------
-#  ВЕБ-ИНТЕРФЕЙС (Quart, без Jinja2)
+#  ВЕБ-ИНТЕРФЕЙС (Quart)
 # ------------------------------------------------------------
 app = Quart(__name__)
 
@@ -734,7 +734,6 @@ async def index():
     bot_status = "🟢 Online" if application else "🔴 Offline"
     bot_status_class = "online" if application else "offline"
 
-    # Защищённое получение данных
     total_users = len(bot_stats.user_stats) if bot_stats else 0
     today_key = datetime.now().strftime('%Y-%m-%d')
     active_today = len(bot_stats.daily_stats.get(today_key, {}).get('users', [])) if bot_stats else 0
@@ -862,7 +861,7 @@ async def index():
     <body>
         <div class="container">
             <h1>🤖 HR Бот «Мечел»</h1>
-            <div class="subtitle">Версия 12.7 · Render-Ultimate (проверка файлов + защита webhook)</div>
+            <div class="subtitle">Версия 12.10 · Render-Ultimate (токен-агностик, pandas 3.0)</div>
 
             <div class="grid">
                 <div class="card">
@@ -967,14 +966,12 @@ async def export_excel_web():
 
 @app.route(WEBHOOK_PATH, methods=['POST'])
 async def webhook():
-    # Проверка секретного токена
     if request.headers.get('X-Telegram-Bot-Api-Secret-Token') != WEBHOOK_SECRET:
         return 'Forbidden', 403
     if not application:
         return jsonify({'error': 'Bot not initialized'}), 503
     try:
         data = await request.get_json()
-        # ДОБАВЛЕНО: проверка пустого тела запроса
         if not data:
             logger.error("Получен пустой запрос вебхука")
             return 'Bad Request', 400
@@ -986,15 +983,13 @@ async def webhook():
         return jsonify({'error': str(e)}), 500
 
 # ------------------------------------------------------------
-#  ИНИЦИАЛИЗАЦИЯ ПРИЛОЖЕНИЯ TELEGRAM (ВСЯ ИНИЦИАЛИЗАЦИЯ ЗДЕСЬ)
+#  ИНИЦИАЛИЗАЦИЯ ПРИЛОЖЕНИЯ TELEGRAM
 # ------------------------------------------------------------
 async def init_bot():
     global application, search_engine, bot_stats
-    logger.info("🚀 Инициализация бота версии 12.7...")
+    logger.info("🚀 Инициализация бота версии 12.10...")
 
-    # 1. Инициализация поискового движка
     try:
-        # Пытаемся импортировать внешний поисковик, если есть
         from search_engine import EnhancedSearchEngine
         search_engine = EnhancedSearchEngine(max_cache_size=1000)
         logger.info("✅ Загружен EnhancedSearchEngine из search_engine.py")
@@ -1004,22 +999,18 @@ async def init_bot():
             search_engine = ExternalSearchEngine()
             logger.info("✅ Загружен SearchEngine из search_engine.py")
         except ImportError:
-            search_engine = SearchEngine()  # встроенный
+            search_engine = SearchEngine()
             logger.info("✅ Используется встроенный SearchEngine")
 
-    # 2. Инициализация статистики
     bot_stats = BotStatistics()
     logger.info("✅ Инициализирован модуль статистики")
 
-    # 3. Создание приложения Telegram
     builder = ApplicationBuilder().token(BOT_TOKEN)
     if RENDER:
         builder = builder.webhook_url(WEBHOOK_URL).webhook_path(WEBHOOK_PATH)
-    # Добавляем post_init
     builder = builder.post_init(post_init)
     application = builder.build()
 
-    # 4. Регистрация обработчиков
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("categories", categories_command))
@@ -1030,7 +1021,6 @@ async def init_bot():
     application.add_handler(CallbackQueryHandler(handle_callback_query))
     application.add_error_handler(error_handler)
 
-    # 5. Инициализация и настройка вебхука
     await application.initialize()
     if RENDER:
         await application.bot.set_webhook(

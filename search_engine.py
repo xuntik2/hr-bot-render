@@ -1,7 +1,7 @@
 """
 ПОИСКОВЫЙ ДВИЖОК ДЛЯ HR-БОТА МЕЧЕЛ
-Версия 4.3 - Совместимость с адаптером (question, answer, score), индекс категорий, неточное совпадение
-Полностью исправлена ошибка преобразования float, оптимизирован для Render Free.
+Версия 4.5 — оптимизированный поиск (быстрая предфильтрация + Левенштейн),
+предложения по исправлению запроса.
 """
 
 import logging
@@ -16,31 +16,45 @@ from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
+# ------------------------------------------------------------
+#  ФУНКЦИЯ ЛЕВЕНШТЕЙНА
+# ------------------------------------------------------------
+def levenshtein_distance(s1: str, s2: str) -> int:
+    """Вычисляет расстояние Левенштейна между двумя строками."""
+    if len(s1) < len(s2):
+        return levenshtein_distance(s2, s1)
+    if len(s2) == 0:
+        return len(s1)
+    previous_row = range(len(s2) + 1)
+    for i, c1 in enumerate(s1):
+        current_row = [i + 1]
+        for j, c2 in enumerate(s2):
+            insertions = previous_row[j + 1] + 1
+            deletions = current_row[j] + 1
+            substitutions = previous_row[j] + (c1 != c2)
+            current_row.append(min(insertions, deletions, substitutions))
+        previous_row = current_row
+    return previous_row[-1]
+
 @dataclass
 class FAQEntry:
-    """Запись в базе знаний"""
     id: int
     question: str
     answer: str
-    keywords: str          # строка с ключевыми словами через запятую
-    norm_keywords: str     # нормализованные ключевые слова
-    norm_question: str     # нормализованный вопрос
+    keywords: str
+    norm_keywords: str
+    norm_question: str
     category: str
     usage_count: int = 0
 
 class SearchEngine:
     """
-    Поисковый движок с поддержкой:
-    - загрузки из faq.json (приоритет) или встроенных резервных данных
-    - поиска с учётом категории (неточное совпадение) и top_k
-    - нормализации запроса (стоп-слова, обрезание окончаний, синонимы)
-    - индекса категорий для быстрой фильтрации
-    - LRU-кэша результатов
-    - подробной статистики
-    - возврата кортежей (question, answer, score) для совместимости с адаптером
+    Поисковый движок с оптимизированным нечётким поиском:
+    1. Быстрая предварительная фильтрация (без Левенштейна).
+    2. Только для топ-10 кандидатов — расчёт полной релевантности с Левенштейном.
+    3. Функция предложения исправлений для запросов без результатов.
     """
     
-    # Стоп-слова (не влияют на поиск)
     STOP_WORDS = {
         'как', 'что', 'где', 'когда', 'почему', 'зачем', 'сколько', 'чей',
         'а', 'и', 'но', 'или', 'если', 'то', 'же', 'бы', 'в', 'на', 'с', 'по',
@@ -49,7 +63,6 @@ class SearchEngine:
         'можно', 'нужно', 'надо', 'будет', 'есть', 'быть', 'весь', 'эта', 'эти'
     }
     
-    # Синонимы (расширенный набор)
     SYNONYMS = {
         'зп': 'зарплата',
         'отдых': 'отпуск',
@@ -72,7 +85,6 @@ class SearchEngine:
         self.faq_data: List[FAQEntry] = []
         self._category_index: Dict[str, List[FAQEntry]] = defaultdict(list)
         
-        # Статистика
         self.stats = {
             'total_searches': 0,
             'cache_hits': 0,
@@ -82,21 +94,19 @@ class SearchEngine:
         
         self._load_faq()
         self._build_category_index()
-        logger.info(f"✅ SearchEngine v4.3: загружено {len(self.faq_data)} записей, "
-                   f"источник: {self.stats['loaded_from']}")
+        logger.info(f"✅ SearchEngine v4.5: загружено {len(self.faq_data)} записей, "
+                   f"источник: {self.stats['loaded_from']}, оптимизированный нечёткий поиск")
 
     # ------------------------------------------------------------
-    #  ЗАГРУЗКА ДАННЫХ И ИНДЕКСАЦИЯ
+    #  ЗАГРУЗКА ДАННЫХ
     # ------------------------------------------------------------
     def _load_faq(self):
-        """Загрузка FAQ: JSON -> резервные данные"""
         if self._load_from_json():
             return
         logger.warning("⚠️ Не удалось загрузить faq.json, используются встроенные резервные вопросы")
         self._load_fallback()
 
     def _load_from_json(self) -> bool:
-        """Загрузка из faq.json (ожидается структура, сгенерированная из faq_data.py)"""
         json_path = "faq.json"
         if not os.path.exists(json_path):
             logger.debug(f"Файл {json_path} не найден")
@@ -112,7 +122,6 @@ class SearchEngine:
                 question = item.get('question', '').strip()
                 answer = item.get('answer', '').strip()
                 if not question or not answer:
-                    logger.warning(f"⚠️ Пропущена запись {idx}: пустой вопрос или ответ")
                     continue
                 
                 keywords_raw = item.get('keywords', '')
@@ -144,13 +153,11 @@ class SearchEngine:
             self.stats['loaded_from'] = f'JSON ({loaded_count} записей)'
             logger.info(f"✅ Загружено {loaded_count} записей из {json_path}")
             return True
-            
         except Exception as e:
             logger.error(f"❌ Ошибка загрузки JSON: {e}")
             return False
 
     def _load_fallback(self):
-        """Резервные вопросы (встроенные)"""
         self.faq_data = [
             FAQEntry(
                 id=1,
@@ -172,55 +179,39 @@ class SearchEngine:
             )
         ]
         self.stats['loaded_from'] = 'резервные данные (2 записи)'
-        logger.info("✅ Используются резервные данные (2 записи)")
 
     def _build_category_index(self):
-        """Построение индекса категорий для быстрого поиска"""
         self._category_index.clear()
         for faq in self.faq_data:
             cat_lower = faq.category.lower()
             self._category_index[cat_lower].append(faq)
-        logger.debug(f"📂 Построен индекс категорий: {len(self._category_index)} категорий")
 
     # ------------------------------------------------------------
-    #  НОРМАЛИЗАЦИЯ ТЕКСТА (СТОП-СЛОВА, СТЕММИНГ, СИНОНИМЫ)
+    #  НОРМАЛИЗАЦИЯ ТЕКСТА
     # ------------------------------------------------------------
     def _normalize_text(self, text: str) -> str:
-        """Приведение текста к нормальной форме для сравнения"""
         if not text:
             return ""
         
-        # Нижний регистр
         text = text.lower().strip()
-        
-        # Замена синонимов (целые слова)
         for orig, repl in self.SYNONYMS.items():
             text = re.sub(r'\b' + re.escape(orig) + r'\b', repl, text)
         
-        # Удаление знаков препинания (оставляем буквы, цифры, пробелы)
         text = re.sub(r'[^\w\s]', ' ', text)
-        
-        # Разбиваем на слова
         words = text.split()
-        
-        # Удаляем стоп-слова и слишком короткие слова
         words = [w for w in words if w not in self.STOP_WORDS and len(w) > 2]
         
-        # Обрезаем окончания (очень простой стемминг для русского)
         normalized = []
         for w in words:
-            # Глагольные окончания
             if w.endswith('ться'): w = w[:-4] + 'ть'
             elif w.endswith('тся'): w = w[:-3] + 'ться'
             elif w.endswith('ать') and len(w) > 4: w = w[:-3]
             elif w.endswith('ять') and len(w) > 4: w = w[:-3]
             elif w.endswith('ить') and len(w) > 4: w = w[:-3]
             elif w.endswith('еть') and len(w) > 4: w = w[:-3]
-            # Прилагательные
             elif w.endswith('ый') or w.endswith('ий') or w.endswith('ой'): w = w[:-2]
             elif w.endswith('ая') or w.endswith('яя'): w = w[:-2]
             elif w.endswith('ое') or w.endswith('ее'): w = w[:-2]
-            # Существительные (очень грубо)
             elif w.endswith('ам') or w.endswith('ям'): w = w[:-2]
             elif w.endswith('ами') or w.endswith('ями'): w = w[:-3]
             elif w.endswith('ах') or w.endswith('ях'): w = w[:-2]
@@ -231,38 +222,95 @@ class SearchEngine:
         return ' '.join(normalized)
 
     # ------------------------------------------------------------
-    #  ПОИСК (ОСНОВНОЙ МЕТОД) - версия 4.3
+    #  БЫСТРАЯ ПРЕДВАРИТЕЛЬНАЯ ФИЛЬТРАЦИЯ (БЕЗ ЛЕВЕНШТЕЙНА)
+    # ------------------------------------------------------------
+    def _quick_match(self, norm_query: str, faq: FAQEntry) -> bool:
+        """
+        Быстрая проверка: есть ли хотя бы одно совпадение слов запроса
+        с нормализованным вопросом или ключевыми словами.
+        """
+        if not norm_query:
+            return False
+        q_words = set(norm_query.split())
+        # Проверка пересечения с вопросом
+        if faq.norm_question:
+            q_words_question = set(faq.norm_question.split())
+            if q_words.intersection(q_words_question):
+                return True
+        # Проверка пересечения с ключевыми словами
+        if faq.norm_keywords:
+            q_words_keywords = set(faq.norm_keywords.split())
+            if q_words.intersection(q_words_keywords):
+                return True
+        return False
+
+    # ------------------------------------------------------------
+    #  ПОЛНЫЙ РАСЧЁТ РЕЛЕВАНТНОСТИ (С ЛЕВЕНШТЕЙНОМ)
+    # ------------------------------------------------------------
+    def _calculate_full_score(self, norm_query: str, query_words: set, faq: FAQEntry) -> float:
+        """Полный расчёт релевантности с использованием Левенштейна."""
+        score = 0.0
+
+        # 1. Точное совпадение нормализованного вопроса
+        if norm_query == faq.norm_question:
+            return 100.0
+
+        # 2. Запрос является подстрокой нормализованного вопроса
+        if norm_query in faq.norm_question:
+            score += 50.0
+
+        # 3. Нечёткое сравнение (Левенштейн)
+        if len(norm_query) >= 4 and faq.norm_question:
+            lev_dist = levenshtein_distance(norm_query, faq.norm_question)
+            if lev_dist == 0:
+                return 100.0
+            elif lev_dist <= 2:
+                score += 40.0
+            elif lev_dist <= 4:
+                score += 20.0
+            if faq.norm_keywords:
+                kw_lev = levenshtein_distance(norm_query, faq.norm_keywords[:len(norm_query)+5])
+                if kw_lev <= 2:
+                    score += 30.0
+
+        # 4. Совпадение по словам в вопросе
+        q_words = set(faq.norm_question.split()) if faq.norm_question else set()
+        common_q = query_words.intersection(q_words)
+        score += len(common_q) * 12.0
+
+        # 5. Совпадение по ключевым словам
+        if faq.norm_keywords:
+            kw_words = set(faq.norm_keywords.split())
+            common_kw = query_words.intersection(kw_words)
+            score += len(common_kw) * 20.0
+
+        # 6. Частичное совпадение отдельных слов
+        for word in query_words:
+            if len(word) > 3:
+                if word in faq.norm_question:
+                    score += 3.0
+                if faq.norm_keywords and word in faq.norm_keywords:
+                    score += 5.0
+
+        return score
+
+    # ------------------------------------------------------------
+    #  ОСНОВНОЙ ПОИСК (ОПТИМИЗИРОВАННЫЙ)
     # ------------------------------------------------------------
     def search(self, query: str, category: Optional[str] = None, top_k: int = 5) -> List[Tuple[str, str, float]]:
-        """
-        Поиск по базе знаний.
-        
-        Параметры:
-            query (str): поисковый запрос
-            category (Optional[str]): фильтр по категории (неточное, регистронезависимое совпадение)
-            top_k (int): количество возвращаемых результатов (по умолчанию 5)
-        
-        Возвращает:
-            List[Tuple[str, str, float]]: список кортежей (вопрос, ответ, релевантность)
-                         отсортирован по убыванию релевантности
-        """
-        # Валидация
         if not query or len(query.strip()) < 2:
             return []
         if not self.faq_data:
             logger.warning("⚠️ Поиск при пустой базе знаний")
             return []
         
-        # Нормализуем запрос
         norm_query = self._normalize_text(query)
         if not norm_query:
             return []
         
-        # Ключ кэша
         cache_key = f"{norm_query}_{category}_{top_k}"
         cache_key_hash = hashlib.md5(cache_key.encode()).hexdigest()[:16]
         
-        # Проверяем кэш
         if cache_key_hash in self.cache:
             expiry = self.cache_ttl.get(cache_key_hash)
             if expiry and datetime.now() < expiry:
@@ -274,7 +322,7 @@ class SearchEngine:
         self.stats['total_searches'] += 1
         self.stats['cache_misses'] += 1
         
-        # Фильтрация по категории с неточным совпадением
+        # Фильтрация по категории (неточное совпадение)
         if category:
             cat_lower = category.lower()
             faq_list = self._category_index.get(cat_lower, [])
@@ -290,74 +338,88 @@ class SearchEngine:
         if not faq_list:
             return []
         
-        # Расчёт релевантности
-        results = []
         query_words = set(norm_query.split())
         
+        # --- ЭТАП 1: БЫСТРАЯ ПРЕДВАРИТЕЛЬНАЯ ФИЛЬТРАЦИЯ ---
+        preliminary = []
         for faq in faq_list:
-            score = self._calculate_score(norm_query, query_words, faq)
+            if self._quick_match(norm_query, faq):
+                preliminary.append(faq)
+        
+        # Если предварительных кандидатов нет, используем первые 20 из faq_list
+        if not preliminary:
+            preliminary = faq_list[:20]
+        
+        # --- ЭТАП 2: ПОЛНЫЙ РАСЧЁТ ДЛЯ ТОП-10 КАНДИДАТОВ ---
+        # Сначала наберём базовые очки без Левенштейна (только совпадение слов)
+        candidates_with_score = []
+        for faq in preliminary[:20]:  # лимит 20 для безопасности
+            # быстрая оценка только по словам (без Левенштейна)
+            base_score = 0.0
+            q_words = set(faq.norm_question.split()) if faq.norm_question else set()
+            common_q = query_words.intersection(q_words)
+            base_score += len(common_q) * 12.0
+            if faq.norm_keywords:
+                kw_words = set(faq.norm_keywords.split())
+                common_kw = query_words.intersection(kw_words)
+                base_score += len(common_kw) * 20.0
+            candidates_with_score.append((faq, base_score))
+        
+        # Сортируем по базовой оценке и берём топ-10
+        candidates_with_score.sort(key=lambda x: x[1], reverse=True)
+        top_candidates = [faq for faq, _ in candidates_with_score[:10]]
+        
+        # Теперь вычисляем полную оценку (с Левенштейном) для топ-10
+        results = []
+        for faq in top_candidates:
+            score = self._calculate_full_score(norm_query, query_words, faq)
             if score > 0:
                 results.append((faq.question, faq.answer, min(score, 100.0)))
         
-        # Сортируем по убыванию релевантности
+        # Сортируем по итоговой релевантности
         results.sort(key=lambda x: x[2], reverse=True)
-        
-        # Берём top_k
         top_results = results[:top_k]
         
-        # Сохраняем в кэш (если есть результаты)
+        # Сохраняем в кэш
         if top_results:
             if len(self.cache) >= self.max_cache_size:
                 oldest = next(iter(self.cache))
                 del self.cache[oldest]
                 del self.cache_ttl[oldest]
-            
             self.cache[cache_key_hash] = top_results
             self.cache_ttl[cache_key_hash] = datetime.now() + timedelta(hours=1)
         
         return top_results
 
-    def _calculate_score(self, norm_query: str, query_words: set, faq: FAQEntry) -> float:
+    # ------------------------------------------------------------
+    #  ПРЕДЛОЖЕНИЯ ПО ИСПРАВЛЕНИЮ ЗАПРОСА
+    # ------------------------------------------------------------
+    def suggest_correction(self, query: str, top_k: int = 3) -> List[str]:
         """
-        Вычисление релевантности записи запросу.
-        Возвращает число от 0 до 100.
+        Возвращает список вопросов, наиболее близких к запросу по расстоянию Левенштейна.
+        Используется, когда поиск не дал результатов.
         """
-        score = 0.0
+        if not query or not self.faq_data:
+            return []
         
-        # 1. Точное совпадение нормализованного вопроса
-        if norm_query == faq.norm_question:
-            return 100.0
+        norm_query = self._normalize_text(query)
+        if not norm_query or len(norm_query) < 3:
+            return []
         
-        # 2. Запрос является подстрокой нормализованного вопроса
-        if norm_query in faq.norm_question:
-            score += 50.0
+        candidates = []
+        for faq in self.faq_data[:50]:  # ограничим первыми 50 для производительности
+            if faq.norm_question:
+                dist = levenshtein_distance(norm_query, faq.norm_question)
+                if dist <= 5:  # только достаточно близкие
+                    candidates.append((faq.question, dist))
         
-        # 3. Совпадение по словам в вопросе
-        q_words = set(faq.norm_question.split()) if faq.norm_question else set()
-        common_q = query_words.intersection(q_words)
-        score += len(common_q) * 12.0
-        
-        # 4. Совпадение по ключевым словам
-        if faq.norm_keywords:
-            kw_words = set(faq.norm_keywords.split())
-            common_kw = query_words.intersection(kw_words)
-            score += len(common_kw) * 20.0
-        
-        # 5. Частичное совпадение отдельных слов
-        for word in query_words:
-            if len(word) > 3:
-                if word in faq.norm_question:
-                    score += 3.0
-                if faq.norm_keywords and word in faq.norm_keywords:
-                    score += 5.0
-        
-        return score
+        candidates.sort(key=lambda x: x[1])
+        return [q for q, _ in candidates[:top_k]]
 
     # ------------------------------------------------------------
-    #  УПРАВЛЕНИЕ ДАННЫМИ И СТАТИСТИКА
+    #  УПРАВЛЕНИЕ И СТАТИСТИКА
     # ------------------------------------------------------------
     def refresh_data(self):
-        """Принудительная перезагрузка данных и сброс кэша"""
         self._load_faq()
         self._build_category_index()
         self.cache.clear()
@@ -365,11 +427,9 @@ class SearchEngine:
         logger.info("🔄 Данные перезагружены, кэш сброшен")
 
     def get_stats(self) -> Dict[str, Any]:
-        """Детальная статистика движка"""
         categories = {}
         for faq in self.faq_data:
-            cat = faq.category
-            categories[cat] = categories.get(cat, 0) + 1
+            categories[faq.category] = categories.get(faq.category, 0) + 1
         
         cache_hit_rate = 0.0
         if self.stats['total_searches'] > 0:
@@ -390,7 +450,6 @@ class SearchEngine:
         }
 
     def get_faq_by_id(self, faq_id: int) -> Optional[Dict]:
-        """Получить запись по ID (для детального просмотра)"""
         for faq in self.faq_data:
             if faq.id == faq_id:
                 return {
@@ -402,5 +461,5 @@ class SearchEngine:
                 }
         return None
 
-# Для обратной совместимости с bot.py
+# Для обратной совместимости
 EnhancedSearchEngine = SearchEngine

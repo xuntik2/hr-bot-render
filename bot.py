@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Telegram-бот для HR-отдела компании "Мечел"
-Версия 12.20 (Render-Ultimate) — ПОЛНЫЙ код, все обработчики и методы.
-Идеальный адаптер поиска, универсальный экспорт, Quart 0.21+.
+Версия 12.21 (JSON-версия) — загрузка из faq.json, удалена faq_data.py
+Полный код, адаптирован для Render Free.
 """
 
 import os
@@ -51,7 +51,7 @@ check_critical_dependencies()
 # ------------------------------------------------------------
 #  ИМПОРТЫ
 # ------------------------------------------------------------
-from quart import Quart, request, jsonify, send_file, make_response
+from quart import Quart, request, jsonify, make_response
 import hypercorn
 from hypercorn.config import Config
 from hypercorn.asyncio import serve
@@ -141,7 +141,7 @@ except Exception as e:
 #  НЕФАТАЛЬНАЯ ПРОВЕРКА ОПЦИОНАЛЬНЫХ ФАЙЛОВ
 # ------------------------------------------------------------
 def check_optional_files():
-    optional_files = ['search_engine.py', 'faq_data.py']
+    optional_files = ['search_engine.py']  # faq_data.py удалён
     missing = []
     for file in optional_files:
         if not os.path.exists(file):
@@ -155,7 +155,7 @@ def check_optional_files():
 check_optional_files()
 
 # ------------------------------------------------------------
-#  ВСТРОЕННЫЙ ПОИСКОВЫЙ ДВИЖОК (ЭТАЛОННЫЙ)
+#  ВСТРОЕННЫЙ ПОИСКОВЫЙ ДВИЖОК (ЗАГРУЗКА ИЗ JSON)
 # ------------------------------------------------------------
 class BuiltinSearchEngine:
     def __init__(self, max_cache_size: int = 1000):
@@ -171,43 +171,43 @@ class BuiltinSearchEngine:
         }
         logger.info(f"✅ Загружено {len(self.faq_data)} вопросов во встроенный поиск")
 
-    def _normalize_faq_item(self, item: Any) -> Dict[str, Any]:
-        if isinstance(item, dict):
-            return {
-                'question': item.get('question', ''),
-                'answer': item.get('answer', ''),
-                'category': item.get('category', 'Без категории'),
-                'keywords': item.get('keywords', [])
-            }
-        return {
-            'question': getattr(item, 'question', ''),
-            'answer': getattr(item, 'answer', ''),
-            'category': getattr(item, 'category', 'Без категории'),
-            'keywords': getattr(item, 'keywords', [])
-        }
-
     def _load_faq_data(self) -> List[Dict[str, Any]]:
-        data = []
-        try:
-            from faq_data import get_faq_data
-            raw_data = get_faq_data()
-            for item in raw_data:
-                data.append(self._normalize_faq_item(item))
-            logger.info(f"✅ Загружено {len(data)} вопросов через get_faq_data()")
-            return data
-        except ImportError:
+        """Загрузка FAQ из JSON-файла. Если файл отсутствует — резервные вопросы."""
+        json_path = "faq.json"
+        if os.path.exists(json_path):
             try:
-                from faq_data import FAQ_QUESTIONS
-                raw_data = FAQ_QUESTIONS
-                for item in raw_data:
-                    data.append(self._normalize_faq_item(item))
-                logger.info(f"✅ Загружено {len(data)} вопросов через FAQ_QUESTIONS")
-                return data
-            except ImportError:
-                logger.warning("⚠️ Файл faq_data.py не найден, используются резервные вопросы")
-                return self._get_backup_questions()
+                with open(json_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                normalized = []
+                for item in data:
+                    # Нормализация ключевых слов (из строки в список)
+                    keywords = item.get('keywords', '')
+                    if isinstance(keywords, str):
+                        keywords_list = [kw.strip() for kw in keywords.split(',') if kw.strip()]
+                    elif isinstance(keywords, list):
+                        keywords_list = keywords
+                    else:
+                        keywords_list = []
+                    
+                    normalized.append({
+                        'question': item.get('question', ''),
+                        'answer': item.get('answer', ''),
+                        'category': item.get('category', 'Без категории'),
+                        'keywords': keywords_list
+                    })
+                logger.info(f"✅ Загружено {len(normalized)} вопросов из {json_path}")
+                return normalized
+            except Exception as e:
+                logger.error(f"❌ Ошибка загрузки {json_path}: {e}")
+                # Падаем на резерв
+        else:
+            logger.warning(f"⚠️ Файл {json_path} не найден, используются резервные вопросы")
+        
+        # Резервные вопросы (встроенные)
+        return self._get_backup_questions()
 
     def _get_backup_questions(self) -> List[Dict[str, Any]]:
+        """Резервные вопросы на случай отсутствия faq.json"""
         return [
             {
                 "question": "Как получить справку о заработной плате?",
@@ -570,13 +570,13 @@ async def post_init(application: Application):
 # ------------------------------------------------------------
 async def init_bot():
     global application, search_engine, bot_stats
-    logger.info("🚀 Инициализация бота версии 12.20...")
+    logger.info("🚀 Инициализация бота версии 12.21...")
 
     try:
         # 1. ВЫБОР ПОИСКОВОГО ДВИЖКА — ТОЛЬКО ОДИН РАБОЧИЙ
         engine_initialized = False
 
-        # Попытка 1: EnhancedSearchEngine
+        # Попытка 1: EnhancedSearchEngine (из search_engine.py, если есть)
         if not engine_initialized:
             try:
                 from search_engine import EnhancedSearchEngine
@@ -1180,7 +1180,7 @@ async def index():
     <body>
         <div class="container">
             <h1>🤖 HR Бот «Мечел»</h1>
-            <div class="subtitle">Версия 12.20 · Render-Ultimate (ПОЛНЫЙ КОД, идеальный адаптер)</div>
+            <div class="subtitle">Версия 12.21 · Render-Ultimate (загрузка из faq.json)</div>
 
             <div class="grid">
                 <div class="card">

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram-бот для HR-отдела компании "Мечел"
-Версия 12.35 — ИСПРАВЛЕНИЕ: get_message теперь работает с текстом, а не со словарём.
+Версия 12.36 — исправление broadcast, команда /предложения, веб-страница рассылки
 Полная совместимость с search_engine.py v4.6, оптимизация для Render Free.
 """
 
@@ -592,7 +592,7 @@ messages_lock = asyncio.Lock()
 DEFAULT_MESSAGES = {
     "welcome": {
         "title": "Приветствие",
-        "text": "👋 Привет, {first_name}!\n\nЯ HR-бот компании <b>Мечел</b>. Помогу с кадровыми вопросами.\n\n📌 Просто напишите вопрос — я поищу в базе знаний.\n/help — подсказки\n/categories — категории вопросов\n/feedback — отзыв\n\n💬 Можно также использовать русские команды:\n/старт, /помощь, /категории, /отзыв"
+        "text": "👋 Привет, {first_name}!\n\nЯ HR-бот компании <b>Мечел</b>. Помогу с кадровыми вопросами.\n\n📌 Просто напишите вопрос — я поищу в базе знаний.\n/help — подсказки\n/categories — категории вопросов\n/feedback — отзыв / предложения\n\n💬 Можно также использовать русские команды:\n/старт, /помощь, /категории, /предложения"
     },
     "help": {
         "title": "Помощь",
@@ -600,15 +600,15 @@ DEFAULT_MESSAGES = {
     },
     "no_results": {
         "title": "Ничего не найдено",
-        "text": "😕 Не нашёл ответ. Попробуйте переформулировать, использовать /categories для выбора категории или /feedback."
+        "text": "😕 Не нашёл ответ. Попробуйте переформулировать, использовать /categories для выбора категории или /feedback /предложения."
     },
     "suggestions": {
         "title": "Предложения по исправлению",
-        "text": "😕 Не нашёл точного совпадения для «{query}».\n\nВозможно, вы имели в виду:\n{suggestions}\n\nПопробуйте переформулировать или /feedback."
+        "text": "😕 Не нашёл точного совпадения для «{query}».\n\nВозможно, вы имели в виду:\n{suggestions}\n\nПопробуйте переформулировать или /feedback /предложения."
     },
     "feedback_ack": {
-        "title": "Спасибо за отзыв",
-        "text": "🙏 Спасибо за отзыв!"
+        "title": "Спасибо за отзыв / предложение",
+        "text": "🙏 Спасибо за ваше предложение! Мы обязательно его рассмотрим."
     },
     "greeting_response": {
         "title": "Ответ на приветствие",
@@ -633,17 +633,14 @@ DEFAULT_MESSAGES = {
 }
 
 async def load_messages():
-    """Загружает сообщения из messages.json. Если файла нет, создаёт с дефолтными."""
     try:
         async with messages_lock:
             with open(MESSAGES_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-                # Проверяем, что все ключи дефолтных сообщений присутствуют и имеют правильную структуру
                 for key, default in DEFAULT_MESSAGES.items():
                     if key not in data:
                         data[key] = default
                     else:
-                        # Если запись есть, но нет поля 'text' или 'title', дополняем из дефолта
                         if 'text' not in data[key]:
                             data[key]['text'] = default.get('text', '')
                         if 'title' not in data[key]:
@@ -659,13 +656,11 @@ async def load_messages():
         return DEFAULT_MESSAGES.copy()
 
 async def save_messages(messages: Dict):
-    """Сохраняет сообщения в messages.json."""
     async with messages_lock:
         with open(MESSAGES_FILE, 'w', encoding='utf-8') as f:
             json.dump(messages, f, ensure_ascii=False, indent=2)
 
 async def get_message(key: str, **kwargs) -> str:
-    """Возвращает текст сообщения по ключу с подстановкой параметров."""
     msgs = await load_messages()
     entry = msgs.get(key, DEFAULT_MESSAGES.get(key, {}))
     template = entry.get('text', '')
@@ -673,7 +668,6 @@ async def get_message(key: str, **kwargs) -> str:
         try:
             return template.format(**kwargs)
         except KeyError:
-            # Если в шаблоне нет нужного ключа, возвращаем как есть
             return template
     return template
 
@@ -1030,7 +1024,7 @@ async def post_init(application: Application):
 # ------------------------------------------------------------
 async def init_bot():
     global application, search_engine, bot_stats
-    logger.info("🚀 Инициализация бота версии 12.35...")
+    logger.info("🚀 Инициализация бота версии 12.36...")
 
     try:
         use_builtin = False
@@ -1073,7 +1067,8 @@ async def init_bot():
         application.add_handler(CommandHandler("help", help_command))
         application.add_handler(CommandHandler("categories", categories_command))
         application.add_handler(CommandHandler("faq", categories_command))
-        application.add_handler(CommandHandler("feedback", feedback_command))
+        application.add_handler(CommandHandler("feedback", feedback_command))      # оставляем /feedback
+        application.add_handler(CommandHandler("suggestions", feedback_command)) # добавляем /suggestions
         application.add_handler(CommandHandler("feedbacks", feedbacks_command))
         application.add_handler(CommandHandler("stats", stats_command))
         application.add_handler(CommandHandler("export", export_command))
@@ -1090,9 +1085,9 @@ async def init_bot():
                 await help_command(update, context)
             elif text.startswith('/категории'):
                 await categories_command(update, context)
-            elif text.startswith('/отзыв'):
+            elif text.startswith('/предложения'):      # переименовано с /отзыв
                 await feedback_command(update, context)
-            elif text.startswith('/отзывы'):
+            elif text.startswith('/отзывы'):           # оставляем /отзывы для выгрузки
                 await feedbacks_command(update, context)
             elif text.startswith('/статистика'):
                 await stats_command(update, context)
@@ -1106,7 +1101,7 @@ async def init_bot():
                 await broadcast_command(update, context)
 
         application.add_handler(MessageHandler(
-            filters.Regex(r'^/(старт|помощь|категории|отзыв|отзывы|статистика|экспорт|подписаться|отписаться|рассылка)'),
+            filters.Regex(r'^/(старт|помощь|категории|предложения|отзывы|статистика|экспорт|подписаться|отписаться|рассылка)'),
             russian_command_handler
         ))
 
@@ -1161,7 +1156,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bot_stats.log_message(user.id, user.username or "Unknown", 'subscribe', '')
     text = await get_message('welcome', first_name=user.first_name)
     if user.id in ADMIN_IDS:
-        text += "\n\n👑 Админ-команды:\n/stats [период] — статистика\n/feedbacks — отзывы\n/export — Excel\n/статистика, /отзывы, /экспорт\n/subscribe /unsubscribe — подписка\n/broadcast — рассылка"
+        text += "\n\n👑 Админ-команды:\n/stats [период] — статистика\n/feedbacks — отзывы (выгрузка)\n/export — Excel\n/статистика, /отзывы, /экспорт\n/subscribe /unsubscribe — подписка\n/broadcast — рассылка"
     await _reply_or_edit(update, text, parse_mode='HTML')
 
 @measure_response_time
@@ -1204,7 +1199,8 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _reply_or_edit(update, "⛔ Нет прав.", parse_mode='HTML')
         return
     if not context.args:
-        await _reply_or_edit(update, "ℹ️ Использование: /broadcast <текст сообщения>", parse_mode='HTML')
+        # ИСПРАВЛЕНО: убрали parse_mode='HTML', чтобы не было ошибки парсинга тега <текст>
+        await _reply_or_edit(update, "ℹ️ Использование: /broadcast <текст сообщения>", parse_mode=None)
         return
     message = ' '.join(context.args)
     subscribers = await get_subscribers()
@@ -1264,15 +1260,17 @@ async def categories_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 @measure_response_time
 async def feedback_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик для /feedback, /suggestions, /предложения."""
     user = update.effective_user
     await ensure_subscribed(user.id)
     if bot_stats:
         bot_stats.log_message(user.id, user.username or "Unknown", 'command', '/feedback')
     context.user_data['awaiting_feedback'] = True
-    await _reply_or_edit(update, "💬 Напишите ваш отзыв или предложение.", parse_mode='HTML')
+    await _reply_or_edit(update, "💬 Напишите ваше предложение или пожелание по работе бота.", parse_mode='HTML')
 
 @measure_response_time
 async def feedbacks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выгрузка отзывов/предложений (админка)."""
     user = update.effective_user
     await ensure_subscribed(user.id)
     if user.id not in ADMIN_IDS:
@@ -1288,7 +1286,7 @@ async def feedbacks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_document(
             document=output.getvalue(),
             filename=filename,
-            caption=f"📋 Отзывы от {datetime.now().strftime('%d.%m.%Y %H:%M')}"
+            caption=f"📋 Отзывы и предложения от {datetime.now().strftime('%d.%m.%Y %H:%M')}"
         )
         logger.info(f"✅ Отзывы выгружены пользователем {user.id}")
     except Exception as e:
@@ -1335,7 +1333,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📨 Сообщений: {s['total_messages']}\n"
         f"🛠 Команд: {s['total_commands']}\n"
         f"🔍 Поисков: {s['total_searches']}\n"
-        f"📝 Отзывов: {s['total_feedback']}\n"
+        f"📝 Отзывов/предложений: {s['total_feedback']}\n"
         f"👍 Полезных ответов: {s['total_ratings_helpful']}\n"
         f"👎 Бесполезных: {s['total_ratings_unhelpful']}\n"
         f"⭐ Удовлетворённость: "
@@ -1405,9 +1403,9 @@ def generate_feedback_report() -> io.BytesIO:
     output = io.BytesIO()
     wb = Workbook()
     ws = wb.active
-    ws.title = "Отзывы"
+    ws.title = "Отзывы и предложения"
     
-    headers = ["Дата", "User ID", "Имя пользователя", "Отзыв"]
+    headers = ["Дата", "User ID", "Имя пользователя", "Текст"]
     for col, h in enumerate(headers, 1):
         cell = ws.cell(row=1, column=col)
         cell.value = h
@@ -1440,7 +1438,7 @@ def generate_excel_report() -> io.BytesIO:
     wb = Workbook()
     stats = bot_stats.get_summary_stats() if bot_stats else {}
     rating_stats = bot_stats.get_rating_stats() if bot_stats else {}
-    subscribers = asyncio.run(get_subscribers())  # синхронный контекст, допустимо
+    subscribers = asyncio.run(get_subscribers())
 
     ws1 = wb.active
     ws1.title = "Общая статистика"
@@ -1458,7 +1456,7 @@ def generate_excel_report() -> io.BytesIO:
         ("Всего сообщений", stats.get('total_messages', 0)),
         ("Всего команд", stats.get('total_commands', 0)),
         ("Всего поисков", stats.get('total_searches', 0)),
-        ("Всего отзывов", stats.get('total_feedback', 0)),
+        ("Всего отзывов/предложений", stats.get('total_feedback', 0)),
         ("Всего оценок", rating_stats.get('total_ratings', 0)),
         ("Полезных ответов", rating_stats.get('helpful', 0)),
         ("Бесполезных ответов", rating_stats.get('unhelpful', 0)),
@@ -1607,7 +1605,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if search_engine is None:
         await update.message.reply_text(
-            "⚠️ Поиск временно недоступен. Попробуйте позже или используйте /feedback.",
+            "⚠️ Поиск временно недоступен. Попробуйте позже или используйте /feedback /предложения.",
             parse_mode='HTML'
         )
         return
@@ -2253,6 +2251,117 @@ async def messages_manager():
     return await render_template_string(MESSAGES_MANAGER_HTML)
 
 # ------------------------------------------------------------
+#  СТРАНИЦА РАССЫЛКИ ПОДПИСЧИКАМ (НОВАЯ)
+# ------------------------------------------------------------
+BROADCAST_PAGE_HTML = """<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Рассылка подписчикам — HR Бот Мечел</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background-color: #f5f5f5; }
+        .container { max-width: 800px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        h1 { color: #0B1C2F; }
+        textarea { width: 100%; padding: 8px; margin-bottom: 10px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; font-family: monospace; }
+        button { background: #007BFF; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; font-size: 16px; }
+        button:hover { background: #0056b3; }
+        #result { margin-top: 20px; padding: 15px; border-radius: 4px; }
+        .success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+        .error { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+        .warning { background-color: #fff3cd; border: 1px solid #ffeeba; color: #856404; padding: 12px; border-radius: 4px; margin-bottom: 20px; }
+        .auth-form { background: #e9ecef; padding: 20px; border-radius: 5px; margin-bottom: 20px; }
+        input[type=password] { width: 300px; padding: 8px; margin-bottom: 10px; border: 1px solid #ddd; border-radius: 4px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📨 Рассылка сообщения подписчикам</h1>
+        
+        <div class="warning">
+            ⚠️ Сообщение будет отправлено всем подписчикам. Убедитесь, что вы используете корректный HTML (можно без разметки).
+        </div>
+        
+        <div class="auth-form" id="authSection">
+            <label for="keyInput">Введите секретный ключ (WEBHOOK_SECRET):</label>
+            <input type="password" id="keyInput" placeholder="Секретный ключ">
+            <button onclick="authorize()">Авторизоваться</button>
+            <div id="authError" class="error"></div>
+        </div>
+
+        <div id="content" style="display: none;">
+            <form id="broadcastForm">
+                <label for="message">Сообщение (можно использовать HTML-теги):</label>
+                <textarea id="message" name="message" rows="8" required></textarea>
+                <button type="submit">🚀 Отправить рассылку</button>
+            </form>
+            <div id="result"></div>
+        </div>
+    </div>
+
+    <script>
+        let currentKey = '';
+        const API_BASE = window.location.origin;
+
+        function authorize() {
+            currentKey = document.getElementById('keyInput').value;
+            if (!currentKey) {
+                document.getElementById('authError').innerText = 'Введите ключ';
+                return;
+            }
+            // Проверяем ключ, выполнив запрос к API подписчиков
+            fetch(`${API_BASE}/subscribers/api?key=${encodeURIComponent(currentKey)}`)
+                .then(res => {
+                    if (res.ok) {
+                        document.getElementById('authSection').style.display = 'none';
+                        document.getElementById('content').style.display = 'block';
+                    } else {
+                        document.getElementById('authError').innerText = 'Неверный ключ';
+                    }
+                })
+                .catch(() => {
+                    document.getElementById('authError').innerText = 'Ошибка соединения';
+                });
+        }
+
+        const form = document.getElementById('broadcastForm');
+        if (form) {
+            form.onsubmit = async (e) => {
+                e.preventDefault();
+                const message = document.getElementById('message').value;
+                const resultDiv = document.getElementById('result');
+                resultDiv.innerHTML = '⏳ Отправка...';
+                resultDiv.className = '';
+
+                try {
+                    const res = await fetch(`${API_BASE}/broadcast/api?key=${encodeURIComponent(currentKey)}`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ message })
+                    });
+                    const data = await res.json();
+                    if (res.ok) {
+                        resultDiv.innerHTML = `✅ Рассылка завершена.<br>📨 Отправлено: ${data.sent}<br>❌ Ошибок: ${data.failed}`;
+                        resultDiv.className = 'success';
+                    } else {
+                        resultDiv.innerHTML = `❌ Ошибка: ${data.error || 'Неизвестная ошибка'}`;
+                        resultDiv.className = 'error';
+                    }
+                } catch (err) {
+                    resultDiv.innerHTML = `❌ Ошибка сети: ${err.message}`;
+                    resultDiv.className = 'error';
+                }
+            };
+        }
+    </script>
+</body>
+</html>"""
+
+@app.route('/broadcast')
+async def broadcast_page():
+    return await render_template_string(BROADCAST_PAGE_HTML)
+
+# ------------------------------------------------------------
 #  API ДЛЯ УПРАВЛЕНИЯ СООБЩЕНИЯМИ
 # ------------------------------------------------------------
 @app.route('/messages/api', methods=['GET'])
@@ -2580,7 +2689,7 @@ async def index():
 <body>
     <div class="container">
         <h1>🤖 HR Бот «Мечел»</h1>
-        <div class="subtitle">Версия 12.35 · Исправление get_message, периодическое сохранение, улучшенная рассылка</div>
+        <div class="subtitle">Версия 12.36 · Команда /предложения, веб-рассылка, исправлен broadcast</div>
         
         <div class="grid">
             <div class="card">
@@ -2615,11 +2724,12 @@ async def index():
             <a href="/export/excel?key={WEBHOOK_SECRET}" class="btn">📥 Экспорт в Excel</a>
             <a href="/health" class="btn" style="background: #2E5C4E;">🩺 Health Check</a>
             <a href="/search/stats?key={WEBHOOK_SECRET}" class="btn" style="background: #5C3E6E;">🔍 Поиск Статистика</a>
-            <a href="/feedback/export?key={WEBHOOK_SECRET}" class="btn" style="background: #9C27B0;">📝 Отзывы</a>
+            <a href="/feedback/export?key={WEBHOOK_SECRET}" class="btn" style="background: #9C27B0;">📝 Отзывы (выгрузка)</a>
             <a href="/rate/stats?key={WEBHOOK_SECRET}" class="btn" style="background: #FF9800;">⭐ Оценки</a>
             <a href="/faq" class="btn" style="background: #17a2b8;">📚 Редактор FAQ</a>
             <a href="/messages" class="btn" style="background: #28a745;">💬 Редактор сообщений</a>
             <a href="/subscribers/api?key={WEBHOOK_SECRET}" class="btn" style="background: #6f42c1;">📬 Подписчики (JSON)</a>
+            <a href="/broadcast" class="btn" style="background: #fd7e14;">📨 Рассылка</a>
         </div>
         
         <h2>📈 Статистика за последние 7 дней</h2>

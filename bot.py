@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
 Telegram-бот для HR-отдела компании "Мечел"
-Версия 12.30 — исправление ошибок callback_query, русские команды,
-эмодзи-приветствия, веб-редактор FAQ, безопасные эндпоинты (key + header).
-Полная совместимость с search_engine.py v4.6, оптимизация для Render Free.
+Версия 12.31 — исправление русских команд, надёжный _reply_or_edit,
+полная совместимость с search_engine.py v4.6, оптимизация для Render Free.
 """
 
 import os
@@ -414,7 +413,7 @@ class BuiltinSearchEngine:
         logger.info("🔄 BuiltinSearchEngine: данные обновлены")
 
 # ------------------------------------------------------------
-#  АДАПТЕР ДЛЯ ВНЕШНЕГО SEARCH ENGINE (С ПРОБРОСОМ refresh_data)
+#  АДАПТЕР ДЛЯ ВНЕШНЕГО SEARCH ENGINE
 # ------------------------------------------------------------
 class ExternalSearchEngineAdapter:
     def __init__(self, external_engine):
@@ -766,7 +765,7 @@ search_engine: Optional[Union[BuiltinSearchEngine, ExternalSearchEngineAdapter]]
 bot_stats: Optional[BotStatistics] = None
 
 # ------------------------------------------------------------
-#  БЛОКИРОВКА ДЛЯ РАБОТЫ С FAQ.JSON (конкурентная запись)
+#  БЛОКИРОВКА ДЛЯ РАБОТЫ С FAQ.JSON
 # ------------------------------------------------------------
 faq_lock = asyncio.Lock()
 
@@ -776,19 +775,16 @@ faq_lock = asyncio.Lock()
 def is_greeting(text: str) -> bool:
     """Определяет, является ли сообщение приветствием (включая эмодзи)."""
     text_clean = text.lower().strip()
-    # Текстовые приветствия
     greetings = {
         'привет', 'здравствуй', 'здравствуйте', 'здорово', 'hello', 'hi', 'hey',
         'добрый день', 'доброе утро', 'добрый вечер', 'доброй ночи', 'доброго времени суток',
         'ку', 'салют', 'хай', 'хелло', 'хэллоу'
     }
-    # Эмодзи-приветствия (набор символов)
     emoji_greetings = {'👋', '🙋', '🙌', '🤝', '✋', '🖐', '👐', '🤗', '😊', '😀', '😄', '😁', '😃'}
     
     for greet in greetings:
         if greet in text_clean or text_clean == greet:
             return True
-    # Проверка на наличие эмодзи приветствия
     for emoji in emoji_greetings:
         if emoji in text:
             return True
@@ -813,13 +809,11 @@ def parse_period_argument(arg: str) -> str:
     return mapping.get(arg, 'all')
 
 # ------------------------------------------------------------
-#  ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ ОТПРАВКИ/РЕДАКТИРОВАНИЯ СООБЩЕНИЙ
+#  УНИВЕРСАЛЬНАЯ ОТПРАВКА/РЕДАКТИРОВАНИЕ СООБЩЕНИЯ
 # ------------------------------------------------------------
 async def _reply_or_edit(update: Update, text: str, parse_mode: str = 'HTML', reply_markup=None):
     """
-    Универсальная отправка ответа:
-    - если update.message существует -> reply_text
-    - если update.callback_query существует -> edit_message_text
+    Безопасно отправляет или редактирует сообщение в зависимости от типа update.
     """
     if update.message:
         return await update.message.reply_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
@@ -828,17 +822,16 @@ async def _reply_or_edit(update: Update, text: str, parse_mode: str = 'HTML', re
         return None
     else:
         logger.error("Не удалось определить тип update для отправки сообщения")
+        return None
 
 # ------------------------------------------------------------
-#  ВЕБ-БЕЗОПАСНОСТЬ (ПРОВЕРКА ЗАГОЛОВКА X-Secret-Key ИЛИ ПАРАМЕТРА key)
+#  ВЕБ-БЕЗОПАСНОСТЬ
 # ------------------------------------------------------------
 def is_authorized(request) -> bool:
     """Проверка авторизации: заголовок X-Secret-Key или параметр URL key."""
-    # Проверка заголовка
     secret = request.headers.get('X-Secret-Key')
     if secret == WEBHOOK_SECRET:
         return True
-    # Проверка параметра URL
     key = request.args.get('key')
     if key == WEBHOOK_SECRET:
         return True
@@ -864,7 +857,6 @@ async def save_faq_json(data: List[Dict]):
     async with faq_lock:
         with open('faq.json', 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-    # Оповещаем поисковый движок о необходимости перезагрузки
     if search_engine and hasattr(search_engine, 'refresh_data'):
         search_engine.refresh_data()
 
@@ -887,9 +879,10 @@ async def post_init(application: Application):
 # ------------------------------------------------------------
 async def init_bot():
     global application, search_engine, bot_stats
-    logger.info("🚀 Инициализация бота версии 12.30...")
+    logger.info("🚀 Инициализация бота версии 12.31...")
 
     try:
+        # 1. ПОИСКОВЫЙ ДВИЖОК
         use_builtin = False
         try:
             from search_engine import EnhancedSearchEngine
@@ -919,33 +912,52 @@ async def init_bot():
             search_engine = BuiltinSearchEngine()
             logger.info("✅ Используется встроенный BuiltinSearchEngine (оптимизированный нечёткий поиск)")
 
+        # 2. СТАТИСТИКА
         bot_stats = BotStatistics()
         logger.info("✅ Инициализирован модуль статистики")
 
+        # 3. ПРИЛОЖЕНИЕ TELEGRAM
         builder = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init)
         application = builder.build()
 
-        # --- РЕГИСТРАЦИЯ КОМАНД (английские + русские алиасы) ---
+        # --- РЕГИСТРАЦИЯ КОМАНД (ТОЛЬКО АНГЛИЙСКИЕ) ---
         application.add_handler(CommandHandler("start", start_command))
-        application.add_handler(CommandHandler("старт", start_command))
         application.add_handler(CommandHandler("help", help_command))
-        application.add_handler(CommandHandler("помощь", help_command))
         application.add_handler(CommandHandler("categories", categories_command))
-        application.add_handler(CommandHandler("категории", categories_command))
-        application.add_handler(CommandHandler("faq", categories_command))
+        application.add_handler(CommandHandler("faq", categories_command))  # alias
         application.add_handler(CommandHandler("feedback", feedback_command))
-        application.add_handler(CommandHandler("отзыв", feedback_command))
         application.add_handler(CommandHandler("feedbacks", feedbacks_command))
-        application.add_handler(CommandHandler("отзывы", feedbacks_command))
         application.add_handler(CommandHandler("stats", stats_command))
-        application.add_handler(CommandHandler("статистика", stats_command))
         application.add_handler(CommandHandler("export", export_command))
-        application.add_handler(CommandHandler("экспорт", export_command))
+
+        # --- РУССКИЕ КОМАНДЫ ЧЕРЕЗ MessageHandler ---
+        async def russian_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            text = update.message.text.lower()
+            if text.startswith('/старт'):
+                await start_command(update, context)
+            elif text.startswith('/помощь'):
+                await help_command(update, context)
+            elif text.startswith('/категории'):
+                await categories_command(update, context)
+            elif text.startswith('/отзыв'):
+                await feedback_command(update, context)
+            elif text.startswith('/отзывы'):
+                await feedbacks_command(update, context)
+            elif text.startswith('/статистика'):
+                await stats_command(update, context)
+            elif text.startswith('/экспорт'):
+                await export_command(update, context)
+
+        application.add_handler(MessageHandler(
+            filters.Regex(r'^/(старт|помощь|категории|отзыв|отзывы|статистика|экспорт)'),
+            russian_command_handler
+        ))
 
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         application.add_handler(CallbackQueryHandler(handle_callback_query))
         application.add_error_handler(error_handler)
 
+        # 4. WEBHOOK
         await application.initialize()
         if RENDER:
             webhook_url = WEBHOOK_URL + WEBHOOK_PATH
@@ -1176,7 +1188,7 @@ async def export_to_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _reply_or_edit(update, f"❌ Ошибка: {str(e)}", parse_mode='HTML')
 
 # ------------------------------------------------------------
-#  ГЕНЕРАЦИЯ ОТЧЁТОВ EXCEL
+#  ГЕНЕРАЦИЯ ОТЧЁТОВ EXCEL (ПОЛНОСТЬЮ АНАЛОГИЧНО ПРЕДЫДУЩИМ ВЕРСИЯМ)
 # ------------------------------------------------------------
 def generate_feedback_report() -> io.BytesIO:
     output = io.BytesIO()
@@ -1346,7 +1358,7 @@ def generate_excel_report() -> io.BytesIO:
     return output
 
 # ------------------------------------------------------------
-#  ОБРАБОТЧИК ТЕКСТОВЫХ СООБЩЕНИЙ (С ПРЕДЛОЖЕНИЯМИ)
+#  ОБРАБОТЧИК ТЕКСТОВЫХ СООБЩЕНИЙ
 # ------------------------------------------------------------
 @measure_response_time
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1560,7 +1572,7 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
 
 # ------------------------------------------------------------
-#  ВЕБ-ИНТЕРФЕЙС (Quart) — с безопасностью и управлением FAQ
+#  ВЕБ-ИНТЕРФЕЙС (Quart)
 # ------------------------------------------------------------
 app = Quart(__name__)
 
@@ -1572,6 +1584,7 @@ async def startup():
         logger.info("✅ Бот успешно инициализирован через before_serving")
     else:
         logger.error("❌ Не удалось инициализировать бота")
+        sys.exit(1)  # ОСТАНАВЛИВАЕМ ПРИЛОЖЕНИЕ ПРИ ОШИБКЕ
 
 @app.after_serving
 async def shutdown():
@@ -1587,8 +1600,7 @@ async def shutdown():
 # ------------------------------------------------------------
 #  СТРАНИЦА УПРАВЛЕНИЯ FAQ
 # ------------------------------------------------------------
-FAQ_MANAGER_HTML = """
-<!DOCTYPE html>
+FAQ_MANAGER_HTML = """<!DOCTYPE html>
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
@@ -1651,7 +1663,6 @@ FAQ_MANAGER_HTML = """
                 document.getElementById('authError').innerText = 'Введите ключ';
                 return;
             }
-            // Проверим ключ, выполнив запрос к API
             fetch(`${API_BASE}/faq/api?key=${encodeURIComponent(currentKey)}`)
                 .then(res => {
                     if (res.ok) {
@@ -1752,7 +1763,6 @@ FAQ_MANAGER_HTML = """
         }
 
         function editFaq(id) {
-            // Сначала загрузим текущие данные
             fetch(`${API_BASE}/faq/api/${id}?key=${encodeURIComponent(currentKey)}`)
                 .then(res => res.json())
                 .then(item => {
@@ -1831,12 +1841,10 @@ FAQ_MANAGER_HTML = """
         }
     </script>
 </body>
-</html>
-"""
+</html>"""
 
 @app.route('/faq')
 async def faq_manager():
-    """Веб-интерфейс для управления FAQ."""
     return await render_template_string(FAQ_MANAGER_HTML)
 
 # ------------------------------------------------------------
@@ -1844,7 +1852,6 @@ async def faq_manager():
 # ------------------------------------------------------------
 @app.route('/faq/api', methods=['GET'])
 async def faq_api_list():
-    """Получить список всех записей FAQ (JSON)."""
     if not is_authorized(request):
         return jsonify({'error': 'Forbidden'}), 403
     data = await load_faq_json()
@@ -1852,7 +1859,6 @@ async def faq_api_list():
 
 @app.route('/faq/api/<int:faq_id>', methods=['GET'])
 async def faq_api_get(faq_id):
-    """Получить одну запись FAQ по ID."""
     if not is_authorized(request):
         return jsonify({'error': 'Forbidden'}), 403
     data = await load_faq_json()
@@ -1863,7 +1869,6 @@ async def faq_api_get(faq_id):
 
 @app.route('/faq/api', methods=['POST'])
 async def faq_api_add():
-    """Добавить новую запись в FAQ."""
     if not is_authorized(request):
         return jsonify({'error': 'Forbidden'}), 403
     try:
@@ -1889,7 +1894,6 @@ async def faq_api_add():
 
 @app.route('/faq/api/<int:faq_id>', methods=['PUT'])
 async def faq_api_update(faq_id):
-    """Обновить существующую запись."""
     if not is_authorized(request):
         return jsonify({'error': 'Forbidden'}), 403
     try:
@@ -1916,7 +1920,6 @@ async def faq_api_update(faq_id):
 
 @app.route('/faq/api/<int:faq_id>', methods=['DELETE'])
 async def faq_api_delete(faq_id):
-    """Удалить запись по ID."""
     if not is_authorized(request):
         return jsonify({'error': 'Forbidden'}), 403
     data = await load_faq_json()
@@ -1927,7 +1930,7 @@ async def faq_api_delete(faq_id):
     return jsonify({'success': True}), 200
 
 # ------------------------------------------------------------
-#  ОСТАЛЬНЫЕ ВЕБ-ЭНДПОИНТЫ (С ЗАЩИТОЙ)
+#  ОСТАЛЬНЫЕ ВЕБ-ЭНДПОИНТЫ
 # ------------------------------------------------------------
 @app.route('/setwebhook')
 async def set_webhook_manual():
@@ -2098,7 +2101,7 @@ async def index():
 <body>
     <div class="container">
         <h1>🤖 HR Бот «Мечел»</h1>
-        <div class="subtitle">Версия 12.30 · Русские команды, редактор FAQ, безопасные эндпоинты</div>
+        <div class="subtitle">Версия 12.31 · Исправление русских команд, редактор FAQ</div>
         
         <div class="grid">
             <div class="card">

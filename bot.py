@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Telegram-бот для HR-отдела компании "Мечел"
-Версия 12.24 (Render-Ultimate) — синхронная статистика, упрощённый BASE_URL,
-полная совместимость с SearchEngine v4.3, оптимизирован для бесплатного тарифа Render.
+Версия 12.25 — интерактивные категории, приветствия, улучшенный поиск
+Полная совместимость с SearchEngine v4.3, оптимизирован для бесплатного тарифа Render.
 """
 
 import os
@@ -128,7 +128,7 @@ if RENDER and not WEBHOOK_URL:
     logger.critical("❌ На Render WEBHOOK_URL обязателен")
     sys.exit(1)
 
-# ---- УПРОЩЁННЫЙ BASE_URL (v12.24) ----
+# Упрощённый BASE_URL
 BASE_URL = f"http://localhost:{PORT}" if not RENDER else WEBHOOK_URL.rstrip('/')
 
 ADMIN_IDS = []
@@ -369,7 +369,7 @@ class ExternalSearchEngineAdapter:
         return []
 
 # ------------------------------------------------------------
-#  КЛАСС СТАТИСТИКИ (СИНХРОННАЯ ВЕРСИЯ, v12.24)
+#  КЛАСС СТАТИСТИКИ (СИНХРОННАЯ ВЕРСИЯ)
 # ------------------------------------------------------------
 class BotStatistics:
     def __init__(self, max_history_days: int = 90):
@@ -477,9 +477,6 @@ class BotStatistics:
             'user_id': user_id
         })
 
-    # ------------------------------------------------------------
-    #  СИНХРОННЫЙ get_summary_stats (БЕЗ await)
-    # ------------------------------------------------------------
     def get_summary_stats(self) -> Dict[str, Any]:
         """Сводная статистика (синхронная, без ожидания очистки)."""
         total_users = len(self.user_stats)
@@ -552,6 +549,24 @@ search_engine: Optional[Union[BuiltinSearchEngine, ExternalSearchEngineAdapter]]
 bot_stats: Optional[BotStatistics] = None
 
 # ------------------------------------------------------------
+#  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (v12.25)
+# ------------------------------------------------------------
+def is_greeting(text: str) -> bool:
+    """Определяет, является ли сообщение приветствием."""
+    greetings = {'привет', 'здравствуй', 'здравствуйте', 'здорово', 'hello', 'hi', 'hey', 'добрый день', 'доброе утро', 'добрый вечер'}
+    text_lower = text.lower().strip()
+    for greet in greetings:
+        if greet in text_lower or text_lower == greet:
+            return True
+    return False
+
+def truncate_question(question: str, max_len: int = 50) -> str:
+    """Сокращает вопрос для отображения в кнопке."""
+    if len(question) <= max_len:
+        return question
+    return question[:max_len-3] + "..."
+
+# ------------------------------------------------------------
 #  POST_INIT
 # ------------------------------------------------------------
 async def post_init(application: Application):
@@ -562,7 +577,7 @@ async def post_init(application: Application):
 # ------------------------------------------------------------
 async def init_bot():
     global application, search_engine, bot_stats
-    logger.info("🚀 Инициализация бота версии 12.24...")
+    logger.info("🚀 Инициализация бота версии 12.25...")
 
     try:
         # 1. ИНИЦИАЛИЗАЦИЯ ПОИСКОВОГО ДВИЖКА С АВТОВЫБОРОМ
@@ -607,6 +622,7 @@ async def init_bot():
         application.add_handler(CommandHandler("start", start_command))
         application.add_handler(CommandHandler("help", help_command))
         application.add_handler(CommandHandler("categories", categories_command))
+        application.add_handler(CommandHandler("faq", categories_command))  # alias
         application.add_handler(CommandHandler("feedback", feedback_command))
         application.add_handler(CommandHandler("stats", stats_command))
         application.add_handler(CommandHandler("export", export_command))
@@ -648,7 +664,7 @@ async def init_bot():
         return False
 
 # ------------------------------------------------------------
-#  ОБРАБОТЧИКИ КОМАНД (используют синхронную статистику)
+#  ОБРАБОТЧИКИ КОМАНД
 # ------------------------------------------------------------
 @measure_response_time
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -661,6 +677,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📌 Просто напишите вопрос — я поищу в базе знаний.\n"
         "/help — подсказки\n"
         "/categories — категории вопросов\n"
+        "/faq — просмотр всех категорий и вопросов\n"
         "/feedback — отзыв\n"
     )
     if user.id in ADMIN_IDS:
@@ -683,33 +700,44 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @measure_response_time
 async def categories_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Показывает все категории с inline-кнопками.
+    При нажатии на категорию – показываются вопросы этой категории.
+    """
     if bot_stats:
         bot_stats.log_message(update.effective_user.id, update.effective_user.username or "Unknown", 'command', '/categories')
-    if search_engine is None:
-        await update.message.reply_text("⚠️ Категории временно недоступны (поисковый движок не загружен).")
+    
+    if search_engine is None or not search_engine.faq_data:
+        await update.message.reply_text("⚠️ Категории временно недоступны.")
         return
 
+    # Собираем категории и количество вопросов
     categories = {}
     for item in search_engine.faq_data:
-        if isinstance(item, dict):
-            cat = item.get('category', 'Без категории')
-        else:
-            cat = getattr(item, 'category', 'Без категории')
+        cat = item.get('category', 'Без категории') if isinstance(item, dict) else getattr(item, 'category', 'Без категории')
         categories[cat] = categories.get(cat, 0) + 1
 
     if not categories:
-        await update.message.reply_text("📂 Категории временно недоступны.")
+        await update.message.reply_text("📂 Категории не найдены.")
         return
-    
-    text = "📂 <b>Категории:</b>\n"
-    for cat, cnt in sorted(categories.items()):
-        text += f"• {cat} ({cnt})\n"
-    
-    text += "\n💡 <b>Как использовать категорию:</b>\n"
-    text += "Напишите <i>Категория: ваш вопрос</i>\n"
-    text += "Например: <i>Отпуск: как перенести?</i> или <i>Больничные: сколько дней оплачивается?</i>\n"
-    
-    await update.message.reply_text(text, parse_mode='HTML')
+
+    # Создаем inline-кнопки для каждой категории
+    keyboard = []
+    for cat in sorted(categories.keys()):
+        count = categories[cat]
+        button = InlineKeyboardButton(
+            text=f"{cat} ({count})",
+            callback_data=f"cat_{cat}"  # префикс cat_ для идентификации
+        )
+        keyboard.append([button])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(
+        "📂 <b>Выберите категорию:</b>\n\n"
+        "Нажмите на категорию, чтобы увидеть список вопросов.",
+        parse_mode='HTML',
+        reply_markup=reply_markup
+    )
 
 @measure_response_time
 async def feedback_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -731,7 +759,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Статистика временно недоступна.")
         return
     bot_stats.log_message(user.id, user.username or "Unknown", 'command', '/stats')
-    s = bot_stats.get_summary_stats()  # Синхронный вызов, await НЕ НУЖЕН
+    s = bot_stats.get_summary_stats()
     avg = s['avg_response_time']
     status, color = s['response_time_status'], s['response_time_color']
     text = (
@@ -763,7 +791,7 @@ async def export_to_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     bot_stats.log_message(user.id, user.username or "Unknown", 'command', '/export')
     try:
-        output = generate_excel_report()  # Синхронный вызов, await НЕ НУЖЕН
+        output = generate_excel_report()
         filename = f"mechel_bot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         await update.message.reply_document(
             document=output.getvalue(),
@@ -775,7 +803,8 @@ async def export_to_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"❌ Ошибка экспорта: {e}", exc_info=True)
         await update.message.reply_text(f"❌ Ошибка: {str(e)}")
 
-def generate_excel_report() -> io.BytesIO:  # Синхронная функция
+def generate_excel_report() -> io.BytesIO:
+    """Синхронная генерация Excel-отчёта."""
     output = io.BytesIO()
     wb = Workbook()
     stats = bot_stats.get_summary_stats() if bot_stats else {}
@@ -886,13 +915,18 @@ def generate_excel_report() -> io.BytesIO:  # Синхронная функци�
     output.seek(0)
     return output
 
+# ------------------------------------------------------------
+#  ОБРАБОТЧИК ТЕКСТОВЫХ СООБЩЕНИЙ (v12.25)
+# ------------------------------------------------------------
 @measure_response_time
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = update.message.text.strip()
+    
     if bot_stats:
         bot_stats.log_message(user.id, user.username or "Unknown", 'message')
 
+    # 1. Обработка обратной связи
     if context.user_data.get('awaiting_feedback'):
         context.user_data['awaiting_feedback'] = False
         if bot_stats:
@@ -900,10 +934,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🙏 Спасибо за отзыв!")
         return
 
+    # 2. Обработка приветствий
+    if is_greeting(text):
+        logger.info(f"Приветствие от {user.id}: '{text}'")
+        await start_command(update, context)
+        return
+
+    # 3. Быстрый доступ к статистике для админов
     if text.lower() in ['статистика', 'stats'] and user.id in ADMIN_IDS:
         await stats_command(update, context)
         return
 
+    # 4. Поиск по базе знаний
     if bot_stats:
         bot_stats.log_message(user.id, user.username or "Unknown", 'search')
 
@@ -914,29 +956,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Извлечение категории из запроса (формат "Категория: вопрос")
     category = None
+    search_text = text
     if ':' in text:
         parts = text.split(':', 1)
         cat_candidate = parts[0].strip().lower()
         for item in search_engine.faq_data:
-            if isinstance(item, dict):
-                cat = item.get('category')
-            else:
-                cat = getattr(item, 'category', None)
+            cat = item.get('category') if isinstance(item, dict) else getattr(item, 'category', None)
             if cat and cat_candidate in cat.lower():
                 category = cat
-                text = parts[1].strip()
+                search_text = parts[1].strip()
                 break
 
     try:
-        results = search_engine.search(text, category, top_k=3)
+        results = search_engine.search(search_text, category, top_k=3)
+        logger.info(f"Поиск по запросу '{search_text}', категория {category}, найдено {len(results)} результатов")
     except Exception as e:
         logger.error(f"❌ Ошибка поиска: {e}", exc_info=True)
         results = []
 
     if not results:
         await update.message.reply_text(
-            "😕 Не нашёл ответ. Попробуйте переформулировать или /feedback.",
+            "😕 Не нашёл ответ. Попробуйте переформулировать, использовать /categories для выбора категории или /feedback.",
             parse_mode='HTML'
         )
         return
@@ -947,16 +989,97 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     response += "🔍 /categories — все темы"
     await update.message.reply_text(response, parse_mode='HTML')
 
+# ------------------------------------------------------------
+#  ОБРАБОТЧИК INLINE-КНОПОК (v12.25)
+# ------------------------------------------------------------
 @measure_response_time
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
+
+    # Экспорт Excel
     if data == 'export_excel':
         if update.effective_user.id in ADMIN_IDS:
             await export_to_excel(update, context)
         else:
             await query.answer("⛔ Нет прав", show_alert=True)
+        return
+
+    # Обработка навигации по категориям и вопросам
+    if data.startswith('cat_'):
+        # Пользователь выбрал категорию
+        category_name = data[4:]  # удаляем префикс 'cat_'
+        
+        # Собираем все вопросы этой категории
+        questions = []
+        for item in search_engine.faq_data:
+            cat = item.get('category') if isinstance(item, dict) else getattr(item, 'category', None)
+            if cat == category_name:
+                q = item.get('question') if isinstance(item, dict) else getattr(item, 'question', '')
+                questions.append(q)
+        
+        if not questions:
+            await query.edit_message_text(f"❓ В категории {category_name} нет вопросов.")
+            return
+        
+        # Создаем кнопки для каждого вопроса (сокращённые)
+        keyboard = []
+        for q in questions[:20]:  # ограничим 20 вопросами для безопасности
+            short_q = truncate_question(q, 50)
+            button = InlineKeyboardButton(
+                text=short_q,
+                callback_data=f"q_{hash(q)}"  # уникальный идентификатор вопроса
+            )
+            keyboard.append([button])
+        
+        # Добавляем кнопку "Назад к категориям"
+        keyboard.append([InlineKeyboardButton("◀ Назад к категориям", callback_data="back_to_categories")])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            f"📁 <b>{category_name}</b>\n\n"
+            f"Всего вопросов: {len(questions)}\n"
+            f"Выберите вопрос:",
+            parse_mode='HTML',
+            reply_markup=reply_markup
+        )
+    
+    elif data.startswith('q_'):
+        # Пользователь выбрал конкретный вопрос
+        # Здесь нужно найти полный вопрос и ответ
+        # Для простоты используем хеш и сравниваем с вопросом
+        target_hash = data[2:]  # удаляем префикс 'q_'
+        
+        found = None
+        for item in search_engine.faq_data:
+            q = item.get('question') if isinstance(item, dict) else getattr(item, 'question', '')
+            if hashlib.md5(q.encode()).hexdigest()[:16] == target_hash:
+                found = item
+                break
+        
+        if found:
+            question = found.get('question') if isinstance(found, dict) else getattr(found, 'question', '')
+            answer = found.get('answer') if isinstance(found, dict) else getattr(found, 'answer', '')
+            category = found.get('category') if isinstance(found, dict) else getattr(found, 'category', '')
+            
+            response = f"❓ <b>{question}</b>\n\n📌 <b>Ответ:</b>\n{answer}\n\n📁 Категория: {category}"
+            
+            # Кнопка "Назад к категории"
+            keyboard = [[InlineKeyboardButton("◀ Назад к категории", callback_data=f"cat_{category}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.edit_message_text(
+                response,
+                parse_mode='HTML',
+                reply_markup=reply_markup
+            )
+        else:
+            await query.edit_message_text("❌ Вопрос не найден.")
+    
+    elif data == "back_to_categories":
+        # Возврат к списку категорий
+        await categories_command(update, context)
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     error = context.error
@@ -1031,7 +1154,7 @@ async def set_webhook_manual():
 @app.route('/')
 async def index():
     start_time = time.time()
-    s = bot_stats.get_summary_stats() if bot_stats else {}  # Синхронно, await НЕ НУЖЕН
+    s = bot_stats.get_summary_stats() if bot_stats else {}
     avg = s.get('avg_response_time', 0)
     if avg < 1:
         perf_color = "metric-good"; perf_text = "Хорошо"
@@ -1169,7 +1292,7 @@ async def index():
 <body>
     <div class="container">
         <h1>🤖 HR Бот «Мечел»</h1>
-        <div class="subtitle">Версия 12.24 · Render-Ultimate (синхронная статистика, упрощённый BASE_URL)</div>
+        <div class="subtitle">Версия 12.25 · Интерактивные категории, приветствия, улучшенный поиск</div>
         
         <div class="grid">
             <div class="card">
@@ -1277,7 +1400,7 @@ async def export_excel_web():
     if bot_stats is None:
         return jsonify({'error': 'Статистика не инициализирована'}), 503
     try:
-        excel_file = generate_excel_report()  # Синхронно, await НЕ НУЖЕН
+        excel_file = generate_excel_report()
         filename = f'mechel_bot_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xlsx'
         response = await make_response(excel_file.getvalue())
         response.mimetype = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'

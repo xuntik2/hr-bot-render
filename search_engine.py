@@ -1,7 +1,7 @@
 """
 ПОИСКОВЫЙ ДВИЖОК ДЛЯ HR-БОТА МЕЧЕЛ
-Версия 4.2 - Индекс категорий, неточное совпадение, top_k=5, расширенные синонимы
-Полностью совместим с bot.py 12.21, оптимизирован для Render Free.
+Версия 4.3 - Совместимость с адаптером (question, answer, score), индекс категорий, неточное совпадение
+Полностью исправлена ошибка преобразования float, оптимизирован для Render Free.
 """
 
 import logging
@@ -37,6 +37,7 @@ class SearchEngine:
     - индекса категорий для быстрой фильтрации
     - LRU-кэша результатов
     - подробной статистики
+    - возврата кортежей (question, answer, score) для совместимости с адаптером
     """
     
     # Стоп-слова (не влияют на поиск)
@@ -50,7 +51,6 @@ class SearchEngine:
     
     # Синонимы (расширенный набор)
     SYNONYMS = {
-        # Основные (из v4.1)
         'зп': 'зарплата',
         'отдых': 'отпуск',
         'больничный': 'листок нетрудоспособности',
@@ -59,7 +59,6 @@ class SearchEngine:
         'премия': 'бонус',
         'справка': 'документ',
         'трудовая': 'трудовая книжка',
-        # Дополнительные (v4.2)
         'оклад': 'зарплата',
         'отгул': 'дополнительный выходной',
         'кадры': 'отдел кадров',
@@ -83,7 +82,7 @@ class SearchEngine:
         
         self._load_faq()
         self._build_category_index()
-        logger.info(f"✅ SearchEngine v4.2: загружено {len(self.faq_data)} записей, "
+        logger.info(f"✅ SearchEngine v4.3: загружено {len(self.faq_data)} записей, "
                    f"источник: {self.stats['loaded_from']}")
 
     # ------------------------------------------------------------
@@ -108,10 +107,12 @@ class SearchEngine:
                 data = json.load(f)
             
             self.faq_data.clear()
+            loaded_count = 0
             for idx, item in enumerate(data, start=1):
                 question = item.get('question', '').strip()
                 answer = item.get('answer', '').strip()
                 if not question or not answer:
+                    logger.warning(f"⚠️ Пропущена запись {idx}: пустой вопрос или ответ")
                     continue
                 
                 keywords_raw = item.get('keywords', '')
@@ -138,8 +139,10 @@ class SearchEngine:
                     category=item.get('category', 'Без категории').strip()
                 )
                 self.faq_data.append(faq)
+                loaded_count += 1
             
-            self.stats['loaded_from'] = f'JSON ({len(self.faq_data)} записей)'
+            self.stats['loaded_from'] = f'JSON ({loaded_count} записей)'
+            logger.info(f"✅ Загружено {loaded_count} записей из {json_path}")
             return True
             
         except Exception as e:
@@ -169,6 +172,7 @@ class SearchEngine:
             )
         ]
         self.stats['loaded_from'] = 'резервные данные (2 записи)'
+        logger.info("✅ Используются резервные данные (2 записи)")
 
     def _build_category_index(self):
         """Построение индекса категорий для быстрого поиска"""
@@ -227,19 +231,19 @@ class SearchEngine:
         return ' '.join(normalized)
 
     # ------------------------------------------------------------
-    #  ПОИСК (ОСНОВНОЙ МЕТОД) - версия 4.2
+    #  ПОИСК (ОСНОВНОЙ МЕТОД) - версия 4.3
     # ------------------------------------------------------------
-    def search(self, query: str, category: Optional[str] = None, top_k: int = 5) -> List[Tuple]:
+    def search(self, query: str, category: Optional[str] = None, top_k: int = 5) -> List[Tuple[str, str, float]]:
         """
         Поиск по базе знаний.
         
         Параметры:
             query (str): поисковый запрос
             category (Optional[str]): фильтр по категории (неточное, регистронезависимое совпадение)
-            top_k (int): количество возвращаемых результатов (по умолчанию 5, как в bot.py)
+            top_k (int): количество возвращаемых результатов (по умолчанию 5)
         
         Возвращает:
-            List[Tuple]: список кортежей (id, question, answer, category, score)
+            List[Tuple[str, str, float]]: список кортежей (вопрос, ответ, релевантность)
                          отсортирован по убыванию релевантности
         """
         # Валидация
@@ -252,7 +256,6 @@ class SearchEngine:
         # Нормализуем запрос
         norm_query = self._normalize_text(query)
         if not norm_query:
-            # После нормализации запрос стал пустым (например, одни стоп-слова)
             return []
         
         # Ключ кэша
@@ -271,12 +274,10 @@ class SearchEngine:
         self.stats['total_searches'] += 1
         self.stats['cache_misses'] += 1
         
-        # --- УЛУЧШЕННАЯ ФИЛЬТРАЦИЯ ПО КАТЕГОРИИ (неточное совпадение) ---
+        # Фильтрация по категории с неточным совпадением
         if category:
             cat_lower = category.lower()
-            # 1. Точное совпадение
             faq_list = self._category_index.get(cat_lower, [])
-            # 2. Если точного нет — ищем частичное вхождение (cat_lower in cat_key)
             if not faq_list:
                 for cat_key, entries in self._category_index.items():
                     if cat_lower in cat_key:
@@ -286,7 +287,6 @@ class SearchEngine:
         else:
             faq_list = self.faq_data
         
-        # Если по категории ничего не найдено — пустой результат
         if not faq_list:
             return []
         
@@ -297,16 +297,10 @@ class SearchEngine:
         for faq in faq_list:
             score = self._calculate_score(norm_query, query_words, faq)
             if score > 0:
-                results.append((
-                    faq.id,
-                    faq.question,
-                    faq.answer,
-                    faq.category,
-                    min(score, 100.0)
-                ))
+                results.append((faq.question, faq.answer, min(score, 100.0)))
         
         # Сортируем по убыванию релевантности
-        results.sort(key=lambda x: x[4], reverse=True)
+        results.sort(key=lambda x: x[2], reverse=True)
         
         # Берём top_k
         top_results = results[:top_k]
@@ -314,7 +308,6 @@ class SearchEngine:
         # Сохраняем в кэш (если есть результаты)
         if top_results:
             if len(self.cache) >= self.max_cache_size:
-                # LRU: удаляем самый старый
                 oldest = next(iter(self.cache))
                 del self.cache[oldest]
                 del self.cache_ttl[oldest]
@@ -331,7 +324,7 @@ class SearchEngine:
         """
         score = 0.0
         
-        # 1. Точное совпадение нормализованного вопроса (макс 100)
+        # 1. Точное совпадение нормализованного вопроса
         if norm_query == faq.norm_question:
             return 100.0
         
@@ -339,7 +332,7 @@ class SearchEngine:
         if norm_query in faq.norm_question:
             score += 50.0
         
-        # 3. Совпадение по словам в вопросе (взвешенно)
+        # 3. Совпадение по словам в вопросе
         q_words = set(faq.norm_question.split()) if faq.norm_question else set()
         common_q = query_words.intersection(q_words)
         score += len(common_q) * 12.0
@@ -350,7 +343,7 @@ class SearchEngine:
             common_kw = query_words.intersection(kw_words)
             score += len(common_kw) * 20.0
         
-        # 5. Частичное совпадение отдельных слов в вопросе
+        # 5. Частичное совпадение отдельных слов
         for word in query_words:
             if len(word) > 3:
                 if word in faq.norm_question:
@@ -370,13 +363,6 @@ class SearchEngine:
         self.cache.clear()
         self.cache_ttl.clear()
         logger.info("🔄 Данные перезагружены, кэш сброшен")
-
-    def increment_usage(self, faq_id: int):
-        """Увеличить счётчик использования записи (для будущих улучшений)"""
-        for faq in self.faq_data:
-            if faq.id == faq_id:
-                faq.usage_count += 1
-                break
 
     def get_stats(self) -> Dict[str, Any]:
         """Детальная статистика движка"""
@@ -416,5 +402,5 @@ class SearchEngine:
                 }
         return None
 
-# Для обратной совместимости с bot.py (ожидает EnhancedSearchEngine)
+# Для обратной совместимости с bot.py
 EnhancedSearchEngine = SearchEngine

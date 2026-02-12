@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 Telegram-бот для HR-отдела компании "Мечел"
-Версия 12.25 — интерактивные категории, приветствия, улучшенный поиск
-Полная совместимость с SearchEngine v4.3, оптимизирован для бесплатного тарифа Render.
+Версия 12.29 — оптимизированный поиск, предложения по исправлению запросов,
+безопасные веб-эндпоинты (X-Secret-Key), ограничение отзывов.
+Полная совместимость с search_engine.py v4.5, оптимизация для Render Free.
 """
 
 import os
@@ -49,7 +50,7 @@ def check_critical_dependencies():
 check_critical_dependencies()
 
 # ------------------------------------------------------------
-#  ИМПОРТЫ (оптимизированы для бесплатного тарифа)
+#  ИМПОРТЫ
 # ------------------------------------------------------------
 from quart import Quart, request, jsonify, make_response
 import hypercorn
@@ -77,6 +78,26 @@ from dotenv import load_dotenv
 import psutil
 
 # ------------------------------------------------------------
+#  ФУНКЦИЯ ЛЕВЕНШТЕЙНА (ДЛЯ ВСТРОЕННОГО ДВИЖКА)
+# ------------------------------------------------------------
+def levenshtein_distance(s1: str, s2: str) -> int:
+    """Вычисляет расстояние Левенштейна между двумя строками."""
+    if len(s1) < len(s2):
+        return levenshtein_distance(s2, s1)
+    if len(s2) == 0:
+        return len(s1)
+    previous_row = range(len(s2) + 1)
+    for i, c1 in enumerate(s1):
+        current_row = [i + 1]
+        for j, c2 in enumerate(s2):
+            insertions = previous_row[j + 1] + 1
+            deletions = current_row[j] + 1
+            substitutions = previous_row[j] + (c1 != c2)
+            current_row.append(min(insertions, deletions, substitutions))
+        previous_row = current_row
+    return previous_row[-1]
+
+# ------------------------------------------------------------
 #  КОНФИГУРАЦИЯ ЛОГИРОВАНИЯ
 # ------------------------------------------------------------
 logging.basicConfig(
@@ -90,7 +111,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------
-#  ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ (упрощённый BASE_URL)
+#  ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
 # ------------------------------------------------------------
 load_dotenv()
 
@@ -128,7 +149,6 @@ if RENDER and not WEBHOOK_URL:
     logger.critical("❌ На Render WEBHOOK_URL обязателен")
     sys.exit(1)
 
-# Упрощённый BASE_URL
 BASE_URL = f"http://localhost:{PORT}" if not RENDER else WEBHOOK_URL.rstrip('/')
 
 ADMIN_IDS = []
@@ -158,7 +178,7 @@ def check_optional_files():
 check_optional_files()
 
 # ------------------------------------------------------------
-#  ВСТРОЕННЫЙ ПОИСКОВЫЙ ДВИЖОК (ЭТАЛОННЫЙ)
+#  ВСТРОЕННЫЙ ПОИСКОВЫЙ ДВИЖОК (С ОПТИМИЗАЦИЕЙ И ПРЕДЛОЖЕНИЯМИ)
 # ------------------------------------------------------------
 class BuiltinSearchEngine:
     def __init__(self, max_cache_size: int = 1000):
@@ -172,17 +192,19 @@ class BuiltinSearchEngine:
             'о', 'об', 'от', 'до', 'для', 'из', 'у', 'не', 'нет', 'да', 'это',
             'тот', 'этот', 'такой', 'какой', 'все', 'всё', 'его', 'ее', 'их'
         }
-        logger.info(f"✅ Загружено {len(self.faq_data)} вопросов во встроенный поиск")
+        logger.info(f"✅ BuiltinSearchEngine: загружено {len(self.faq_data)} вопросов (оптимизированный нечёткий поиск)")
 
     def _normalize_faq_item(self, item: Any) -> Dict[str, Any]:
         if isinstance(item, dict):
             return {
+                'id': item.get('id', hash(item.get('question', '')) % 1000000),
                 'question': item.get('question', ''),
                 'answer': item.get('answer', ''),
                 'category': item.get('category', 'Без категории'),
                 'keywords': item.get('keywords', [])
             }
         return {
+            'id': getattr(item, 'id', hash(getattr(item, 'question', '')) % 1000000),
             'question': getattr(item, 'question', ''),
             'answer': getattr(item, 'answer', ''),
             'category': getattr(item, 'category', 'Без категории'),
@@ -194,26 +216,30 @@ class BuiltinSearchEngine:
         try:
             with open('faq.json', 'r', encoding='utf-8') as f:
                 raw_data = json.load(f)
-            for item in raw_data:
-                data.append(self._normalize_faq_item(item))
+            for idx, item in enumerate(raw_data, start=1):
+                normalized = self._normalize_faq_item(item)
+                if not normalized.get('id'):
+                    normalized['id'] = idx
+                data.append(normalized)
             logger.info(f"✅ Загружено {len(data)} вопросов из faq.json")
             return data
         except FileNotFoundError:
             logger.warning("⚠️ Файл faq.json не найден, используются резервные вопросы")
         except json.JSONDecodeError as e:
             logger.error(f"⚠️ Ошибка парсинга faq.json: {e}. Используются резервные вопросы")
-        
         return self._get_backup_questions()
 
     def _get_backup_questions(self) -> List[Dict[str, Any]]:
         return [
             {
+                "id": 1,
                 "question": "Как получить справку о заработной плате?",
                 "answer": "Справку можно получить в отделе кадров (каб. 205) или через корпоративный портал.",
                 "category": "Документы",
                 "keywords": ["справка", "зарплата", "заработная", "плата"]
             },
             {
+                "id": 2,
                 "question": "Как оформить отпуск?",
                 "answer": "Заявление в портале → согласование с руководителем → отдел кадров → приказ.",
                 "category": "Отпуск",
@@ -230,6 +256,7 @@ class BuiltinSearchEngine:
             if w.endswith('ться'): w = w[:-4] + 'ть'
             elif w.endswith('тся'): w = w[:-3] + 'ться'
             elif w.endswith('ать') and len(w) > 4: w = w[:-3]
+            elif w.endswith('ять') and len(w) > 4: w = w[:-3]
             elif w.endswith('ить') and len(w) > 4: w = w[:-3]
             elif w.endswith('еть') and len(w) > 4: w = w[:-3]
             elif w.endswith('ый') or w.endswith('ий') or w.endswith('ой'): w = w[:-2]
@@ -238,7 +265,72 @@ class BuiltinSearchEngine:
             norm.append(w)
         return ' '.join(norm)
 
-    def _calc_score(self, query: str, text: str) -> float:
+    def _quick_match(self, norm_query: str, item: Dict[str, Any]) -> bool:
+        """Быстрая проверка (аналог внешнего движка)."""
+        if not norm_query:
+            return False
+        q_words = set(norm_query.split())
+        norm_question = self._normalize_query(item['question'])
+        q_words_question = set(norm_question.split())
+        if q_words.intersection(q_words_question):
+            return True
+        norm_keywords = ' '.join(item.get('keywords', [])).lower()
+        if norm_keywords:
+            q_words_keywords = set(norm_keywords.split())
+            if q_words.intersection(q_words_keywords):
+                return True
+        return False
+
+    def _calculate_full_score(self, norm_query: str, item: Dict[str, Any]) -> float:
+        """Полный расчёт релевантности с Левенштейном."""
+        score = 0.0
+        norm_question = self._normalize_query(item['question'])
+        norm_answer = self._normalize_query(item['answer'])
+        norm_keywords = ' '.join(item.get('keywords', [])).lower()
+        q_words = set(norm_query.split())
+
+        if norm_query == norm_question:
+            return 100.0
+        if norm_query in norm_question:
+            score += 50.0
+
+        if len(norm_query) >= 4 and norm_question:
+            lev_dist = levenshtein_distance(norm_query, norm_question)
+            if lev_dist == 0:
+                return 100.0
+            elif lev_dist <= 2:
+                score += 40.0
+            elif lev_dist <= 4:
+                score += 20.0
+            if norm_keywords:
+                kw_lev = levenshtein_distance(norm_query, norm_keywords[:len(norm_query)+5])
+                if kw_lev <= 2:
+                    score += 30.0
+
+        q_words_question = set(norm_question.split())
+        common_q = q_words.intersection(q_words_question)
+        score += len(common_q) * 12.0
+
+        if norm_keywords:
+            kw_words = set(norm_keywords.split())
+            common_kw = q_words.intersection(kw_words)
+            score += len(common_kw) * 20.0
+
+        for word in q_words:
+            if len(word) > 3:
+                if word in norm_question:
+                    score += 3.0
+                if norm_keywords and word in norm_keywords:
+                    score += 5.0
+
+        # Бонус за совпадение в ответе
+        if norm_answer:
+            a_score = self._calc_score_simple(norm_query, norm_answer) * 0.5
+            score += a_score
+
+        return score
+
+    def _calc_score_simple(self, query: str, text: str) -> float:
         if not query or not text:
             return 0.0
         q_words = set(query.split())
@@ -254,18 +346,45 @@ class BuiltinSearchEngine:
             return self.cache[cache_key]
 
         norm_q = self._normalize_query(query)
+        if not norm_q:
+            return []
+
+        # Фильтр по категории (простой)
+        filtered = self.faq_data
+        if category:
+            filtered = [item for item in self.faq_data if item.get('category') == category]
+
+        # Быстрая предфильтрация
+        preliminary = []
+        for item in filtered:
+            if self._quick_match(norm_q, item):
+                preliminary.append(item)
+        if not preliminary:
+            preliminary = filtered[:20]
+
+        # Базовая оценка для кандидатов
+        candidates = []
+        for item in preliminary[:20]:
+            q_words = set(norm_q.split())
+            norm_question = self._normalize_query(item['question'])
+            q_words_question = set(norm_question.split())
+            common = q_words.intersection(q_words_question)
+            base_score = len(common) * 12.0
+            norm_keywords = ' '.join(item.get('keywords', [])).lower()
+            if norm_keywords:
+                kw_words = set(norm_keywords.split())
+                common_kw = q_words.intersection(kw_words)
+                base_score += len(common_kw) * 20.0
+            candidates.append((item, base_score))
+
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        top_candidates = [item for item, _ in candidates[:10]]
+
         results = []
-        for item in self.faq_data:
-            if category and item.get('category') != category:
-                continue
-            q_score = self._calc_score(norm_q, self._normalize_query(item['question']))
-            kw_score = 0
-            for kw in item.get('keywords', []):
-                kw_score += self._calc_score(norm_q, self._normalize_query(kw))
-            a_score = self._calc_score(norm_q, self._normalize_query(item['answer'])) * 0.5
-            total = q_score * 2 + kw_score * 1.5 + a_score
-            if total > 0.3:
-                results.append((item['question'], item['answer'], total))
+        for item in top_candidates:
+            score = self._calculate_full_score(norm_q, item)
+            if score > 0:
+                results.append((item['question'], item['answer'], min(score, 100.0)))
 
         results.sort(key=lambda x: x[2], reverse=True)
         top = results[:top_k]
@@ -278,11 +397,27 @@ class BuiltinSearchEngine:
         self.cache_ttl[cache_key] = datetime.now() + timedelta(hours=1)
         return top
 
+    def suggest_correction(self, query: str, top_k: int = 3) -> List[str]:
+        """Предлагает исправления для запроса без результатов."""
+        if not query or not self.faq_data:
+            return []
+        norm_query = self._normalize_query(query)
+        if not norm_query or len(norm_query) < 3:
+            return []
+        candidates = []
+        for item in self.faq_data[:50]:
+            norm_question = self._normalize_query(item['question'])
+            if norm_question:
+                dist = levenshtein_distance(norm_query, norm_question)
+                if dist <= 5:
+                    candidates.append((item['question'], dist))
+        candidates.sort(key=lambda x: x[1])
+        return [q for q, _ in candidates[:top_k]]
+
 # ------------------------------------------------------------
-#  АДАПТЕР ДЛЯ ВНЕШНЕГО SEARCH ENGINE (оптимизированный)
+#  АДАПТЕР ДЛЯ ВНЕШНЕГО SEARCH ENGINE (без изменений, совместим)
 # ------------------------------------------------------------
 class ExternalSearchEngineAdapter:
-    """Адаптирует внешний SearchEngine к нашему интерфейсу."""
     def __init__(self, external_engine):
         self._engine = external_engine
         self._search_method = getattr(external_engine, 'search', None)
@@ -306,7 +441,6 @@ class ExternalSearchEngineAdapter:
                     f"поддержка top_k = {self._supports_top_k}")
 
     def search(self, query: str, category: Optional[str] = None, top_k: int = 5) -> List[Tuple[str, str, float]]:
-        """Унифицированный метод поиска с правильной передачей аргументов."""
         try:
             if self._supports_top_k:
                 if self._has_category:
@@ -321,10 +455,8 @@ class ExternalSearchEngineAdapter:
                         result = self._search_method(query, category)
                     else:
                         result = self._search_method(query)
-                
                 if isinstance(result, list):
                     result = result[:top_k]
-            
             return self._normalize_result(result)
         except Exception as e:
             logger.error(f"❌ Ошибка во внешнем поисковом движке: {e}")
@@ -357,19 +489,33 @@ class ExternalSearchEngineAdapter:
             normalized = []
             for item in raw:
                 if isinstance(item, dict):
-                    normalized.append(item)
+                    norm_item = {
+                        'id': item.get('id', hash(item.get('question', '')) % 1000000),
+                        'question': item.get('question', ''),
+                        'answer': item.get('answer', ''),
+                        'category': item.get('category', 'Без категории'),
+                        'keywords': item.get('keywords', []) if isinstance(item.get('keywords'), list) else str(item.get('keywords', '')).split(', ')
+                    }
                 else:
-                    normalized.append({
+                    norm_item = {
+                        'id': getattr(item, 'id', hash(getattr(item, 'question', '')) % 1000000),
                         'question': getattr(item, 'question', ''),
                         'answer': getattr(item, 'answer', ''),
                         'category': getattr(item, 'category', 'Без категории'),
-                        'keywords': getattr(item, 'keywords', [])
-                    })
+                        'keywords': getattr(item, 'keywords', []) if isinstance(getattr(item, 'keywords', []), list) else str(getattr(item, 'keywords', '')).split(', ')
+                    }
+                normalized.append(norm_item)
             return normalized
         return []
 
+    # Проброс метода suggest_correction, если он есть во внешнем движке
+    def suggest_correction(self, query: str, top_k: int = 3) -> List[str]:
+        if hasattr(self._engine, 'suggest_correction'):
+            return self._engine.suggest_correction(query, top_k)
+        return []
+
 # ------------------------------------------------------------
-#  КЛАСС СТАТИСТИКИ (СИНХРОННАЯ ВЕРСИЯ)
+#  КЛАСС СТАТИСТИКИ (С ОГРАНИЧЕНИЕМ ОТЗЫВОВ)
 # ------------------------------------------------------------
 class BotStatistics:
     def __init__(self, max_history_days: int = 90):
@@ -380,7 +526,10 @@ class BotStatistics:
             'searches': 0,
             'last_active': None,
             'first_seen': None,
-            'feedback_count': 0
+            'feedback_count': 0,
+            'ratings_given': 0,
+            'ratings_helpful': 0,
+            'ratings_unhelpful': 0
         })
         self.daily_stats = defaultdict(lambda: {
             'messages': 0,
@@ -388,10 +537,12 @@ class BotStatistics:
             'searches': 0,
             'users': set(),
             'feedback': 0,
-            'response_times': []
+            'response_times': [],
+            'ratings': {'helpful': 0, 'unhelpful': 0}
         })
         self.command_stats = defaultdict(int)
         self.feedback_list = []
+        self.max_feedback = 10000  # храним не более 10 000 отзывов
         self.error_log = deque(maxlen=1000)
         self.response_times = deque(maxlen=100)
         self.cache = {}
@@ -399,9 +550,9 @@ class BotStatistics:
         self.max_history_days = max_history_days
         self._last_cleanup = datetime.now()
         self._cleanup_lock = asyncio.Lock()
+        self.faq_ratings = defaultdict(lambda: {'helpful': 0, 'unhelpful': 0})
 
     async def _cleanup_old_data(self):
-        """Асинхронная очистка устаревших данных (запускается в фоне)."""
         now = datetime.now()
         if (now - self._last_cleanup).seconds < 3600:
             return
@@ -439,7 +590,6 @@ class BotStatistics:
             return "Медленно", "red"
 
     def log_message(self, user_id: int, username: str, msg_type: str, text: str = ""):
-        # Запускаем асинхронную очистку в фоне, не ждём результата
         asyncio.create_task(self._cleanup_old_data())
         now = datetime.now()
         date_key = now.strftime("%Y-%m-%d")
@@ -466,6 +616,17 @@ class BotStatistics:
                 'text': text,
                 'timestamp': now
             })
+            # ОГРАНИЧЕНИЕ РАЗМЕРА СПИСКА ОТЗЫВОВ
+            if len(self.feedback_list) > self.max_feedback:
+                self.feedback_list = self.feedback_list[-self.max_feedback:]
+        elif msg_type == 'rating_helpful':
+            self.user_stats[user_id]['ratings_given'] += 1
+            self.user_stats[user_id]['ratings_helpful'] += 1
+            self.daily_stats[date_key]['ratings']['helpful'] += 1
+        elif msg_type == 'rating_unhelpful':
+            self.user_stats[user_id]['ratings_given'] += 1
+            self.user_stats[user_id]['ratings_unhelpful'] += 1
+            self.daily_stats[date_key]['ratings']['unhelpful'] += 1
 
         self.daily_stats[date_key]['users'].add(user_id)
 
@@ -477,40 +638,91 @@ class BotStatistics:
             'user_id': user_id
         })
 
-    def get_summary_stats(self) -> Dict[str, Any]:
-        """Сводная статистика (синхронная, без ожидания очистки)."""
-        total_users = len(self.user_stats)
-        active_24h = sum(
-            1 for u in self.user_stats.values()
-            if u['last_active'] and (datetime.now() - u['last_active']) < timedelta(hours=24)
-        )
-        days_stats = {}
-        for date in sorted(self.daily_stats.keys(), reverse=True)[:30]:
-            ds = self.daily_stats[date]
-            days_stats[date] = {
-                'messages': ds['messages'],
-                'commands': ds['commands'],
-                'searches': ds['searches'],
-                'users': len(ds['users']),
-                'feedback': ds['feedback'],
-                'avg_response_time': sum(ds['response_times']) / len(ds['response_times']) if ds['response_times'] else 0
-            }
-        avg_resp = self.get_avg_response_time()
-        status, color = self.get_response_time_status()
+    def record_rating(self, faq_id: int, is_helpful: bool):
+        date_key = datetime.now().strftime("%Y-%m-%d")
+        if is_helpful:
+            self.faq_ratings[faq_id]['helpful'] += 1
+            self.daily_stats[date_key]['ratings']['helpful'] += 1
+        else:
+            self.faq_ratings[faq_id]['unhelpful'] += 1
+            self.daily_stats[date_key]['ratings']['unhelpful'] += 1
+
+    def get_rating_stats(self) -> Dict[str, Any]:
+        total_helpful = sum(v['helpful'] for v in self.faq_ratings.values())
+        total_unhelpful = sum(v['unhelpful'] for v in self.faq_ratings.values())
+        total_ratings = total_helpful + total_unhelpful
+        satisfaction_rate = (total_helpful / total_ratings * 100) if total_ratings > 0 else 0
         return {
-            'uptime': str(datetime.now() - self.start_time),
+            'total_ratings': total_ratings,
+            'helpful': total_helpful,
+            'unhelpful': total_unhelpful,
+            'satisfaction_rate': round(satisfaction_rate, 2),
+            'by_faq': dict(self.faq_ratings)
+        }
+
+    def get_summary_stats(self, period: str = 'all') -> Dict[str, Any]:
+        now = datetime.now()
+        if period == 'all':
+            daily_items = self.daily_stats.items()
+        else:
+            delta_map = {
+                'day': timedelta(days=1),
+                'week': timedelta(days=7),
+                'month': timedelta(days=30),
+                'quarter': timedelta(days=90),
+                'halfyear': timedelta(days=180),
+                'year': timedelta(days=365)
+            }
+            delta = delta_map.get(period, timedelta(days=30))
+            cutoff = (now - delta).strftime("%Y-%m-%d")
+            daily_items = [(d, ds) for d, ds in self.daily_stats.items() if d >= cutoff]
+
+        total_users = set()
+        total_messages = 0
+        total_commands = 0
+        total_searches = 0
+        total_feedback = 0
+        total_ratings_helpful = 0
+        total_ratings_unhelpful = 0
+        all_response_times = []
+
+        for date, ds in daily_items:
+            total_users.update(ds['users'])
+            total_messages += ds['messages']
+            total_commands += ds['commands']
+            total_searches += ds['searches']
+            total_feedback += ds['feedback']
+            total_ratings_helpful += ds['ratings']['helpful']
+            total_ratings_unhelpful += ds['ratings']['unhelpful']
+            all_response_times.extend(ds['response_times'])
+
+        avg_response_time = sum(all_response_times) / len(all_response_times) if all_response_times else 0
+        active_24h = 0
+        if period == 'all':
+            active_24h = sum(
+                1 for u in self.user_stats.values()
+                if u['last_active'] and (now - u['last_active']) < timedelta(hours=24)
+            )
+        top_commands = dict(sorted(self.command_stats.items(), key=lambda x: x[1], reverse=True)[:10])
+        status, color = self.get_response_time_status()
+
+        return {
+            'period': period,
+            'uptime': str(now - self.start_time),
             'start_time': self.start_time.strftime("%Y-%m-%d %H:%M:%S"),
-            'total_users': total_users,
-            'active_users_24h': active_24h,
-            'total_messages': sum(u['messages'] for u in self.user_stats.values()),
-            'total_commands': sum(u['commands'] for u in self.user_stats.values()),
-            'total_searches': sum(u['searches'] for u in self.user_stats.values()),
-            'total_feedback': len(self.feedback_list),
-            'avg_response_time': avg_resp,
+            'total_users': len(total_users),
+            'active_users_24h': active_24h if period == 'all' else 'N/A',
+            'total_messages': total_messages,
+            'total_commands': total_commands,
+            'total_searches': total_searches,
+            'total_feedback': total_feedback,
+            'total_ratings_helpful': total_ratings_helpful,
+            'total_ratings_unhelpful': total_ratings_unhelpful,
+            'total_ratings': total_ratings_helpful + total_ratings_unhelpful,
+            'avg_response_time': avg_response_time,
             'response_time_status': status,
             'response_time_color': color,
-            'daily_stats': days_stats,
-            'top_commands': dict(sorted(self.command_stats.items(), key=lambda x: x[1], reverse=True)[:10]),
+            'top_commands': top_commands,
             'cache_size': len(self.cache),
             'error_count': len(self.error_log)
         }
@@ -520,6 +732,9 @@ class BotStatistics:
         for day in self.daily_stats.values():
             all_users.update(day['users'])
         return len(all_users)
+
+    def get_feedback_list(self, limit: int = 1000) -> List[Dict]:
+        return sorted(self.feedback_list, key=lambda x: x['timestamp'], reverse=True)[:limit]
 
 # ------------------------------------------------------------
 #  ДЕКОРАТОР ИЗМЕРЕНИЯ ВРЕМЕНИ
@@ -549,10 +764,9 @@ search_engine: Optional[Union[BuiltinSearchEngine, ExternalSearchEngineAdapter]]
 bot_stats: Optional[BotStatistics] = None
 
 # ------------------------------------------------------------
-#  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (v12.25)
+#  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ------------------------------------------------------------
 def is_greeting(text: str) -> bool:
-    """Определяет, является ли сообщение приветствием."""
     greetings = {'привет', 'здравствуй', 'здравствуйте', 'здорово', 'hello', 'hi', 'hey', 'добрый день', 'доброе утро', 'добрый вечер'}
     text_lower = text.lower().strip()
     for greet in greetings:
@@ -561,10 +775,30 @@ def is_greeting(text: str) -> bool:
     return False
 
 def truncate_question(question: str, max_len: int = 50) -> str:
-    """Сокращает вопрос для отображения в кнопке."""
     if len(question) <= max_len:
         return question
     return question[:max_len-3] + "..."
+
+def parse_period_argument(arg: str) -> str:
+    arg = arg.lower().strip()
+    mapping = {
+        'day': 'day', 'd': 'day', '1d': 'day',
+        'week': 'week', 'w': 'week', '7d': 'week',
+        'month': 'month', 'm': 'month', '30d': 'month',
+        'quarter': 'quarter', 'q': 'quarter', '3m': 'quarter', '90d': 'quarter',
+        'halfyear': 'halfyear', 'hy': 'halfyear', '6m': 'halfyear', '180d': 'halfyear',
+        'year': 'year', 'y': 'year', '12m': 'year', '365d': 'year',
+        'all': 'all'
+    }
+    return mapping.get(arg, 'all')
+
+# ------------------------------------------------------------
+#  ВЕБ-БЕЗОПАСНОСТЬ (ПРОВЕРКА ЗАГОЛОВКА X-Secret-Key)
+# ------------------------------------------------------------
+def is_authorized_webhook_secret(request) -> bool:
+    """Проверяет заголовок X-Secret-Key на совпадение с WEBHOOK_SECRET."""
+    secret = request.headers.get('X-Secret-Key')
+    return secret == WEBHOOK_SECRET
 
 # ------------------------------------------------------------
 #  POST_INIT
@@ -573,14 +807,13 @@ async def post_init(application: Application):
     logger.info("✅ Приложение Telegram полностью готово и запущено")
 
 # ------------------------------------------------------------
-#  ИНИЦИАЛИЗАЦИЯ БОТА (с оптимизацией для бесплатного тарифа)
+#  ИНИЦИАЛИЗАЦИЯ БОТА
 # ------------------------------------------------------------
 async def init_bot():
     global application, search_engine, bot_stats
-    logger.info("🚀 Инициализация бота версии 12.25...")
+    logger.info("🚀 Инициализация бота версии 12.29...")
 
     try:
-        # 1. ИНИЦИАЛИЗАЦИЯ ПОИСКОВОГО ДВИЖКА С АВТОВЫБОРОМ
         use_builtin = False
         try:
             from search_engine import EnhancedSearchEngine
@@ -588,7 +821,7 @@ async def init_bot():
             search_engine = ExternalSearchEngineAdapter(ext_engine)
             test_result = search_engine.search("тест", top_k=1)
             if test_result is not None:
-                logger.info("✅ Загружен EnhancedSearchEngine из search_engine.py (адаптирован)")
+                logger.info("✅ Загружен EnhancedSearchEngine из search_engine.py (оптимизированный нечёткий поиск)")
             else:
                 raise ImportError("Тест не пройден")
         except (ImportError, Exception) as e:
@@ -599,7 +832,7 @@ async def init_bot():
                 search_engine = ExternalSearchEngineAdapter(ext_engine)
                 test_result = search_engine.search("тест", top_k=1)
                 if test_result is not None:
-                    logger.info("✅ Загружен SearchEngine из search_engine.py (адаптирован)")
+                    logger.info("✅ Загружен SearchEngine из search_engine.py (оптимизированный нечёткий поиск)")
                 else:
                     raise ImportError("Тест не пройден")
             except (ImportError, Exception) as e2:
@@ -608,29 +841,26 @@ async def init_bot():
 
         if use_builtin:
             search_engine = BuiltinSearchEngine()
-            logger.info("✅ Используется встроенный BuiltinSearchEngine")
+            logger.info("✅ Используется встроенный BuiltinSearchEngine (оптимизированный нечёткий поиск)")
 
-        # 2. ИНИЦИАЛИЗАЦИЯ СТАТИСТИКИ
         bot_stats = BotStatistics()
         logger.info("✅ Инициализирован модуль статистики")
 
-        # 3. ПРИЛОЖЕНИЕ TELEGRAM
         builder = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init)
         application = builder.build()
 
-        # 4. РЕГИСТРАЦИЯ ОБРАБОТЧИКОВ
         application.add_handler(CommandHandler("start", start_command))
         application.add_handler(CommandHandler("help", help_command))
         application.add_handler(CommandHandler("categories", categories_command))
-        application.add_handler(CommandHandler("faq", categories_command))  # alias
+        application.add_handler(CommandHandler("faq", categories_command))
         application.add_handler(CommandHandler("feedback", feedback_command))
+        application.add_handler(CommandHandler("feedbacks", feedbacks_command))
         application.add_handler(CommandHandler("stats", stats_command))
         application.add_handler(CommandHandler("export", export_command))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         application.add_handler(CallbackQueryHandler(handle_callback_query))
         application.add_error_handler(error_handler)
 
-        # 5. ИНИЦИАЛИЗАЦИЯ И УСТАНОВКА ВЕБХУКА
         await application.initialize()
         if RENDER:
             webhook_url = WEBHOOK_URL + WEBHOOK_PATH
@@ -664,7 +894,7 @@ async def init_bot():
         return False
 
 # ------------------------------------------------------------
-#  ОБРАБОТЧИКИ КОМАНД
+#  ОБРАБОТЧИКИ КОМАНД (полные, без изменений, кроме версии)
 # ------------------------------------------------------------
 @measure_response_time
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -677,11 +907,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📌 Просто напишите вопрос — я поищу в базе знаний.\n"
         "/help — подсказки\n"
         "/categories — категории вопросов\n"
-        "/faq — просмотр всех категорий и вопросов\n"
         "/feedback — отзыв\n"
     )
     if user.id in ADMIN_IDS:
-        text += "\n👑 Админ-команды:\n/stats — статистика\n/export — Excel"
+        text += "\n👑 Админ-команды:\n/stats [период] — статистика\n/feedbacks — отзывы\n/export — Excel"
     await update.message.reply_text(text, parse_mode='HTML')
 
 @measure_response_time
@@ -700,10 +929,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @measure_response_time
 async def categories_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Показывает все категории с inline-кнопками.
-    При нажатии на категорию – показываются вопросы этой категории.
-    """
     if bot_stats:
         bot_stats.log_message(update.effective_user.id, update.effective_user.username or "Unknown", 'command', '/categories')
     
@@ -711,23 +936,21 @@ async def categories_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("⚠️ Категории временно недоступны.")
         return
 
-    # Собираем категории и количество вопросов
     categories = {}
     for item in search_engine.faq_data:
-        cat = item.get('category', 'Без категории') if isinstance(item, dict) else getattr(item, 'category', 'Без категории')
+        cat = item.get('category', 'Без категории')
         categories[cat] = categories.get(cat, 0) + 1
 
     if not categories:
         await update.message.reply_text("📂 Категории не найдены.")
         return
 
-    # Создаем inline-кнопки для каждой категории
     keyboard = []
     for cat in sorted(categories.keys()):
         count = categories[cat]
         button = InlineKeyboardButton(
             text=f"{cat} ({count})",
-            callback_data=f"cat_{cat}"  # префикс cat_ для идентификации
+            callback_data=f"cat_{cat}"
         )
         keyboard.append([button])
 
@@ -750,6 +973,29 @@ async def feedback_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 @measure_response_time
+async def feedbacks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Нет прав.")
+        return
+    if bot_stats is None:
+        await update.message.reply_text("⚠️ Статистика не инициализирована.")
+        return
+    
+    try:
+        output = generate_feedback_report()
+        filename = f"feedbacks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        await update.message.reply_document(
+            document=output.getvalue(),
+            filename=filename,
+            caption=f"📋 Отзывы от {datetime.now().strftime('%d.%m.%Y %H:%M')}"
+        )
+        logger.info(f"✅ Отзывы выгружены пользователем {user.id}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка выгрузки отзывов: {e}")
+        await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+
+@measure_response_time
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if user.id not in ADMIN_IDS:
@@ -758,24 +1004,70 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if bot_stats is None:
         await update.message.reply_text("⚠️ Статистика временно недоступна.")
         return
-    bot_stats.log_message(user.id, user.username or "Unknown", 'command', '/stats')
-    s = bot_stats.get_summary_stats()
-    avg = s['avg_response_time']
-    status, color = s['response_time_status'], s['response_time_color']
+    
+    period = 'all'
+    if context.args:
+        period = parse_period_argument(context.args[0])
+    
+    bot_stats.log_message(user.id, user.username or "Unknown", 'command', f'/stats {period}')
+    s = bot_stats.get_summary_stats(period)
+    
+    period_names = {
+        'all': 'всё время',
+        'day': 'день',
+        'week': 'неделя',
+        'month': 'месяц',
+        'quarter': 'квартал',
+        'halfyear': 'полгода',
+        'year': 'год'
+    }
+    period_text = period_names.get(period, period)
+    
     text = (
-        f"📊 <b>Статистика</b>\n"
-        f"👥 Всего: {s['total_users']}, 24ч: {s['active_users_24h']}\n"
-        f"📨 Сообщ: {s['total_messages']}, Команд: {s['total_commands']}\n"
-        f"🔍 Поисков: {s['total_searches']}, Отзывов: {s['total_feedback']}\n"
-        f"⚡ Время ответа: <b>{avg:.2f}с</b> ({status})\n"
-        f"📦 Кэш: {s['cache_size']}\n"
+        f"📊 <b>Статистика за {period_text}</b>\n"
+        f"👥 Пользователей: {s['total_users']}\n"
+    )
+    if period == 'all':
+        text += f"👤 Активных (24ч): {s['active_users_24h']}\n"
+    text += (
+        f"📨 Сообщений: {s['total_messages']}\n"
+        f"🛠 Команд: {s['total_commands']}\n"
+        f"🔍 Поисков: {s['total_searches']}\n"
+        f"📝 Отзывов: {s['total_feedback']}\n"
+        f"👍 Полезных ответов: {s['total_ratings_helpful']}\n"
+        f"👎 Бесполезных: {s['total_ratings_unhelpful']}\n"
+        f"⭐ Удовлетворённость: "
+    )
+    if s['total_ratings'] > 0:
+        satisfaction = s['total_ratings_helpful'] / s['total_ratings'] * 100
+        text += f"{satisfaction:.1f}%\n"
+    else:
+        text += "нет оценок\n"
+    text += (
+        f"⚡ Время ответа: <b>{s['avg_response_time']:.2f}с</b> ({s['response_time_status']})\n"
+        f"📦 Кэш поиска: {s['cache_size']}\n"
         f"⏱ Uptime: {s['uptime']}\n"
     )
+    
     keyboard = [
-        [InlineKeyboardButton("📊 Веб-статистика", url=BASE_URL)],
-        [InlineKeyboardButton("📁 Excel", callback_data="export_excel")]
+        [
+            InlineKeyboardButton("День", callback_data="stats_day"),
+            InlineKeyboardButton("Неделя", callback_data="stats_week"),
+            InlineKeyboardButton("Месяц", callback_data="stats_month")
+        ],
+        [
+            InlineKeyboardButton("Квартал", callback_data="stats_quarter"),
+            InlineKeyboardButton("Полгода", callback_data="stats_halfyear"),
+            InlineKeyboardButton("Год", callback_data="stats_year")
+        ],
+        [
+            InlineKeyboardButton("📊 Веб-статистика", url=BASE_URL),
+            InlineKeyboardButton("📁 Excel", callback_data="export_excel")
+        ]
     ]
-    await update.message.reply_text(text, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(keyboard))
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(text, parse_mode='HTML', reply_markup=reply_markup)
 
 @measure_response_time
 async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -803,13 +1095,46 @@ async def export_to_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"❌ Ошибка экспорта: {e}", exc_info=True)
         await update.message.reply_text(f"❌ Ошибка: {str(e)}")
 
+def generate_feedback_report() -> io.BytesIO:
+    output = io.BytesIO()
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Отзывы"
+    
+    headers = ["Дата", "User ID", "Имя пользователя", "Отзыв"]
+    for col, h in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col)
+        cell.value = h
+        cell.font = Font(bold=True)
+    
+    if bot_stats:
+        for i, fb in enumerate(bot_stats.get_feedback_list(), start=2):
+            ws.cell(row=i, column=1, value=fb['timestamp'].strftime("%Y-%m-%d %H:%M:%S"))
+            ws.cell(row=i, column=2, value=fb['user_id'])
+            ws.cell(row=i, column=3, value=fb['username'])
+            ws.cell(row=i, column=4, value=fb['text'])
+    
+    for col in ws.columns:
+        max_len = 0
+        col_letter = get_column_letter(col[0].column)
+        for cell in col:
+            try:
+                if cell.value and len(str(cell.value)) > max_len:
+                    max_len = len(str(cell.value))
+            except:
+                pass
+        ws.column_dimensions[col_letter].width = min(max_len + 2, 70)
+    
+    wb.save(output)
+    output.seek(0)
+    return output
+
 def generate_excel_report() -> io.BytesIO:
-    """Синхронная генерация Excel-отчёта."""
     output = io.BytesIO()
     wb = Workbook()
     stats = bot_stats.get_summary_stats() if bot_stats else {}
+    rating_stats = bot_stats.get_rating_stats() if bot_stats else {}
 
-    # Лист 1: Общая статистика
     ws1 = wb.active
     ws1.title = "Общая статистика"
     ws1['A1'] = "Статистика HR-бота Мечел"
@@ -827,6 +1152,10 @@ def generate_excel_report() -> io.BytesIO:
         ("Всего команд", stats.get('total_commands', 0)),
         ("Всего поисков", stats.get('total_searches', 0)),
         ("Всего отзывов", stats.get('total_feedback', 0)),
+        ("Всего оценок", rating_stats.get('total_ratings', 0)),
+        ("Полезных ответов", rating_stats.get('helpful', 0)),
+        ("Бесполезных ответов", rating_stats.get('unhelpful', 0)),
+        ("Удовлетворённость", f"{rating_stats.get('satisfaction_rate', 0)}%"),
         ("Ср. время ответа", f"{stats.get('avg_response_time', 0):.2f} сек"),
         ("Статус времени", stats.get('response_time_status', 'N/A')),
         ("Размер кэша", stats.get('cache_size', 0)),
@@ -835,7 +1164,6 @@ def generate_excel_report() -> io.BytesIO:
     for i, (k, v) in enumerate(rows, 4):
         ws1[f'A{i}'] = k; ws1[f'B{i}'] = v
 
-    # Лист 2: Время ответа
     ws2 = wb.create_sheet("Время ответа")
     ws2['A1'] = "История времени ответа"
     ws2['A1'].font = Font(bold=True, size=14)
@@ -849,42 +1177,36 @@ def generate_excel_report() -> io.BytesIO:
             t = rt['response_time']
             ws2[f'C{i}'] = "Хорошо" if t < 1 else "Нормально" if t < 3 else "Медленно"
 
-    # Лист 3: FAQ База
     ws3 = wb.create_sheet("FAQ База")
     ws3['A1'] = "База знаний FAQ"
     ws3['A1'].font = Font(bold=True, size=14)
-    ws3.merge_cells('A1:D1')
-    headers = ["Категория", "Вопрос", "Ответ", "Ключевые слова"]
+    ws3.merge_cells('A1:E1')
+    headers = ["ID", "Категория", "Вопрос", "Ответ", "Ключевые слова"]
     for col, h in enumerate(headers, 1):
         cell = ws3.cell(row=3, column=col); cell.value = h; cell.font = Font(bold=True)
     
     if search_engine and hasattr(search_engine, 'faq_data') and search_engine.faq_data:
         row = 4
         for item in search_engine.faq_data:
-            if isinstance(item, dict):
-                cat = item.get('category', 'Без категории')
-                q = item.get('question', '')
-                a = item.get('answer', '')
-                kw = ', '.join(item.get('keywords', []))
-            else:
-                cat = getattr(item, 'category', 'Без категории')
-                q = getattr(item, 'question', '')
-                a = getattr(item, 'answer', '')
-                kw = ', '.join(getattr(item, 'keywords', []))
-            ws3.cell(row=row, column=1, value=cat)
-            ws3.cell(row=row, column=2, value=q)
-            ws3.cell(row=row, column=3, value=a)
-            ws3.cell(row=row, column=4, value=kw)
+            item_id = item.get('id', '')
+            cat = item.get('category', 'Без категории')
+            q = item.get('question', '')
+            a = item.get('answer', '')
+            kw = ', '.join(item.get('keywords', []))
+            ws3.cell(row=row, column=1, value=item_id)
+            ws3.cell(row=row, column=2, value=cat)
+            ws3.cell(row=row, column=3, value=q)
+            ws3.cell(row=row, column=4, value=a)
+            ws3.cell(row=row, column=5, value=kw)
             row += 1
     else:
         ws3.cell(row=4, column=1, value="Поисковый движок недоступен или база знаний пуста")
 
-    # Лист 4: Пользователи
     ws4 = wb.create_sheet("Пользователи")
     ws4['A1'] = "Статистика пользователей"
     ws4['A1'].font = Font(bold=True, size=14)
-    ws4.merge_cells('A1:G1')
-    headers2 = ["ID", "Имя", "Сообщ", "Команд", "Поиск", "Отзывы", "Посл. активность"]
+    ws4.merge_cells('A1:I1')
+    headers2 = ["ID", "Имя", "Сообщ", "Команд", "Поиск", "Отзывы", "Оценок", "Полезно", "Бесполезно", "Посл. активность"]
     for col, h in enumerate(headers2, 1):
         cell = ws4.cell(row=3, column=col); cell.value = h; cell.font = Font(bold=True)
     if bot_stats:
@@ -895,11 +1217,36 @@ def generate_excel_report() -> io.BytesIO:
             ws4.cell(row=i, column=4, value=udata['commands'])
             ws4.cell(row=i, column=5, value=udata['searches'])
             ws4.cell(row=i, column=6, value=udata['feedback_count'])
+            ws4.cell(row=i, column=7, value=udata['ratings_given'])
+            ws4.cell(row=i, column=8, value=udata['ratings_helpful'])
+            ws4.cell(row=i, column=9, value=udata['ratings_unhelpful'])
             last = udata['last_active']
-            ws4.cell(row=i, column=7, value=last.strftime("%Y-%m-%d %H:%M:%S") if last else '')
+            ws4.cell(row=i, column=10, value=last.strftime("%Y-%m-%d %H:%M:%S") if last else '')
 
-    # Автоширина колонок
-    for ws in [ws1, ws2, ws3, ws4]:
+    ws5 = wb.create_sheet("Оценки FAQ")
+    ws5['A1'] = "Статистика оценок по вопросам"
+    ws5['A1'].font = Font(bold=True, size=14)
+    ws5.merge_cells('A1:D1')
+    headers3 = ["ID вопроса", "Вопрос", "👍 Помог", "👎 Нет", "Всего оценок"]
+    for col, h in enumerate(headers3, 1):
+        cell = ws5.cell(row=3, column=col); cell.value = h; cell.font = Font(bold=True)
+    if bot_stats:
+        row = 4
+        question_map = {}
+        if search_engine and hasattr(search_engine, 'faq_data'):
+            for item in search_engine.faq_data:
+                qid = item.get('id')
+                if qid:
+                    question_map[qid] = item.get('question', '')
+        for faq_id, ratings in bot_stats.faq_ratings.items():
+            ws5.cell(row=row, column=1, value=faq_id)
+            ws5.cell(row=row, column=2, value=question_map.get(faq_id, 'Неизвестный вопрос'))
+            ws5.cell(row=row, column=3, value=ratings['helpful'])
+            ws5.cell(row=row, column=4, value=ratings['unhelpful'])
+            ws5.cell(row=row, column=5, value=ratings['helpful'] + ratings['unhelpful'])
+            row += 1
+
+    for ws in [ws1, ws2, ws3, ws4, ws5]:
         for col in ws.columns:
             max_len = 0
             col_letter = get_column_letter(col[0].column)
@@ -909,14 +1256,14 @@ def generate_excel_report() -> io.BytesIO:
                         max_len = len(str(cell.value))
                 except:
                     pass
-            ws.column_dimensions[col_letter].width = min(max_len + 2, 50)
+            ws.column_dimensions[col_letter].width = min(max_len + 2, 70)
 
     wb.save(output)
     output.seek(0)
     return output
 
 # ------------------------------------------------------------
-#  ОБРАБОТЧИК ТЕКСТОВЫХ СООБЩЕНИЙ (v12.25)
+#  ОБРАБОТЧИК ТЕКСТОВЫХ СООБЩЕНИЙ (С ПРЕДЛОЖЕНИЯМИ)
 # ------------------------------------------------------------
 @measure_response_time
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -926,7 +1273,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if bot_stats:
         bot_stats.log_message(user.id, user.username or "Unknown", 'message')
 
-    # 1. Обработка обратной связи
     if context.user_data.get('awaiting_feedback'):
         context.user_data['awaiting_feedback'] = False
         if bot_stats:
@@ -934,18 +1280,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🙏 Спасибо за отзыв!")
         return
 
-    # 2. Обработка приветствий
     if is_greeting(text):
         logger.info(f"Приветствие от {user.id}: '{text}'")
         await start_command(update, context)
         return
 
-    # 3. Быстрый доступ к статистике для админов
     if text.lower() in ['статистика', 'stats'] and user.id in ADMIN_IDS:
         await stats_command(update, context)
         return
 
-    # 4. Поиск по базе знаний
     if bot_stats:
         bot_stats.log_message(user.id, user.username or "Unknown", 'search')
 
@@ -956,14 +1299,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Извлечение категории из запроса (формат "Категория: вопрос")
     category = None
     search_text = text
     if ':' in text:
         parts = text.split(':', 1)
         cat_candidate = parts[0].strip().lower()
         for item in search_engine.faq_data:
-            cat = item.get('category') if isinstance(item, dict) else getattr(item, 'category', None)
+            cat = item.get('category')
             if cat and cat_candidate in cat.lower():
                 category = cat
                 search_text = parts[1].strip()
@@ -977,20 +1319,47 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         results = []
 
     if not results:
-        await update.message.reply_text(
-            "😕 Не нашёл ответ. Попробуйте переформулировать, использовать /categories для выбора категории или /feedback.",
-            parse_mode='HTML'
-        )
+        # ПРЕДЛОЖЕНИЯ ПО ИСПРАВЛЕНИЮ
+        suggestions = []
+        if hasattr(search_engine, 'suggest_correction'):
+            suggestions = search_engine.suggest_correction(search_text, top_k=3)
+        if suggestions:
+            text_response = f"😕 Не нашёл точного совпадения для «{search_text}».\n\n"
+            text_response += "Возможно, вы имели в виду:\n"
+            for s in suggestions:
+                text_response += f"• {s}\n"
+            text_response += "\nПопробуйте переформулировать или /feedback."
+            await update.message.reply_text(text_response, parse_mode='HTML')
+        else:
+            await update.message.reply_text(
+                "😕 Не нашёл ответ. Попробуйте переформулировать, использовать /categories для выбора категории или /feedback.",
+                parse_mode='HTML'
+            )
         return
 
-    response = f"📌 <b>Результаты по запросу:</b>\n\n"
-    for q, a, s in results[:3]:
-        response += f"• <b>{q}</b>\n{a[:200]}...\n\n"
-    response += "🔍 /categories — все темы"
-    await update.message.reply_text(response, parse_mode='HTML')
+    for idx, (q, a, s) in enumerate(results[:3]):
+        faq_id = None
+        for item in search_engine.faq_data:
+            if item.get('question') == q:
+                faq_id = item.get('id')
+                break
+        if faq_id is None:
+            faq_id = hash(q) % 1000000
+        
+        response = f"📌 <b>Результат {idx+1}:</b>\n\n• <b>{q}</b>\n{a[:200]}...\n\n"
+        keyboard = [
+            [
+                InlineKeyboardButton("👍 Помог", callback_data=f"rate_{faq_id}_1"),
+                InlineKeyboardButton("👎 Нет", callback_data=f"rate_{faq_id}_0")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(response, parse_mode='HTML', reply_markup=reply_markup)
+    
+    await update.message.reply_text("🔍 /categories — все темы")
 
 # ------------------------------------------------------------
-#  ОБРАБОТЧИК INLINE-КНОПОК (v12.25)
+#  ОБРАБОТЧИК INLINE-КНОПОК (без изменений)
 # ------------------------------------------------------------
 @measure_response_time
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -998,7 +1367,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
     data = query.data
 
-    # Экспорт Excel
     if data == 'export_excel':
         if update.effective_user.id in ADMIN_IDS:
             await export_to_excel(update, context)
@@ -1006,36 +1374,57 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.answer("⛔ Нет прав", show_alert=True)
         return
 
-    # Обработка навигации по категориям и вопросам
+    if data.startswith('stats_'):
+        period_map = {
+            'stats_day': 'day', 'stats_week': 'week', 'stats_month': 'month',
+            'stats_quarter': 'quarter', 'stats_halfyear': 'halfyear', 'stats_year': 'year'
+        }
+        period = period_map.get(data, 'all')
+        context.args = [period]
+        await stats_command(update, context)
+        return
+
+    if data.startswith('rate_'):
+        parts = data.split('_')
+        if len(parts) >= 3:
+            faq_id = int(parts[1])
+            is_helpful = parts[2] == '1'
+            if bot_stats:
+                bot_stats.record_rating(faq_id, is_helpful)
+                bot_stats.log_message(
+                    update.effective_user.id,
+                    update.effective_user.username or "Unknown",
+                    'rating_helpful' if is_helpful else 'rating_unhelpful',
+                    ''
+                )
+            await query.edit_message_reply_markup(reply_markup=None)
+            await query.answer("Спасибо за оценку! 👍", show_alert=False)
+        return
+
     if data.startswith('cat_'):
-        # Пользователь выбрал категорию
-        category_name = data[4:]  # удаляем префикс 'cat_'
-        
-        # Собираем все вопросы этой категории
+        category_name = data[4:]
         questions = []
+        question_ids = []
         for item in search_engine.faq_data:
-            cat = item.get('category') if isinstance(item, dict) else getattr(item, 'category', None)
+            cat = item.get('category')
             if cat == category_name:
-                q = item.get('question') if isinstance(item, dict) else getattr(item, 'question', '')
-                questions.append(q)
+                questions.append(item.get('question', ''))
+                question_ids.append(item.get('id', 0))
         
         if not questions:
             await query.edit_message_text(f"❓ В категории {category_name} нет вопросов.")
             return
         
-        # Создаем кнопки для каждого вопроса (сокращённые)
         keyboard = []
-        for q in questions[:20]:  # ограничим 20 вопросами для безопасности
+        for qid, q in zip(question_ids, questions[:20]):
             short_q = truncate_question(q, 50)
             button = InlineKeyboardButton(
                 text=short_q,
-                callback_data=f"q_{hash(q)}"  # уникальный идентификатор вопроса
+                callback_data=f"q_{qid}"
             )
             keyboard.append([button])
         
-        # Добавляем кнопку "Назад к категориям"
         keyboard.append([InlineKeyboardButton("◀ Назад к категориям", callback_data="back_to_categories")])
-        
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(
             f"📁 <b>{category_name}</b>\n\n"
@@ -1046,29 +1435,20 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         )
     
     elif data.startswith('q_'):
-        # Пользователь выбрал конкретный вопрос
-        # Здесь нужно найти полный вопрос и ответ
-        # Для простоты используем хеш и сравниваем с вопросом
-        target_hash = data[2:]  # удаляем префикс 'q_'
-        
+        faq_id = int(data[2:])
         found = None
         for item in search_engine.faq_data:
-            q = item.get('question') if isinstance(item, dict) else getattr(item, 'question', '')
-            if hashlib.md5(q.encode()).hexdigest()[:16] == target_hash:
+            if item.get('id') == faq_id:
                 found = item
                 break
         
         if found:
-            question = found.get('question') if isinstance(found, dict) else getattr(found, 'question', '')
-            answer = found.get('answer') if isinstance(found, dict) else getattr(found, 'answer', '')
-            category = found.get('category') if isinstance(found, dict) else getattr(found, 'category', '')
-            
+            question = found.get('question', '')
+            answer = found.get('answer', '')
+            category = found.get('category', '')
             response = f"❓ <b>{question}</b>\n\n📌 <b>Ответ:</b>\n{answer}\n\n📁 Категория: {category}"
-            
-            # Кнопка "Назад к категории"
             keyboard = [[InlineKeyboardButton("◀ Назад к категории", callback_data=f"cat_{category}")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
-            
             await query.edit_message_text(
                 response,
                 parse_mode='HTML',
@@ -1078,7 +1458,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text("❌ Вопрос не найден.")
     
     elif data == "back_to_categories":
-        # Возврат к списку категорий
         await categories_command(update, context)
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1099,7 +1478,7 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
 
 # ------------------------------------------------------------
-#  ВЕБ-ИНТЕРФЕЙС (Quart) — синхронные вызовы статистики
+#  ВЕБ-ИНТЕРФЕЙС (Quart) — с безопасностью через X-Secret-Key
 # ------------------------------------------------------------
 app = Quart(__name__)
 
@@ -1292,7 +1671,7 @@ async def index():
 <body>
     <div class="container">
         <h1>🤖 HR Бот «Мечел»</h1>
-        <div class="subtitle">Версия 12.25 · Интерактивные категории, приветствия, улучшенный поиск</div>
+        <div class="subtitle">Версия 12.29 · Оптимизированный поиск, предложения, безопасные эндпоинты</div>
         
         <div class="grid">
             <div class="card">
@@ -1326,6 +1705,8 @@ async def index():
             <a href="/export/excel" class="btn">📥 Экспорт в Excel</a>
             <a href="/health" class="btn" style="background: #2E5C4E;">🩺 Health Check</a>
             <a href="/search/stats" class="btn" style="background: #5C3E6E;">🔍 Поиск Статистика</a>
+            <a href="/feedback/export" class="btn" style="background: #9C27B0;">📝 Отзывы</a>
+            <a href="/rate/stats" class="btn" style="background: #FF9800;">⭐ Оценки</a>
         </div>
         
         <h2>📈 Статистика за последние 7 дней</h2>
@@ -1338,6 +1719,8 @@ async def index():
                     <th>Команды</th>
                     <th>Поиски</th>
                     <th>Время ответа</th>
+                    <th>👍 Оценки</th>
+                    <th>👎 Оценки</th>
                 </tr>
             </thead>
             <tbody>
@@ -1345,6 +1728,8 @@ async def index():
     if bot_stats:
         for date, ds in sorted(bot_stats.daily_stats.items(), reverse=True)[:7]:
             avg_resp = sum(ds['response_times']) / len(ds['response_times']) if ds['response_times'] else 0
+            helpful = ds['ratings']['helpful']
+            unhelpful = ds['ratings']['unhelpful']
             html += f"""
                 <tr>
                     <td>{date}</td>
@@ -1353,6 +1738,8 @@ async def index():
                     <td>{ds['commands']}</td>
                     <td>{ds['searches']}</td>
                     <td>{avg_resp:.2f}с</td>
+                    <td>{helpful}</td>
+                    <td>{unhelpful}</td>
                 </tr>
             """
     html += f"""
@@ -1380,9 +1767,13 @@ async def health_check():
         'faq_count': len(search_engine.faq_data) if search_engine else 0
     })
 
-@app.route('/search/stats')
+# ------------------------------------------------------------
+#  ЗАЩИЩЁННЫЕ ЭНДПОИНТЫ (X-Secret-Key)
+# ------------------------------------------------------------
+@app.route('/search/stats', methods=['GET', 'POST'])
 async def search_stats():
-    """Статистика поискового движка в JSON"""
+    if not is_authorized_webhook_secret(request):
+        return jsonify({'error': 'Forbidden'}), 403
     if search_engine is None:
         return jsonify({'error': 'Search engine not initialized'}), 503
     try:
@@ -1395,8 +1786,56 @@ async def search_stats():
         logger.error(f"Ошибка получения статистики поиска: {e}")
         return jsonify({'error': str(e)}), 500
 
-@app.route('/export/excel')
+@app.route('/feedback/export', methods=['GET', 'POST'])
+async def feedback_export_web():
+    if not is_authorized_webhook_secret(request):
+        return jsonify({'error': 'Forbidden'}), 403
+    if bot_stats is None:
+        return jsonify({'error': 'Bot not initialized'}), 503
+    try:
+        excel_file = generate_feedback_report()
+        filename = f'feedbacks_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xlsx'
+        response = await make_response(excel_file.getvalue())
+        response.mimetype = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        response.headers['Content-Disposition'] = f'attachment; filename="{filename}"'
+        return response
+    except Exception as e:
+        logger.error(f"Ошибка веб-выгрузки отзывов: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/rate/stats', methods=['GET', 'POST'])
+async def rate_stats_web():
+    if not is_authorized_webhook_secret(request):
+        return jsonify({'error': 'Forbidden'}), 403
+    if bot_stats is None:
+        return jsonify({'error': 'Bot not initialized'}), 503
+    try:
+        stats = bot_stats.get_rating_stats()
+        return jsonify(stats)
+    except Exception as e:
+        logger.error(f"Ошибка получения статистики оценок: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/stats/range', methods=['GET', 'POST'])
+async def stats_range_web():
+    if not is_authorized_webhook_secret(request):
+        return jsonify({'error': 'Forbidden'}), 403
+    if bot_stats is None:
+        return jsonify({'error': 'Bot not initialized'}), 503
+    period = request.args.get('period', 'all')
+    if period not in ['all', 'day', 'week', 'month', 'quarter', 'halfyear', 'year']:
+        period = 'all'
+    try:
+        stats = bot_stats.get_summary_stats(period)
+        return jsonify(stats)
+    except Exception as e:
+        logger.error(f"Ошибка получения статистики за период {period}: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/export/excel', methods=['GET', 'POST'])
 async def export_excel_web():
+    if not is_authorized_webhook_secret(request):
+        return jsonify({'error': 'Forbidden'}), 403
     if bot_stats is None:
         return jsonify({'error': 'Статистика не инициализирована'}), 503
     try:

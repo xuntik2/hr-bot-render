@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 Telegram-бот для HR-отдела компании "Мечел"
-Версия 12.29 — оптимизированный поиск, предложения по исправлению запросов,
-безопасные веб-эндпоинты (X-Secret-Key), ограничение отзывов.
-Полная совместимость с search_engine.py v4.5, оптимизация для Render Free.
+Версия 12.30 — исправление ошибок callback_query, русские команды,
+эмодзи-приветствия, веб-редактор FAQ, безопасные эндпоинты (key + header).
+Полная совместимость с search_engine.py v4.6, оптимизация для Render Free.
 """
 
 import os
@@ -52,7 +52,7 @@ check_critical_dependencies()
 # ------------------------------------------------------------
 #  ИМПОРТЫ
 # ------------------------------------------------------------
-from quart import Quart, request, jsonify, make_response
+from quart import Quart, request, jsonify, make_response, render_template_string
 import hypercorn
 from hypercorn.config import Config
 from hypercorn.asyncio import serve
@@ -266,7 +266,6 @@ class BuiltinSearchEngine:
         return ' '.join(norm)
 
     def _quick_match(self, norm_query: str, item: Dict[str, Any]) -> bool:
-        """Быстрая проверка (аналог внешнего движка)."""
         if not norm_query:
             return False
         q_words = set(norm_query.split())
@@ -282,7 +281,6 @@ class BuiltinSearchEngine:
         return False
 
     def _calculate_full_score(self, norm_query: str, item: Dict[str, Any]) -> float:
-        """Полный расчёт релевантности с Левенштейном."""
         score = 0.0
         norm_question = self._normalize_query(item['question'])
         norm_answer = self._normalize_query(item['answer'])
@@ -323,7 +321,6 @@ class BuiltinSearchEngine:
                 if norm_keywords and word in norm_keywords:
                     score += 5.0
 
-        # Бонус за совпадение в ответе
         if norm_answer:
             a_score = self._calc_score_simple(norm_query, norm_answer) * 0.5
             score += a_score
@@ -349,12 +346,10 @@ class BuiltinSearchEngine:
         if not norm_q:
             return []
 
-        # Фильтр по категории (простой)
         filtered = self.faq_data
         if category:
             filtered = [item for item in self.faq_data if item.get('category') == category]
 
-        # Быстрая предфильтрация
         preliminary = []
         for item in filtered:
             if self._quick_match(norm_q, item):
@@ -362,7 +357,6 @@ class BuiltinSearchEngine:
         if not preliminary:
             preliminary = filtered[:20]
 
-        # Базовая оценка для кандидатов
         candidates = []
         for item in preliminary[:20]:
             q_words = set(norm_q.split())
@@ -398,7 +392,6 @@ class BuiltinSearchEngine:
         return top
 
     def suggest_correction(self, query: str, top_k: int = 3) -> List[str]:
-        """Предлагает исправления для запроса без результатов."""
         if not query or not self.faq_data:
             return []
         norm_query = self._normalize_query(query)
@@ -414,8 +407,14 @@ class BuiltinSearchEngine:
         candidates.sort(key=lambda x: x[1])
         return [q for q, _ in candidates[:top_k]]
 
+    def refresh_data(self):
+        self.faq_data = self._load_faq_data()
+        self.cache.clear()
+        self.cache_ttl.clear()
+        logger.info("🔄 BuiltinSearchEngine: данные обновлены")
+
 # ------------------------------------------------------------
-#  АДАПТЕР ДЛЯ ВНЕШНЕГО SEARCH ENGINE (без изменений, совместим)
+#  АДАПТЕР ДЛЯ ВНЕШНЕГО SEARCH ENGINE (С ПРОБРОСОМ refresh_data)
 # ------------------------------------------------------------
 class ExternalSearchEngineAdapter:
     def __init__(self, external_engine):
@@ -508,14 +507,18 @@ class ExternalSearchEngineAdapter:
             return normalized
         return []
 
-    # Проброс метода suggest_correction, если он есть во внешнем движке
     def suggest_correction(self, query: str, top_k: int = 3) -> List[str]:
         if hasattr(self._engine, 'suggest_correction'):
             return self._engine.suggest_correction(query, top_k)
         return []
 
+    def refresh_data(self):
+        if hasattr(self._engine, 'refresh_data'):
+            self._engine.refresh_data()
+            logger.info("🔄 ExternalSearchEngineAdapter: данные обновлены во внешнем движке")
+
 # ------------------------------------------------------------
-#  КЛАСС СТАТИСТИКИ (С ОГРАНИЧЕНИЕМ ОТЗЫВОВ)
+#  КЛАСС СТАТИСТИКИ
 # ------------------------------------------------------------
 class BotStatistics:
     def __init__(self, max_history_days: int = 90):
@@ -542,7 +545,7 @@ class BotStatistics:
         })
         self.command_stats = defaultdict(int)
         self.feedback_list = []
-        self.max_feedback = 10000  # храним не более 10 000 отзывов
+        self.max_feedback = 10000
         self.error_log = deque(maxlen=1000)
         self.response_times = deque(maxlen=100)
         self.cache = {}
@@ -616,7 +619,6 @@ class BotStatistics:
                 'text': text,
                 'timestamp': now
             })
-            # ОГРАНИЧЕНИЕ РАЗМЕРА СПИСКА ОТЗЫВОВ
             if len(self.feedback_list) > self.max_feedback:
                 self.feedback_list = self.feedback_list[-self.max_feedback:]
         elif msg_type == 'rating_helpful':
@@ -764,13 +766,31 @@ search_engine: Optional[Union[BuiltinSearchEngine, ExternalSearchEngineAdapter]]
 bot_stats: Optional[BotStatistics] = None
 
 # ------------------------------------------------------------
+#  БЛОКИРОВКА ДЛЯ РАБОТЫ С FAQ.JSON (конкурентная запись)
+# ------------------------------------------------------------
+faq_lock = asyncio.Lock()
+
+# ------------------------------------------------------------
 #  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ------------------------------------------------------------
 def is_greeting(text: str) -> bool:
-    greetings = {'привет', 'здравствуй', 'здравствуйте', 'здорово', 'hello', 'hi', 'hey', 'добрый день', 'доброе утро', 'добрый вечер'}
-    text_lower = text.lower().strip()
+    """Определяет, является ли сообщение приветствием (включая эмодзи)."""
+    text_clean = text.lower().strip()
+    # Текстовые приветствия
+    greetings = {
+        'привет', 'здравствуй', 'здравствуйте', 'здорово', 'hello', 'hi', 'hey',
+        'добрый день', 'доброе утро', 'добрый вечер', 'доброй ночи', 'доброго времени суток',
+        'ку', 'салют', 'хай', 'хелло', 'хэллоу'
+    }
+    # Эмодзи-приветствия (набор символов)
+    emoji_greetings = {'👋', '🙋', '🙌', '🤝', '✋', '🖐', '👐', '🤗', '😊', '😀', '😄', '😁', '😃'}
+    
     for greet in greetings:
-        if greet in text_lower or text_lower == greet:
+        if greet in text_clean or text_clean == greet:
+            return True
+    # Проверка на наличие эмодзи приветствия
+    for emoji in emoji_greetings:
+        if emoji in text:
             return True
     return False
 
@@ -793,12 +813,68 @@ def parse_period_argument(arg: str) -> str:
     return mapping.get(arg, 'all')
 
 # ------------------------------------------------------------
-#  ВЕБ-БЕЗОПАСНОСТЬ (ПРОВЕРКА ЗАГОЛОВКА X-Secret-Key)
+#  ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ ОТПРАВКИ/РЕДАКТИРОВАНИЯ СООБЩЕНИЙ
 # ------------------------------------------------------------
-def is_authorized_webhook_secret(request) -> bool:
-    """Проверяет заголовок X-Secret-Key на совпадение с WEBHOOK_SECRET."""
+async def _reply_or_edit(update: Update, text: str, parse_mode: str = 'HTML', reply_markup=None):
+    """
+    Универсальная отправка ответа:
+    - если update.message существует -> reply_text
+    - если update.callback_query существует -> edit_message_text
+    """
+    if update.message:
+        return await update.message.reply_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
+    elif update.callback_query:
+        await update.callback_query.edit_message_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
+        return None
+    else:
+        logger.error("Не удалось определить тип update для отправки сообщения")
+
+# ------------------------------------------------------------
+#  ВЕБ-БЕЗОПАСНОСТЬ (ПРОВЕРКА ЗАГОЛОВКА X-Secret-Key ИЛИ ПАРАМЕТРА key)
+# ------------------------------------------------------------
+def is_authorized(request) -> bool:
+    """Проверка авторизации: заголовок X-Secret-Key или параметр URL key."""
+    # Проверка заголовка
     secret = request.headers.get('X-Secret-Key')
-    return secret == WEBHOOK_SECRET
+    if secret == WEBHOOK_SECRET:
+        return True
+    # Проверка параметра URL
+    key = request.args.get('key')
+    if key == WEBHOOK_SECRET:
+        return True
+    return False
+
+# ------------------------------------------------------------
+#  РАБОТА С FAQ.JSON (CRUD)
+# ------------------------------------------------------------
+async def load_faq_json():
+    """Загружает FAQ из faq.json."""
+    try:
+        async with faq_lock:
+            with open('faq.json', 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        logger.error(f"Ошибка загрузки faq.json: {e}")
+        return []
+
+async def save_faq_json(data: List[Dict]):
+    """Сохраняет FAQ в faq.json (с блокировкой)."""
+    async with faq_lock:
+        with open('faq.json', 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    # Оповещаем поисковый движок о необходимости перезагрузки
+    if search_engine and hasattr(search_engine, 'refresh_data'):
+        search_engine.refresh_data()
+
+async def get_next_faq_id() -> int:
+    """Возвращает следующий свободный ID для новой записи."""
+    data = await load_faq_json()
+    if not data:
+        return 1
+    max_id = max((item.get('id', 0) for item in data), default=0)
+    return max_id + 1
 
 # ------------------------------------------------------------
 #  POST_INIT
@@ -811,7 +887,7 @@ async def post_init(application: Application):
 # ------------------------------------------------------------
 async def init_bot():
     global application, search_engine, bot_stats
-    logger.info("🚀 Инициализация бота версии 12.29...")
+    logger.info("🚀 Инициализация бота версии 12.30...")
 
     try:
         use_builtin = False
@@ -849,14 +925,23 @@ async def init_bot():
         builder = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init)
         application = builder.build()
 
+        # --- РЕГИСТРАЦИЯ КОМАНД (английские + русские алиасы) ---
         application.add_handler(CommandHandler("start", start_command))
+        application.add_handler(CommandHandler("старт", start_command))
         application.add_handler(CommandHandler("help", help_command))
+        application.add_handler(CommandHandler("помощь", help_command))
         application.add_handler(CommandHandler("categories", categories_command))
+        application.add_handler(CommandHandler("категории", categories_command))
         application.add_handler(CommandHandler("faq", categories_command))
         application.add_handler(CommandHandler("feedback", feedback_command))
+        application.add_handler(CommandHandler("отзыв", feedback_command))
         application.add_handler(CommandHandler("feedbacks", feedbacks_command))
+        application.add_handler(CommandHandler("отзывы", feedbacks_command))
         application.add_handler(CommandHandler("stats", stats_command))
+        application.add_handler(CommandHandler("статистика", stats_command))
         application.add_handler(CommandHandler("export", export_command))
+        application.add_handler(CommandHandler("экспорт", export_command))
+
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         application.add_handler(CallbackQueryHandler(handle_callback_query))
         application.add_error_handler(error_handler)
@@ -894,7 +979,7 @@ async def init_bot():
         return False
 
 # ------------------------------------------------------------
-#  ОБРАБОТЧИКИ КОМАНД (полные, без изменений, кроме версии)
+#  ОБРАБОТЧИКИ КОМАНД
 # ------------------------------------------------------------
 @measure_response_time
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -907,11 +992,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📌 Просто напишите вопрос — я поищу в базе знаний.\n"
         "/help — подсказки\n"
         "/categories — категории вопросов\n"
-        "/feedback — отзыв\n"
+        "/feedback — отзыв\n\n"
+        "💬 Можно также использовать русские команды:\n"
+        "/старт, /помощь, /категории, /отзыв"
     )
     if user.id in ADMIN_IDS:
-        text += "\n👑 Админ-команды:\n/stats [период] — статистика\n/feedbacks — отзывы\n/export — Excel"
-    await update.message.reply_text(text, parse_mode='HTML')
+        text += "\n\n👑 Админ-команды:\n/stats [период] — статистика\n/feedbacks — отзывы\n/export — Excel\n/статистика, /отзывы, /экспорт"
+    await _reply_or_edit(update, text, parse_mode='HTML')
 
 @measure_response_time
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -925,15 +1012,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "3. Используйте /categories для выбора темы.\n\n"
         "📞 HR: +7 (3519) 25-60-00, hr@mechel.ru"
     )
-    await update.message.reply_text(text, parse_mode='HTML')
+    await _reply_or_edit(update, text, parse_mode='HTML')
 
 @measure_response_time
 async def categories_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает все категории с inline-кнопками."""
     if bot_stats:
         bot_stats.log_message(update.effective_user.id, update.effective_user.username or "Unknown", 'command', '/categories')
     
     if search_engine is None or not search_engine.faq_data:
-        await update.message.reply_text("⚠️ Категории временно недоступны.")
+        await _reply_or_edit(update, "⚠️ Категории временно недоступны.", parse_mode='HTML')
         return
 
     categories = {}
@@ -942,7 +1030,7 @@ async def categories_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         categories[cat] = categories.get(cat, 0) + 1
 
     if not categories:
-        await update.message.reply_text("📂 Категории не найдены.")
+        await _reply_or_edit(update, "📂 Категории не найдены.", parse_mode='HTML')
         return
 
     keyboard = []
@@ -955,31 +1043,24 @@ async def categories_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         keyboard.append([button])
 
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(
-        "📂 <b>Выберите категорию:</b>\n\n"
-        "Нажмите на категорию, чтобы увидеть список вопросов.",
-        parse_mode='HTML',
-        reply_markup=reply_markup
-    )
+    text = "📂 <b>Выберите категорию:</b>\n\nНажмите на категорию, чтобы увидеть список вопросов."
+    await _reply_or_edit(update, text, parse_mode='HTML', reply_markup=reply_markup)
 
 @measure_response_time
 async def feedback_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if bot_stats:
         bot_stats.log_message(update.effective_user.id, update.effective_user.username or "Unknown", 'command', '/feedback')
     context.user_data['awaiting_feedback'] = True
-    await update.message.reply_text(
-        "💬 Напишите ваш отзыв или предложение.",
-        parse_mode='HTML'
-    )
+    await _reply_or_edit(update, "💬 Напишите ваш отзыв или предложение.", parse_mode='HTML')
 
 @measure_response_time
 async def feedbacks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if user.id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ Нет прав.")
+        await _reply_or_edit(update, "⛔ Нет прав.", parse_mode='HTML')
         return
     if bot_stats is None:
-        await update.message.reply_text("⚠️ Статистика не инициализирована.")
+        await _reply_or_edit(update, "⚠️ Статистика не инициализирована.", parse_mode='HTML')
         return
     
     try:
@@ -993,16 +1074,16 @@ async def feedbacks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"✅ Отзывы выгружены пользователем {user.id}")
     except Exception as e:
         logger.error(f"❌ Ошибка выгрузки отзывов: {e}")
-        await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+        await _reply_or_edit(update, f"❌ Ошибка: {str(e)}", parse_mode='HTML')
 
 @measure_response_time
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if user.id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ Нет прав.")
+        await _reply_or_edit(update, "⛔ Нет прав.", parse_mode='HTML')
         return
     if bot_stats is None:
-        await update.message.reply_text("⚠️ Статистика временно недоступна.")
+        await _reply_or_edit(update, "⚠️ Статистика временно недоступна.", parse_mode='HTML')
         return
     
     period = 'all'
@@ -1066,20 +1147,19 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(text, parse_mode='HTML', reply_markup=reply_markup)
+    await _reply_or_edit(update, text, parse_mode='HTML', reply_markup=reply_markup)
 
 @measure_response_time
 async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ Нет прав.")
+        await _reply_or_edit(update, "⛔ Нет прав.", parse_mode='HTML')
         return
     await export_to_excel(update, context)
 
 async def export_to_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if bot_stats is None:
-        await update.message.reply_text("⚠️ Экспорт временно недоступен (статистика не инициализирована).")
+        await _reply_or_edit(update, "⚠️ Экспорт временно недоступен (статистика не инициализирована).", parse_mode='HTML')
         return
     bot_stats.log_message(user.id, user.username or "Unknown", 'command', '/export')
     try:
@@ -1093,8 +1173,11 @@ async def export_to_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"✅ Экспорт выполнен пользователем {user.id}")
     except Exception as e:
         logger.error(f"❌ Ошибка экспорта: {e}", exc_info=True)
-        await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+        await _reply_or_edit(update, f"❌ Ошибка: {str(e)}", parse_mode='HTML')
 
+# ------------------------------------------------------------
+#  ГЕНЕРАЦИЯ ОТЧЁТОВ EXCEL
+# ------------------------------------------------------------
 def generate_feedback_report() -> io.BytesIO:
     output = io.BytesIO()
     wb = Workbook()
@@ -1319,7 +1402,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         results = []
 
     if not results:
-        # ПРЕДЛОЖЕНИЯ ПО ИСПРАВЛЕНИЮ
         suggestions = []
         if hasattr(search_engine, 'suggest_correction'):
             suggestions = search_engine.suggest_correction(search_text, top_k=3)
@@ -1359,7 +1441,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔍 /categories — все темы")
 
 # ------------------------------------------------------------
-#  ОБРАБОТЧИК INLINE-КНОПОК (без изменений)
+#  ОБРАБОТЧИК INLINE-КНОПОК
 # ------------------------------------------------------------
 @measure_response_time
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1478,7 +1560,7 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
 
 # ------------------------------------------------------------
-#  ВЕБ-ИНТЕРФЕЙС (Quart) — с безопасностью через X-Secret-Key
+#  ВЕБ-ИНТЕРФЕЙС (Quart) — с безопасностью и управлением FAQ
 # ------------------------------------------------------------
 app = Quart(__name__)
 
@@ -1502,6 +1584,351 @@ async def shutdown():
         except Exception as e:
             logger.error(f"❌ Ошибка при остановке бота: {e}")
 
+# ------------------------------------------------------------
+#  СТРАНИЦА УПРАВЛЕНИЯ FAQ
+# ------------------------------------------------------------
+FAQ_MANAGER_HTML = """
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Управление FAQ — HR Бот Мечел</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background-color: #f5f5f5; }
+        .container { max-width: 1200px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        h1 { color: #0B1C2F; }
+        .faq-item { border: 1px solid #ddd; margin-bottom: 10px; padding: 15px; border-radius: 5px; background: #fff; }
+        .faq-item:hover { background: #f9f9f9; }
+        .question { font-weight: bold; color: #0B1C2F; }
+        .category { color: #3E7B91; font-size: 0.9em; margin-left: 10px; }
+        .answer { margin-top: 10px; white-space: pre-wrap; }
+        .keywords { color: #666; font-size: 0.9em; margin-top: 5px; }
+        .actions { margin-top: 10px; }
+        button { margin-right: 5px; padding: 5px 15px; border: none; border-radius: 4px; cursor: pointer; }
+        .btn-edit { background: #FFC107; color: #000; }
+        .btn-delete { background: #DC3545; color: white; }
+        .btn-add { background: #28A745; color: white; padding: 10px 20px; font-size: 16px; }
+        .btn-save { background: #007BFF; color: white; }
+        .btn-cancel { background: #6C757D; color: white; }
+        form { margin-top: 20px; background: #f8f9fa; padding: 20px; border-radius: 5px; }
+        input, textarea, select { width: 100%; padding: 8px; margin-bottom: 10px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }
+        label { font-weight: bold; margin-top: 10px; display: block; }
+        #keyInput { width: 300px; margin-bottom: 20px; }
+        .auth-form { background: #e9ecef; padding: 20px; border-radius: 5px; margin-bottom: 20px; }
+        .error { color: red; margin-top: 10px; }
+        .success { color: green; margin-top: 10px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📚 Управление базой знаний FAQ</h1>
+        
+        <div class="auth-form" id="authSection">
+            <label for="keyInput">Введите секретный ключ (WEBHOOK_SECRET):</label>
+            <input type="password" id="keyInput" placeholder="Секретный ключ">
+            <button onclick="authorize()">Авторизоваться</button>
+            <div id="authError" class="error"></div>
+        </div>
+
+        <div id="content" style="display: none;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <h2>Все записи</h2>
+                <button class="btn-add" onclick="showAddForm()">➕ Добавить новый вопрос</button>
+            </div>
+            <div id="faqList"></div>
+            <div id="formContainer" style="display: none;"></div>
+        </div>
+    </div>
+
+    <script>
+        let currentKey = '';
+        const API_BASE = window.location.origin;
+
+        function authorize() {
+            currentKey = document.getElementById('keyInput').value;
+            if (!currentKey) {
+                document.getElementById('authError').innerText = 'Введите ключ';
+                return;
+            }
+            // Проверим ключ, выполнив запрос к API
+            fetch(`${API_BASE}/faq/api?key=${encodeURIComponent(currentKey)}`)
+                .then(res => {
+                    if (res.ok) {
+                        document.getElementById('authSection').style.display = 'none';
+                        document.getElementById('content').style.display = 'block';
+                        loadFaqList();
+                    } else {
+                        document.getElementById('authError').innerText = 'Неверный ключ';
+                    }
+                })
+                .catch(() => {
+                    document.getElementById('authError').innerText = 'Ошибка соединения';
+                });
+        }
+
+        function loadFaqList() {
+            fetch(`${API_BASE}/faq/api?key=${encodeURIComponent(currentKey)}`)
+                .then(res => res.json())
+                .then(data => {
+                    const list = document.getElementById('faqList');
+                    if (!data || data.length === 0) {
+                        list.innerHTML = '<p>База знаний пуста. Добавьте первый вопрос.</p>';
+                        return;
+                    }
+                    let html = '';
+                    data.forEach(item => {
+                        html += `
+                            <div class="faq-item" id="faq-${item.id}">
+                                <div style="display: flex; justify-content: space-between;">
+                                    <span class="question">${escapeHtml(item.question)}</span>
+                                    <span class="category">${escapeHtml(item.category)}</span>
+                                </div>
+                                <div class="answer">${escapeHtml(item.answer)}</div>
+                                <div class="keywords"><b>Ключевые слова:</b> ${escapeHtml(item.keywords || '')}</div>
+                                <div class="actions">
+                                    <button class="btn-edit" onclick="editFaq(${item.id})">✏️ Редактировать</button>
+                                    <button class="btn-delete" onclick="deleteFaq(${item.id})">🗑 Удалить</button>
+                                </div>
+                            </div>
+                        `;
+                    });
+                    list.innerHTML = html;
+                })
+                .catch(err => console.error(err));
+        }
+
+        function showAddForm() {
+            const container = document.getElementById('formContainer');
+            container.style.display = 'block';
+            container.innerHTML = `
+                <h3>Добавить новый вопрос</h3>
+                <form onsubmit="addFaq(event)">
+                    <label for="question">Вопрос *</label>
+                    <input type="text" id="question" required>
+                    
+                    <label for="answer">Ответ *</label>
+                    <textarea id="answer" rows="5" required></textarea>
+                    
+                    <label for="category">Категория *</label>
+                    <input type="text" id="category" required>
+                    
+                    <label for="keywords">Ключевые слова (через запятую)</label>
+                    <input type="text" id="keywords">
+                    
+                    <button type="submit" class="btn-save">Сохранить</button>
+                    <button type="button" class="btn-cancel" onclick="hideForm()">Отмена</button>
+                </form>
+            `;
+        }
+
+        function hideForm() {
+            document.getElementById('formContainer').style.display = 'none';
+            document.getElementById('formContainer').innerHTML = '';
+        }
+
+        function addFaq(event) {
+            event.preventDefault();
+            const data = {
+                question: document.getElementById('question').value,
+                answer: document.getElementById('answer').value,
+                category: document.getElementById('category').value,
+                keywords: document.getElementById('keywords').value
+            };
+            fetch(`${API_BASE}/faq/api?key=${encodeURIComponent(currentKey)}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(data)
+            })
+            .then(res => {
+                if (res.ok) {
+                    hideForm();
+                    loadFaqList();
+                } else {
+                    alert('Ошибка при добавлении');
+                }
+            })
+            .catch(err => alert('Ошибка: ' + err));
+        }
+
+        function editFaq(id) {
+            // Сначала загрузим текущие данные
+            fetch(`${API_BASE}/faq/api/${id}?key=${encodeURIComponent(currentKey)}`)
+                .then(res => res.json())
+                .then(item => {
+                    const container = document.getElementById('formContainer');
+                    container.style.display = 'block';
+                    container.innerHTML = `
+                        <h3>Редактировать вопрос #${id}</h3>
+                        <form onsubmit="updateFaq(event, ${id})">
+                            <label for="edit_question">Вопрос *</label>
+                            <input type="text" id="edit_question" value="${escapeHtml(item.question)}" required>
+                            
+                            <label for="edit_answer">Ответ *</label>
+                            <textarea id="edit_answer" rows="5" required>${escapeHtml(item.answer)}</textarea>
+                            
+                            <label for="edit_category">Категория *</label>
+                            <input type="text" id="edit_category" value="${escapeHtml(item.category)}" required>
+                            
+                            <label for="edit_keywords">Ключевые слова (через запятую)</label>
+                            <input type="text" id="edit_keywords" value="${escapeHtml(item.keywords || '')}">
+                            
+                            <button type="submit" class="btn-save">Сохранить</button>
+                            <button type="button" class="btn-cancel" onclick="hideForm()">Отмена</button>
+                        </form>
+                    `;
+                })
+                .catch(err => alert('Ошибка загрузки данных: ' + err));
+        }
+
+        function updateFaq(event, id) {
+            event.preventDefault();
+            const data = {
+                question: document.getElementById('edit_question').value,
+                answer: document.getElementById('edit_answer').value,
+                category: document.getElementById('edit_category').value,
+                keywords: document.getElementById('edit_keywords').value
+            };
+            fetch(`${API_BASE}/faq/api/${id}?key=${encodeURIComponent(currentKey)}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(data)
+            })
+            .then(res => {
+                if (res.ok) {
+                    hideForm();
+                    loadFaqList();
+                } else {
+                    alert('Ошибка при обновлении');
+                }
+            })
+            .catch(err => alert('Ошибка: ' + err));
+        }
+
+        function deleteFaq(id) {
+            if (!confirm(`Удалить вопрос #${id}?`)) return;
+            fetch(`${API_BASE}/faq/api/${id}?key=${encodeURIComponent(currentKey)}`, {
+                method: 'DELETE'
+            })
+            .then(res => {
+                if (res.ok) {
+                    document.getElementById(`faq-${id}`).remove();
+                } else {
+                    alert('Ошибка при удалении');
+                }
+            })
+            .catch(err => alert('Ошибка: ' + err));
+        }
+
+        function escapeHtml(unsafe) {
+            if (!unsafe) return '';
+            return unsafe
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;")
+                .replace(/'/g, "&#039;");
+        }
+    </script>
+</body>
+</html>
+"""
+
+@app.route('/faq')
+async def faq_manager():
+    """Веб-интерфейс для управления FAQ."""
+    return await render_template_string(FAQ_MANAGER_HTML)
+
+# ------------------------------------------------------------
+#  API ДЛЯ УПРАВЛЕНИЯ FAQ
+# ------------------------------------------------------------
+@app.route('/faq/api', methods=['GET'])
+async def faq_api_list():
+    """Получить список всех записей FAQ (JSON)."""
+    if not is_authorized(request):
+        return jsonify({'error': 'Forbidden'}), 403
+    data = await load_faq_json()
+    return jsonify(data)
+
+@app.route('/faq/api/<int:faq_id>', methods=['GET'])
+async def faq_api_get(faq_id):
+    """Получить одну запись FAQ по ID."""
+    if not is_authorized(request):
+        return jsonify({'error': 'Forbidden'}), 403
+    data = await load_faq_json()
+    item = next((i for i in data if i.get('id') == faq_id), None)
+    if item:
+        return jsonify(item)
+    return jsonify({'error': 'Not found'}), 404
+
+@app.route('/faq/api', methods=['POST'])
+async def faq_api_add():
+    """Добавить новую запись в FAQ."""
+    if not is_authorized(request):
+        return jsonify({'error': 'Forbidden'}), 403
+    try:
+        item = await request.get_json()
+        if not item.get('question') or not item.get('answer') or not item.get('category'):
+            return jsonify({'error': 'Missing required fields'}), 400
+        
+        data = await load_faq_json()
+        new_id = await get_next_faq_id()
+        new_item = {
+            'id': new_id,
+            'question': item['question'].strip(),
+            'answer': item['answer'].strip(),
+            'category': item['category'].strip(),
+            'keywords': item.get('keywords', '').strip()
+        }
+        data.append(new_item)
+        await save_faq_json(data)
+        return jsonify(new_item), 201
+    except Exception as e:
+        logger.error(f"Ошибка добавления FAQ: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/faq/api/<int:faq_id>', methods=['PUT'])
+async def faq_api_update(faq_id):
+    """Обновить существующую запись."""
+    if not is_authorized(request):
+        return jsonify({'error': 'Forbidden'}), 403
+    try:
+        item = await request.get_json()
+        if not item.get('question') or not item.get('answer') or not item.get('category'):
+            return jsonify({'error': 'Missing required fields'}), 400
+        
+        data = await load_faq_json()
+        for i, d in enumerate(data):
+            if d.get('id') == faq_id:
+                data[i] = {
+                    'id': faq_id,
+                    'question': item['question'].strip(),
+                    'answer': item['answer'].strip(),
+                    'category': item['category'].strip(),
+                    'keywords': item.get('keywords', '').strip()
+                }
+                await save_faq_json(data)
+                return jsonify(data[i])
+        return jsonify({'error': 'Not found'}), 404
+    except Exception as e:
+        logger.error(f"Ошибка обновления FAQ: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/faq/api/<int:faq_id>', methods=['DELETE'])
+async def faq_api_delete(faq_id):
+    """Удалить запись по ID."""
+    if not is_authorized(request):
+        return jsonify({'error': 'Forbidden'}), 403
+    data = await load_faq_json()
+    new_data = [i for i in data if i.get('id') != faq_id]
+    if len(new_data) == len(data):
+        return jsonify({'error': 'Not found'}), 404
+    await save_faq_json(new_data)
+    return jsonify({'success': True}), 200
+
+# ------------------------------------------------------------
+#  ОСТАЛЬНЫЕ ВЕБ-ЭНДПОИНТЫ (С ЗАЩИТОЙ)
+# ------------------------------------------------------------
 @app.route('/setwebhook')
 async def set_webhook_manual():
     key = request.args.get('key')
@@ -1671,7 +2098,7 @@ async def index():
 <body>
     <div class="container">
         <h1>🤖 HR Бот «Мечел»</h1>
-        <div class="subtitle">Версия 12.29 · Оптимизированный поиск, предложения, безопасные эндпоинты</div>
+        <div class="subtitle">Версия 12.30 · Русские команды, редактор FAQ, безопасные эндпоинты</div>
         
         <div class="grid">
             <div class="card">
@@ -1701,12 +2128,13 @@ async def index():
             </div>
         </div>
         
-        <div style="display: flex; gap: 1rem; margin-bottom: 2rem;">
-            <a href="/export/excel" class="btn">📥 Экспорт в Excel</a>
+        <div style="display: flex; gap: 1rem; margin-bottom: 2rem; flex-wrap: wrap;">
+            <a href="/export/excel?key={WEBHOOK_SECRET}" class="btn">📥 Экспорт в Excel</a>
             <a href="/health" class="btn" style="background: #2E5C4E;">🩺 Health Check</a>
-            <a href="/search/stats" class="btn" style="background: #5C3E6E;">🔍 Поиск Статистика</a>
-            <a href="/feedback/export" class="btn" style="background: #9C27B0;">📝 Отзывы</a>
-            <a href="/rate/stats" class="btn" style="background: #FF9800;">⭐ Оценки</a>
+            <a href="/search/stats?key={WEBHOOK_SECRET}" class="btn" style="background: #5C3E6E;">🔍 Поиск Статистика</a>
+            <a href="/feedback/export?key={WEBHOOK_SECRET}" class="btn" style="background: #9C27B0;">📝 Отзывы</a>
+            <a href="/rate/stats?key={WEBHOOK_SECRET}" class="btn" style="background: #FF9800;">⭐ Оценки</a>
+            <a href="/faq" class="btn" style="background: #17a2b8;">📚 Редактор FAQ</a>
         </div>
         
         <h2>📈 Статистика за последние 7 дней</h2>
@@ -1767,12 +2195,9 @@ async def health_check():
         'faq_count': len(search_engine.faq_data) if search_engine else 0
     })
 
-# ------------------------------------------------------------
-#  ЗАЩИЩЁННЫЕ ЭНДПОИНТЫ (X-Secret-Key)
-# ------------------------------------------------------------
 @app.route('/search/stats', methods=['GET', 'POST'])
 async def search_stats():
-    if not is_authorized_webhook_secret(request):
+    if not is_authorized(request):
         return jsonify({'error': 'Forbidden'}), 403
     if search_engine is None:
         return jsonify({'error': 'Search engine not initialized'}), 503
@@ -1788,7 +2213,7 @@ async def search_stats():
 
 @app.route('/feedback/export', methods=['GET', 'POST'])
 async def feedback_export_web():
-    if not is_authorized_webhook_secret(request):
+    if not is_authorized(request):
         return jsonify({'error': 'Forbidden'}), 403
     if bot_stats is None:
         return jsonify({'error': 'Bot not initialized'}), 503
@@ -1805,7 +2230,7 @@ async def feedback_export_web():
 
 @app.route('/rate/stats', methods=['GET', 'POST'])
 async def rate_stats_web():
-    if not is_authorized_webhook_secret(request):
+    if not is_authorized(request):
         return jsonify({'error': 'Forbidden'}), 403
     if bot_stats is None:
         return jsonify({'error': 'Bot not initialized'}), 503
@@ -1818,7 +2243,7 @@ async def rate_stats_web():
 
 @app.route('/stats/range', methods=['GET', 'POST'])
 async def stats_range_web():
-    if not is_authorized_webhook_secret(request):
+    if not is_authorized(request):
         return jsonify({'error': 'Forbidden'}), 403
     if bot_stats is None:
         return jsonify({'error': 'Bot not initialized'}), 503
@@ -1834,7 +2259,7 @@ async def stats_range_web():
 
 @app.route('/export/excel', methods=['GET', 'POST'])
 async def export_excel_web():
-    if not is_authorized_webhook_secret(request):
+    if not is_authorized(request):
         return jsonify({'error': 'Forbidden'}), 403
     if bot_stats is None:
         return jsonify({'error': 'Статистика не инициализирована'}), 503

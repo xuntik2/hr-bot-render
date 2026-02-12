@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Telegram-бот для HR-отдела компании "Мечел"
-Версия 12.31 — исправление русских команд, надёжный _reply_or_edit,
-полная совместимость с search_engine.py v4.6, оптимизация для Render Free.
+Версия 12.34 — периодическое сохранение подписчиков, улучшенная рассылка,
+предупреждение о Render Free в редакторе FAQ, полная совместимость с search_engine.py v4.6.
 """
 
 import os
@@ -517,6 +517,166 @@ class ExternalSearchEngineAdapter:
             logger.info("🔄 ExternalSearchEngineAdapter: данные обновлены во внешнем движке")
 
 # ------------------------------------------------------------
+#  СИСТЕМА ПОДПИСОК
+# ------------------------------------------------------------
+SUBSCRIBERS_FILE = 'subscribers.json'
+subscribers_lock = asyncio.Lock()
+_subscribers_cache = None  # кэш для периодического сохранения
+_subscribers_cache_loaded = False
+
+async def load_subscribers():
+    """Загружает список подписчиков из JSON с кэшированием."""
+    global _subscribers_cache, _subscribers_cache_loaded
+    if _subscribers_cache_loaded:
+        return _subscribers_cache
+    try:
+        async with subscribers_lock:
+            with open(SUBSCRIBERS_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                _subscribers_cache = data.get('subscribers', [])
+    except FileNotFoundError:
+        _subscribers_cache = []
+    except Exception as e:
+        logger.error(f"Ошибка загрузки подписчиков: {e}")
+        _subscribers_cache = []
+    _subscribers_cache_loaded = True
+    return _subscribers_cache
+
+async def save_subscribers(subscribers: List[int]):
+    """Сохраняет список подписчиков в JSON и обновляет кэш."""
+    global _subscribers_cache
+    async with subscribers_lock:
+        with open(SUBSCRIBERS_FILE, 'w', encoding='utf-8') as f:
+            json.dump({'subscribers': subscribers, 'updated': datetime.now().isoformat()}, f, ensure_ascii=False, indent=2)
+        _subscribers_cache = subscribers
+
+async def add_subscriber(user_id: int):
+    """Добавляет пользователя в список подписчиков, если его там нет."""
+    subs = await load_subscribers()
+    if user_id not in subs:
+        subs.append(user_id)
+        await save_subscribers(subs)
+        return True
+    return False
+
+async def remove_subscriber(user_id: int):
+    """Удаляет пользователя из списка подписчиков."""
+    subs = await load_subscribers()
+    if user_id in subs:
+        subs.remove(user_id)
+        await save_subscribers(subs)
+        return True
+    return False
+
+async def get_subscribers() -> List[int]:
+    """Возвращает список подписчиков."""
+    return await load_subscribers()
+
+async def ensure_subscribed(user_id: int):
+    """Гарантирует, что пользователь подписан (добавляет, если нет)."""
+    await add_subscriber(user_id)
+
+# ------------------------------------------------------------
+#  ПЕРИОДИЧЕСКОЕ СОХРАНЕНИЕ ПОДПИСЧИКОВ (v12.34)
+# ------------------------------------------------------------
+async def periodic_subscriber_save():
+    """Каждые 5 минут пересохраняет список подписчиков (дополнительная защита)."""
+    while True:
+        await asyncio.sleep(300)  # 5 минут
+        try:
+            subs = await load_subscribers()
+            await save_subscribers(subs)
+            logger.info(f"✅ Периодическое сохранение подписчиков: {len(subs)} записей")
+        except Exception as e:
+            logger.error(f"❌ Ошибка периодического сохранения подписчиков: {e}")
+
+# ------------------------------------------------------------
+#  СИСТЕМНЫЕ СООБЩЕНИЯ (EDITABLE)
+# ------------------------------------------------------------
+MESSAGES_FILE = 'messages.json'
+messages_lock = asyncio.Lock()
+
+DEFAULT_MESSAGES = {
+    "welcome": {
+        "title": "Приветствие",
+        "text": "👋 Привет, {first_name}!\n\nЯ HR-бот компании <b>Мечел</b>. Помогу с кадровыми вопросами.\n\n📌 Просто напишите вопрос — я поищу в базе знаний.\n/help — подсказки\n/categories — категории вопросов\n/feedback — отзыв\n\n💬 Можно также использовать русские команды:\n/старт, /помощь, /категории, /отзыв"
+    },
+    "help": {
+        "title": "Помощь",
+        "text": "❓ <b>Как пользоваться:</b>\n1. Задайте вопрос своими словами.\n2. Можно указать категорию через двоеточие, например:\n   <i>отпуск: как перенести?</i>\n3. Используйте /categories для выбора темы.\n\n📞 HR: +7 (3519) 25-60-00, hr@mechel.ru"
+    },
+    "no_results": {
+        "title": "Ничего не найдено",
+        "text": "😕 Не нашёл ответ. Попробуйте переформулировать, использовать /categories для выбора категории или /feedback."
+    },
+    "suggestions": {
+        "title": "Предложения по исправлению",
+        "text": "😕 Не нашёл точного совпадения для «{query}».\n\nВозможно, вы имели в виду:\n{suggestions}\n\nПопробуйте переформулировать или /feedback."
+    },
+    "feedback_ack": {
+        "title": "Спасибо за отзыв",
+        "text": "🙏 Спасибо за отзыв!"
+    },
+    "greeting_response": {
+        "title": "Ответ на приветствие",
+        "text": "👋 Привет! Я HR-бот Мечел. Чем могу помочь?"
+    },
+    "subscribe_success": {
+        "title": "Подписка оформлена",
+        "text": "✅ Вы подписались на рассылку новостей! Теперь вы будете получать уведомления от администрации."
+    },
+    "unsubscribe_success": {
+        "title": "Подписка отменена",
+        "text": "✅ Вы отписались от рассылки. Если передумаете, всегда можете подписаться снова командой /subscribe."
+    },
+    "already_subscribed": {
+        "title": "Уже подписаны",
+        "text": "ℹ️ Вы уже подписаны на рассылку."
+    },
+    "not_subscribed": {
+        "title": "Не подписаны",
+        "text": "ℹ️ Вы не подписаны на рассылку. Чтобы подписаться, используйте /subscribe."
+    }
+}
+
+async def load_messages():
+    """Загружает сообщения из messages.json. Если файла нет, создаёт с дефолтными."""
+    try:
+        async with messages_lock:
+            with open(MESSAGES_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                # Проверяем, что все ключи дефолтных сообщений присутствуют
+                for key, default in DEFAULT_MESSAGES.items():
+                    if key not in data:
+                        data[key] = default
+                return data
+    except FileNotFoundError:
+        async with messages_lock:
+            with open(MESSAGES_FILE, 'w', encoding='utf-8') as f:
+                json.dump(DEFAULT_MESSAGES, f, ensure_ascii=False, indent=2)
+        return DEFAULT_MESSAGES.copy()
+    except Exception as e:
+        logger.error(f"Ошибка загрузки сообщений: {e}")
+        return DEFAULT_MESSAGES.copy()
+
+async def save_messages(messages: Dict):
+    """Сохраняет сообщения в messages.json."""
+    async with messages_lock:
+        with open(MESSAGES_FILE, 'w', encoding='utf-8') as f:
+            json.dump(messages, f, ensure_ascii=False, indent=2)
+
+async def get_message(key: str, **kwargs) -> str:
+    """Возвращает текст сообщения по ключу с подстановкой параметров."""
+    msgs = await load_messages()
+    template = msgs.get(key, DEFAULT_MESSAGES.get(key, {}).get('text', ''))
+    if kwargs:
+        try:
+            return template.format(**kwargs)
+        except KeyError:
+            return template
+    return template
+
+# ------------------------------------------------------------
 #  КЛАСС СТАТИСТИКИ
 # ------------------------------------------------------------
 class BotStatistics:
@@ -531,7 +691,8 @@ class BotStatistics:
             'feedback_count': 0,
             'ratings_given': 0,
             'ratings_helpful': 0,
-            'ratings_unhelpful': 0
+            'ratings_unhelpful': 0,
+            'subscribed': False
         })
         self.daily_stats = defaultdict(lambda: {
             'messages': 0,
@@ -628,6 +789,10 @@ class BotStatistics:
             self.user_stats[user_id]['ratings_given'] += 1
             self.user_stats[user_id]['ratings_unhelpful'] += 1
             self.daily_stats[date_key]['ratings']['unhelpful'] += 1
+        elif msg_type == 'subscribe':
+            self.user_stats[user_id]['subscribed'] = True
+        elif msg_type == 'unsubscribe':
+            self.user_stats[user_id]['subscribed'] = False
 
         self.daily_stats[date_key]['users'].add(user_id)
 
@@ -765,7 +930,7 @@ search_engine: Optional[Union[BuiltinSearchEngine, ExternalSearchEngineAdapter]]
 bot_stats: Optional[BotStatistics] = None
 
 # ------------------------------------------------------------
-#  БЛОКИРОВКА ДЛЯ РАБОТЫ С FAQ.JSON
+#  БЛОКИРОВКИ ДЛЯ РАБОТЫ С JSON
 # ------------------------------------------------------------
 faq_lock = asyncio.Lock()
 
@@ -812,9 +977,6 @@ def parse_period_argument(arg: str) -> str:
 #  УНИВЕРСАЛЬНАЯ ОТПРАВКА/РЕДАКТИРОВАНИЕ СООБЩЕНИЯ
 # ------------------------------------------------------------
 async def _reply_or_edit(update: Update, text: str, parse_mode: str = 'HTML', reply_markup=None):
-    """
-    Безопасно отправляет или редактирует сообщение в зависимости от типа update.
-    """
     if update.message:
         return await update.message.reply_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
     elif update.callback_query:
@@ -828,7 +990,6 @@ async def _reply_or_edit(update: Update, text: str, parse_mode: str = 'HTML', re
 #  ВЕБ-БЕЗОПАСНОСТЬ
 # ------------------------------------------------------------
 def is_authorized(request) -> bool:
-    """Проверка авторизации: заголовок X-Secret-Key или параметр URL key."""
     secret = request.headers.get('X-Secret-Key')
     if secret == WEBHOOK_SECRET:
         return True
@@ -841,7 +1002,6 @@ def is_authorized(request) -> bool:
 #  РАБОТА С FAQ.JSON (CRUD)
 # ------------------------------------------------------------
 async def load_faq_json():
-    """Загружает FAQ из faq.json."""
     try:
         async with faq_lock:
             with open('faq.json', 'r', encoding='utf-8') as f:
@@ -853,7 +1013,6 @@ async def load_faq_json():
         return []
 
 async def save_faq_json(data: List[Dict]):
-    """Сохраняет FAQ в faq.json (с блокировкой)."""
     async with faq_lock:
         with open('faq.json', 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -861,7 +1020,6 @@ async def save_faq_json(data: List[Dict]):
         search_engine.refresh_data()
 
 async def get_next_faq_id() -> int:
-    """Возвращает следующий свободный ID для новой записи."""
     data = await load_faq_json()
     if not data:
         return 1
@@ -879,10 +1037,9 @@ async def post_init(application: Application):
 # ------------------------------------------------------------
 async def init_bot():
     global application, search_engine, bot_stats
-    logger.info("🚀 Инициализация бота версии 12.31...")
+    logger.info("🚀 Инициализация бота версии 12.34...")
 
     try:
-        # 1. ПОИСКОВЫЙ ДВИЖОК
         use_builtin = False
         try:
             from search_engine import EnhancedSearchEngine
@@ -912,23 +1069,24 @@ async def init_bot():
             search_engine = BuiltinSearchEngine()
             logger.info("✅ Используется встроенный BuiltinSearchEngine (оптимизированный нечёткий поиск)")
 
-        # 2. СТАТИСТИКА
         bot_stats = BotStatistics()
         logger.info("✅ Инициализирован модуль статистики")
 
-        # 3. ПРИЛОЖЕНИЕ TELEGRAM
         builder = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init)
         application = builder.build()
 
-        # --- РЕГИСТРАЦИЯ КОМАНД (ТОЛЬКО АНГЛИЙСКИЕ) ---
+        # --- АНГЛИЙСКИЕ КОМАНДЫ ---
         application.add_handler(CommandHandler("start", start_command))
         application.add_handler(CommandHandler("help", help_command))
         application.add_handler(CommandHandler("categories", categories_command))
-        application.add_handler(CommandHandler("faq", categories_command))  # alias
+        application.add_handler(CommandHandler("faq", categories_command))
         application.add_handler(CommandHandler("feedback", feedback_command))
         application.add_handler(CommandHandler("feedbacks", feedbacks_command))
         application.add_handler(CommandHandler("stats", stats_command))
         application.add_handler(CommandHandler("export", export_command))
+        application.add_handler(CommandHandler("subscribe", subscribe_command))
+        application.add_handler(CommandHandler("unsubscribe", unsubscribe_command))
+        application.add_handler(CommandHandler("broadcast", broadcast_command))
 
         # --- РУССКИЕ КОМАНДЫ ЧЕРЕЗ MessageHandler ---
         async def russian_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -947,9 +1105,15 @@ async def init_bot():
                 await stats_command(update, context)
             elif text.startswith('/экспорт'):
                 await export_command(update, context)
+            elif text.startswith('/подписаться'):
+                await subscribe_command(update, context)
+            elif text.startswith('/отписаться'):
+                await unsubscribe_command(update, context)
+            elif text.startswith('/рассылка'):
+                await broadcast_command(update, context)
 
         application.add_handler(MessageHandler(
-            filters.Regex(r'^/(старт|помощь|категории|отзыв|отзывы|статистика|экспорт)'),
+            filters.Regex(r'^/(старт|помощь|категории|отзыв|отзывы|статистика|экспорт|подписаться|отписаться|рассылка)'),
             russian_command_handler
         ))
 
@@ -957,7 +1121,6 @@ async def init_bot():
         application.add_handler(CallbackQueryHandler(handle_callback_query))
         application.add_error_handler(error_handler)
 
-        # 4. WEBHOOK
         await application.initialize()
         if RENDER:
             webhook_url = WEBHOOK_URL + WEBHOOK_PATH
@@ -983,6 +1146,10 @@ async def init_bot():
             await application.bot.delete_webhook(drop_pending_updates=True)
             logger.info("✅ Режим поллинга (локальная разработка)")
 
+        # Запуск периодического сохранения подписчиков
+        asyncio.create_task(periodic_subscriber_save())
+        logger.info("✅ Запущена задача периодического сохранения подписчиков")
+
         logger.info("✅ Бот полностью инициализирован и готов к работе")
         return True
 
@@ -996,41 +1163,89 @@ async def init_bot():
 @measure_response_time
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    # Автоматическая подписка при старте
+    await ensure_subscribed(user.id)
     if bot_stats:
         bot_stats.log_message(user.id, user.username or "Unknown", 'command', '/start')
-    text = (
-        f"👋 Привет, {user.first_name}!\n\n"
-        "Я HR-бот компании <b>Мечел</b>. Помогу с кадровыми вопросами.\n\n"
-        "📌 Просто напишите вопрос — я поищу в базе знаний.\n"
-        "/help — подсказки\n"
-        "/categories — категории вопросов\n"
-        "/feedback — отзыв\n\n"
-        "💬 Можно также использовать русские команды:\n"
-        "/старт, /помощь, /категории, /отзыв"
-    )
+        bot_stats.log_message(user.id, user.username or "Unknown", 'subscribe', '')
+    text = await get_message('welcome', first_name=user.first_name)
     if user.id in ADMIN_IDS:
-        text += "\n\n👑 Админ-команды:\n/stats [период] — статистика\n/feedbacks — отзывы\n/export — Excel\n/статистика, /отзывы, /экспорт"
+        text += "\n\n👑 Админ-команды:\n/stats [период] — статистика\n/feedbacks — отзывы\n/export — Excel\n/статистика, /отзывы, /экспорт\n/subscribe /unsubscribe — подписка\n/broadcast — рассылка"
     await _reply_or_edit(update, text, parse_mode='HTML')
 
 @measure_response_time
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    await ensure_subscribed(user.id)
     if bot_stats:
-        bot_stats.log_message(update.effective_user.id, update.effective_user.username or "Unknown", 'command', '/help')
-    text = (
-        "❓ <b>Как пользоваться:</b>\n"
-        "1. Задайте вопрос своими словами.\n"
-        "2. Можно указать категорию через двоеточие, например:\n"
-        "   <i>отпуск: как перенести?</i>\n"
-        "3. Используйте /categories для выбора темы.\n\n"
-        "📞 HR: +7 (3519) 25-60-00, hr@mechel.ru"
-    )
+        bot_stats.log_message(user.id, user.username or "Unknown", 'command', '/help')
+    text = await get_message('help')
     await _reply_or_edit(update, text, parse_mode='HTML')
 
 @measure_response_time
-async def categories_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает все категории с inline-кнопками."""
+async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    added = await add_subscriber(user.id)
     if bot_stats:
-        bot_stats.log_message(update.effective_user.id, update.effective_user.username or "Unknown", 'command', '/categories')
+        bot_stats.log_message(user.id, user.username or "Unknown", 'subscribe' if added else 'message')
+    if added:
+        text = await get_message('subscribe_success')
+    else:
+        text = await get_message('already_subscribed')
+    await _reply_or_edit(update, text, parse_mode='HTML')
+
+@measure_response_time
+async def unsubscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    removed = await remove_subscriber(user.id)
+    if bot_stats:
+        bot_stats.log_message(user.id, user.username or "Unknown", 'unsubscribe' if removed else 'message')
+    if removed:
+        text = await get_message('unsubscribe_success')
+    else:
+        text = await get_message('not_subscribed')
+    await _reply_or_edit(update, text, parse_mode='HTML')
+
+@measure_response_time
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.id not in ADMIN_IDS:
+        await _reply_or_edit(update, "⛔ Нет прав.", parse_mode='HTML')
+        return
+    if not context.args:
+        await _reply_or_edit(update, "ℹ️ Использование: /broadcast <текст сообщения>", parse_mode='HTML')
+        return
+    message = ' '.join(context.args)
+    subscribers = await get_subscribers()
+    if not subscribers:
+        await _reply_or_edit(update, "📭 Нет подписчиков для рассылки.", parse_mode='HTML')
+        return
+    
+    sent = 0
+    failed = 0
+    status_msg = await _reply_or_edit(update, f"📨 Отправка {len(subscribers)} подписчикам...", parse_mode='HTML')
+    
+    # Улучшенная задержка для предотвращения флуда (v12.34)
+    for i, uid in enumerate(subscribers):
+        try:
+            await application.bot.send_message(chat_id=uid, text=message, parse_mode='HTML')
+            sent += 1
+            # Задержка 0.1 секунды между сообщениями, каждые 10 сообщений — 1 секунда
+            if i % 10 == 9:
+                await asyncio.sleep(1.0)
+            else:
+                await asyncio.sleep(0.1)
+        except Exception as e:
+            logger.error(f"❌ Ошибка отправки рассылки пользователю {uid}: {e}")
+            failed += 1
+    await status_msg.edit_text(f"✅ Рассылка завершена.\n📨 Отправлено: {sent}\n❌ Ошибок: {failed}")
+
+@measure_response_time
+async def categories_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    await ensure_subscribed(user.id)
+    if bot_stats:
+        bot_stats.log_message(user.id, user.username or "Unknown", 'command', '/categories')
     
     if search_engine is None or not search_engine.faq_data:
         await _reply_or_edit(update, "⚠️ Категории временно недоступны.", parse_mode='HTML')
@@ -1060,14 +1275,17 @@ async def categories_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 @measure_response_time
 async def feedback_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    await ensure_subscribed(user.id)
     if bot_stats:
-        bot_stats.log_message(update.effective_user.id, update.effective_user.username or "Unknown", 'command', '/feedback')
+        bot_stats.log_message(user.id, user.username or "Unknown", 'command', '/feedback')
     context.user_data['awaiting_feedback'] = True
     await _reply_or_edit(update, "💬 Напишите ваш отзыв или предложение.", parse_mode='HTML')
 
 @measure_response_time
 async def feedbacks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    await ensure_subscribed(user.id)
     if user.id not in ADMIN_IDS:
         await _reply_or_edit(update, "⛔ Нет прав.", parse_mode='HTML')
         return
@@ -1091,6 +1309,7 @@ async def feedbacks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @measure_response_time
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    await ensure_subscribed(user.id)
     if user.id not in ADMIN_IDS:
         await _reply_or_edit(update, "⛔ Нет прав.", parse_mode='HTML')
         return
@@ -1104,6 +1323,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     bot_stats.log_message(user.id, user.username or "Unknown", 'command', f'/stats {period}')
     s = bot_stats.get_summary_stats(period)
+    subscribers = await get_subscribers()
     
     period_names = {
         'all': 'всё время',
@@ -1137,9 +1357,9 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         text += "нет оценок\n"
     text += (
-        f"⚡ Время ответа: <b>{s['avg_response_time']:.2f}с</b> ({s['response_time_status']})\n"
         f"📦 Кэш поиска: {s['cache_size']}\n"
         f"⏱ Uptime: {s['uptime']}\n"
+        f"👥 Подписчиков на рассылку: {len(subscribers)}\n"
     )
     
     keyboard = [
@@ -1163,7 +1383,9 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @measure_response_time
 async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+    user = update.effective_user
+    await ensure_subscribed(user.id)
+    if user.id not in ADMIN_IDS:
         await _reply_or_edit(update, "⛔ Нет прав.", parse_mode='HTML')
         return
     await export_to_excel(update, context)
@@ -1188,7 +1410,7 @@ async def export_to_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _reply_or_edit(update, f"❌ Ошибка: {str(e)}", parse_mode='HTML')
 
 # ------------------------------------------------------------
-#  ГЕНЕРАЦИЯ ОТЧЁТОВ EXCEL (ПОЛНОСТЬЮ АНАЛОГИЧНО ПРЕДЫДУЩИМ ВЕРСИЯМ)
+#  ГЕНЕРАЦИЯ ОТЧЁТОВ EXCEL
 # ------------------------------------------------------------
 def generate_feedback_report() -> io.BytesIO:
     output = io.BytesIO()
@@ -1229,6 +1451,7 @@ def generate_excel_report() -> io.BytesIO:
     wb = Workbook()
     stats = bot_stats.get_summary_stats() if bot_stats else {}
     rating_stats = bot_stats.get_rating_stats() if bot_stats else {}
+    subscribers = asyncio.run(get_subscribers())  # синхронный контекст, но здесь допустимо
 
     ws1 = wb.active
     ws1.title = "Общая статистика"
@@ -1254,7 +1477,8 @@ def generate_excel_report() -> io.BytesIO:
         ("Ср. время ответа", f"{stats.get('avg_response_time', 0):.2f} сек"),
         ("Статус времени", stats.get('response_time_status', 'N/A')),
         ("Размер кэша", stats.get('cache_size', 0)),
-        ("Количество ошибок", stats.get('error_count', 0))
+        ("Количество ошибок", stats.get('error_count', 0)),
+        ("Подписчиков", len(subscribers))
     ]
     for i, (k, v) in enumerate(rows, 4):
         ws1[f'A{i}'] = k; ws1[f'B{i}'] = v
@@ -1301,10 +1525,11 @@ def generate_excel_report() -> io.BytesIO:
     ws4['A1'] = "Статистика пользователей"
     ws4['A1'].font = Font(bold=True, size=14)
     ws4.merge_cells('A1:I1')
-    headers2 = ["ID", "Имя", "Сообщ", "Команд", "Поиск", "Отзывы", "Оценок", "Полезно", "Бесполезно", "Посл. активность"]
+    headers2 = ["ID", "Имя", "Сообщ", "Команд", "Поиск", "Отзывы", "Оценок", "Полезно", "Бесполезно", "Посл. активность", "Подписка"]
     for col, h in enumerate(headers2, 1):
         cell = ws4.cell(row=3, column=col); cell.value = h; cell.font = Font(bold=True)
     if bot_stats:
+        subs_set = set(subscribers)
         for i, (uid, udata) in enumerate(bot_stats.user_stats.items(), 4):
             ws4.cell(row=i, column=1, value=uid)
             ws4.cell(row=i, column=2, value=f"Пользователь {uid}")
@@ -1317,6 +1542,7 @@ def generate_excel_report() -> io.BytesIO:
             ws4.cell(row=i, column=9, value=udata['ratings_unhelpful'])
             last = udata['last_active']
             ws4.cell(row=i, column=10, value=last.strftime("%Y-%m-%d %H:%M:%S") if last else '')
+            ws4.cell(row=i, column=11, value="Да" if uid in subs_set else "Нет")
 
     ws5 = wb.create_sheet("Оценки FAQ")
     ws5['A1'] = "Статистика оценок по вопросам"
@@ -1365,6 +1591,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = update.message.text.strip()
     
+    # Автоматическая подписка при любом сообщении
+    await ensure_subscribed(user.id)
+    
     if bot_stats:
         bot_stats.log_message(user.id, user.username or "Unknown", 'message')
 
@@ -1372,12 +1601,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['awaiting_feedback'] = False
         if bot_stats:
             bot_stats.log_message(user.id, user.username or "Unknown", 'feedback', text)
-        await update.message.reply_text("🙏 Спасибо за отзыв!")
+        await update.message.reply_text(await get_message('feedback_ack'), parse_mode='HTML')
         return
 
     if is_greeting(text):
         logger.info(f"Приветствие от {user.id}: '{text}'")
-        await start_command(update, context)
+        greeting_text = await get_message('greeting_response')
+        await update.message.reply_text(greeting_text, parse_mode='HTML')
         return
 
     if text.lower() in ['статистика', 'stats'] and user.id in ADMIN_IDS:
@@ -1418,17 +1648,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if hasattr(search_engine, 'suggest_correction'):
             suggestions = search_engine.suggest_correction(search_text, top_k=3)
         if suggestions:
-            text_response = f"😕 Не нашёл точного совпадения для «{search_text}».\n\n"
-            text_response += "Возможно, вы имели в виду:\n"
-            for s in suggestions:
-                text_response += f"• {s}\n"
-            text_response += "\nПопробуйте переформулировать или /feedback."
+            suggestions_text = '\n'.join([f'• {s}' for s in suggestions])
+            text_response = await get_message('suggestions', query=search_text, suggestions=suggestions_text)
             await update.message.reply_text(text_response, parse_mode='HTML')
         else:
-            await update.message.reply_text(
-                "😕 Не нашёл ответ. Попробуйте переформулировать, использовать /categories для выбора категории или /feedback.",
-                parse_mode='HTML'
-            )
+            await update.message.reply_text(await get_message('no_results'), parse_mode='HTML')
         return
 
     for idx, (q, a, s) in enumerate(results[:3]):
@@ -1584,7 +1808,7 @@ async def startup():
         logger.info("✅ Бот успешно инициализирован через before_serving")
     else:
         logger.error("❌ Не удалось инициализировать бота")
-        sys.exit(1)  # ОСТАНАВЛИВАЕМ ПРИЛОЖЕНИЕ ПРИ ОШИБКЕ
+        sys.exit(1)
 
 @app.after_serving
 async def shutdown():
@@ -1598,7 +1822,7 @@ async def shutdown():
             logger.error(f"❌ Ошибка при остановке бота: {e}")
 
 # ------------------------------------------------------------
-#  СТРАНИЦА УПРАВЛЕНИЯ FAQ
+#  СТРАНИЦА УПРАВЛЕНИЯ FAQ (с предупреждением о Render Free)
 # ------------------------------------------------------------
 FAQ_MANAGER_HTML = """<!DOCTYPE html>
 <html lang="ru">
@@ -1630,11 +1854,17 @@ FAQ_MANAGER_HTML = """<!DOCTYPE html>
         .auth-form { background: #e9ecef; padding: 20px; border-radius: 5px; margin-bottom: 20px; }
         .error { color: red; margin-top: 10px; }
         .success { color: green; margin-top: 10px; }
+        .warning { background-color: #fff3cd; border: 1px solid #ffeeba; color: #856404; padding: 12px; border-radius: 4px; margin-bottom: 20px; }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>📚 Управление базой знаний FAQ</h1>
+        
+        <div class="warning">
+            ⚠️ На бесплатном тарифе Render изменения будут потеряны при перезапуске сервиса.
+            Для постоянного сохранения отредактируйте <code>faq.json</code> локально и выполните <code>git push</code>.
+        </div>
         
         <div class="auth-form" id="authSection">
             <label for="keyInput">Введите секретный ключ (WEBHOOK_SECRET):</label>
@@ -1753,18 +1983,24 @@ FAQ_MANAGER_HTML = """<!DOCTYPE html>
             })
             .then(res => {
                 if (res.ok) {
-                    hideForm();
-                    loadFaqList();
+                    return res.json();
                 } else {
-                    alert('Ошибка при добавлении');
+                    return res.json().then(err => { throw new Error(err.error || 'Ошибка при добавлении'); });
                 }
             })
-            .catch(err => alert('Ошибка: ' + err));
+            .then(() => {
+                hideForm();
+                loadFaqList();
+            })
+            .catch(err => alert('Ошибка: ' + err.message));
         }
 
         function editFaq(id) {
             fetch(`${API_BASE}/faq/api/${id}?key=${encodeURIComponent(currentKey)}`)
-                .then(res => res.json())
+                .then(res => {
+                    if (!res.ok) throw new Error('Не удалось загрузить данные');
+                    return res.json();
+                })
                 .then(item => {
                     const container = document.getElementById('formContainer');
                     container.style.display = 'block';
@@ -1788,7 +2024,7 @@ FAQ_MANAGER_HTML = """<!DOCTYPE html>
                         </form>
                     `;
                 })
-                .catch(err => alert('Ошибка загрузки данных: ' + err));
+                .catch(err => alert('Ошибка загрузки данных: ' + err.message));
         }
 
         function updateFaq(event, id) {
@@ -1806,13 +2042,16 @@ FAQ_MANAGER_HTML = """<!DOCTYPE html>
             })
             .then(res => {
                 if (res.ok) {
-                    hideForm();
-                    loadFaqList();
+                    return res.json();
                 } else {
-                    alert('Ошибка при обновлении');
+                    return res.json().then(err => { throw new Error(err.error || 'Ошибка при обновлении'); });
                 }
             })
-            .catch(err => alert('Ошибка: ' + err));
+            .then(() => {
+                hideForm();
+                loadFaqList();
+            })
+            .catch(err => alert('Ошибка: ' + err.message));
         }
 
         function deleteFaq(id) {
@@ -1824,10 +2063,10 @@ FAQ_MANAGER_HTML = """<!DOCTYPE html>
                 if (res.ok) {
                     document.getElementById(`faq-${id}`).remove();
                 } else {
-                    alert('Ошибка при удалении');
+                    return res.json().then(err => { throw new Error(err.error || 'Ошибка при удалении'); });
                 }
             })
-            .catch(err => alert('Ошибка: ' + err));
+            .catch(err => alert('Ошибка: ' + err.message));
         }
 
         function escapeHtml(unsafe) {
@@ -1846,6 +2085,215 @@ FAQ_MANAGER_HTML = """<!DOCTYPE html>
 @app.route('/faq')
 async def faq_manager():
     return await render_template_string(FAQ_MANAGER_HTML)
+
+# ------------------------------------------------------------
+#  СТРАНИЦА УПРАВЛЕНИЯ СООБЩЕНИЯМИ
+# ------------------------------------------------------------
+MESSAGES_MANAGER_HTML = """<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Управление сообщениями — HR Бот Мечел</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background-color: #f5f5f5; }
+        .container { max-width: 1000px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        h1 { color: #0B1C2F; }
+        .message-group { margin-bottom: 30px; }
+        .message-item { border: 1px solid #ddd; margin-bottom: 10px; padding: 15px; border-radius: 5px; background: #fff; }
+        .message-title { font-weight: bold; color: #0B1C2F; font-size: 1.1em; }
+        .message-key { color: #6c757d; font-size: 0.9em; margin-left: 10px; }
+        .message-text { margin-top: 10px; white-space: pre-wrap; background: #f8f9fa; padding: 10px; border-radius: 4px; }
+        .actions { margin-top: 10px; }
+        button { margin-right: 5px; padding: 5px 15px; border: none; border-radius: 4px; cursor: pointer; }
+        .btn-edit { background: #FFC107; color: #000; }
+        .btn-save { background: #007BFF; color: white; }
+        .btn-cancel { background: #6C757D; color: white; }
+        .auth-form { background: #e9ecef; padding: 20px; border-radius: 5px; margin-bottom: 20px; }
+        input, textarea { width: 100%; padding: 8px; margin-bottom: 10px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }
+        label { font-weight: bold; margin-top: 10px; display: block; }
+        #keyInput { width: 300px; }
+        .error { color: red; margin-top: 10px; }
+        .success { color: green; margin-top: 10px; }
+        .warning { background-color: #fff3cd; border: 1px solid #ffeeba; color: #856404; padding: 12px; border-radius: 4px; margin-bottom: 20px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📝 Редактор системных сообщений</h1>
+        
+        <div class="warning">
+            ⚠️ На бесплатном тарифе Render изменения будут потеряны при перезапуске сервиса.
+            Для постоянного сохранения отредактируйте <code>messages.json</code> локально и выполните <code>git push</code>.
+        </div>
+        
+        <div class="auth-form" id="authSection">
+            <label for="keyInput">Введите секретный ключ (WEBHOOK_SECRET):</label>
+            <input type="password" id="keyInput" placeholder="Секретный ключ">
+            <button onclick="authorize()">Авторизоваться</button>
+            <div id="authError" class="error"></div>
+        </div>
+
+        <div id="content" style="display: none;">
+            <div id="messageList"></div>
+        </div>
+    </div>
+
+    <script>
+        let currentKey = '';
+        let originalMessages = {};
+        const API_BASE = window.location.origin;
+
+        function authorize() {
+            currentKey = document.getElementById('keyInput').value;
+            if (!currentKey) {
+                document.getElementById('authError').innerText = 'Введите ключ';
+                return;
+            }
+            fetch(`${API_BASE}/messages/api?key=${encodeURIComponent(currentKey)}`)
+                .then(res => {
+                    if (res.ok) {
+                        document.getElementById('authSection').style.display = 'none';
+                        document.getElementById('content').style.display = 'block';
+                        loadMessages();
+                    } else {
+                        document.getElementById('authError').innerText = 'Неверный ключ';
+                    }
+                })
+                .catch(() => {
+                    document.getElementById('authError').innerText = 'Ошибка соединения';
+                });
+        }
+
+        function loadMessages() {
+            fetch(`${API_BASE}/messages/api?key=${encodeURIComponent(currentKey)}`)
+                .then(res => res.json())
+                .then(data => {
+                    originalMessages = data;
+                    renderMessages(data);
+                })
+                .catch(err => console.error(err));
+        }
+
+        function renderMessages(messages) {
+            const container = document.getElementById('messageList');
+            let html = '';
+            const groups = {};
+            for (const [key, msg] of Object.entries(messages)) {
+                const groupName = msg.title || key;
+                if (!groups[groupName]) groups[groupName] = [];
+                groups[groupName].push({key, ...msg});
+            }
+            for (const [groupName, items] of Object.entries(groups)) {
+                html += `<div class="message-group"><h2>${escapeHtml(groupName)}</h2>`;
+                items.forEach(item => {
+                    html += `
+                        <div class="message-item" id="msg-${item.key}">
+                            <div>
+                                <span class="message-title">${escapeHtml(item.title || item.key)}</span>
+                                <span class="message-key">(${item.key})</span>
+                            </div>
+                            <div class="message-text" id="text-${item.key}">${escapeHtml(item.text)}</div>
+                            <div class="actions">
+                                <button class="btn-edit" onclick="editMessage('${item.key}')">✏️ Редактировать</button>
+                            </div>
+                        </div>
+                    `;
+                });
+                html += '</div>';
+            }
+            container.innerHTML = html;
+        }
+
+        function editMessage(key) {
+            const currentText = originalMessages[key]?.text || '';
+            const container = document.getElementById(`msg-${key}`);
+            const textDiv = document.getElementById(`text-${key}`);
+            textDiv.innerHTML = `
+                <textarea id="edit-${key}" rows="5">${escapeHtml(currentText)}</textarea>
+                <div style="margin-top: 10px;">
+                    <button class="btn-save" onclick="saveMessage('${key}')">💾 Сохранить</button>
+                    <button class="btn-cancel" onclick="cancelEdit('${key}', '${escapeHtml(currentText)}')">❌ Отмена</button>
+                </div>
+            `;
+        }
+
+        function saveMessage(key) {
+            const newText = document.getElementById(`edit-${key}`).value;
+            const data = { text: newText };
+            fetch(`${API_BASE}/messages/api/${key}?key=${encodeURIComponent(currentKey)}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(data)
+            })
+            .then(res => {
+                if (res.ok) {
+                    return res.json();
+                } else {
+                    return res.json().then(err => { throw new Error(err.error || 'Ошибка при сохранении'); });
+                }
+            })
+            .then(() => {
+                originalMessages[key].text = newText;
+                const textDiv = document.getElementById(`text-${key}`);
+                textDiv.innerHTML = escapeHtml(newText);
+                alert('✅ Сообщение сохранено');
+            })
+            .catch(err => alert('❌ Ошибка: ' + err.message));
+        }
+
+        function cancelEdit(key, originalText) {
+            const textDiv = document.getElementById(`text-${key}`);
+            textDiv.innerHTML = escapeHtml(originalText);
+        }
+
+        function escapeHtml(unsafe) {
+            if (!unsafe) return '';
+            return unsafe
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;")
+                .replace(/'/g, "&#039;");
+        }
+    </script>
+</body>
+</html>"""
+
+@app.route('/messages')
+async def messages_manager():
+    return await render_template_string(MESSAGES_MANAGER_HTML)
+
+# ------------------------------------------------------------
+#  API ДЛЯ УПРАВЛЕНИЯ СООБЩЕНИЯМИ
+# ------------------------------------------------------------
+@app.route('/messages/api', methods=['GET'])
+async def messages_api_list():
+    if not is_authorized(request):
+        return jsonify({'error': 'Forbidden'}), 403
+    messages = await load_messages()
+    return jsonify(messages)
+
+@app.route('/messages/api/<key>', methods=['PUT'])
+async def messages_api_update(key):
+    if not is_authorized(request):
+        return jsonify({'error': 'Forbidden'}), 403
+    try:
+        data = await request.get_json()
+        new_text = data.get('text')
+        if new_text is None:
+            return jsonify({'error': 'Missing text field'}), 400
+        
+        messages = await load_messages()
+        if key not in messages:
+            return jsonify({'error': 'Message key not found'}), 404
+        
+        messages[key]['text'] = new_text
+        await save_messages(messages)
+        return jsonify({'success': True, 'key': key, 'text': new_text})
+    except Exception as e:
+        logger.error(f"Ошибка обновления сообщения {key}: {e}")
+        return jsonify({'error': str(e)}), 500
 
 # ------------------------------------------------------------
 #  API ДЛЯ УПРАВЛЕНИЯ FAQ
@@ -1930,6 +2378,49 @@ async def faq_api_delete(faq_id):
     return jsonify({'success': True}), 200
 
 # ------------------------------------------------------------
+#  API ДЛЯ ПОДПИСЧИКОВ
+# ------------------------------------------------------------
+@app.route('/subscribers/api', methods=['GET'])
+async def subscribers_api_list():
+    if not is_authorized(request):
+        return jsonify({'error': 'Forbidden'}), 403
+    subs = await get_subscribers()
+    return jsonify({'subscribers': subs, 'count': len(subs)})
+
+@app.route('/broadcast/api', methods=['POST'])
+async def broadcast_api():
+    if not is_authorized(request):
+        return jsonify({'error': 'Forbidden'}), 403
+    try:
+        data = await request.get_json()
+        message = data.get('message')
+        if not message:
+            return jsonify({'error': 'Missing message'}), 400
+        
+        subscribers = await get_subscribers()
+        if not subscribers:
+            return jsonify({'error': 'No subscribers'}), 400
+        
+        sent = 0
+        failed = 0
+        for i, uid in enumerate(subscribers):
+            try:
+                await application.bot.send_message(chat_id=uid, text=message, parse_mode='HTML')
+                sent += 1
+                # Улучшенная задержка для API
+                if i % 10 == 9:
+                    await asyncio.sleep(1.0)
+                else:
+                    await asyncio.sleep(0.1)
+            except Exception as e:
+                logger.error(f"❌ Ошибка отправки рассылки пользователю {uid}: {e}")
+                failed += 1
+        return jsonify({'success': True, 'sent': sent, 'failed': failed})
+    except Exception as e:
+        logger.error(f"Ошибка рассылки: {e}")
+        return jsonify({'error': str(e)}), 500
+
+# ------------------------------------------------------------
 #  ОСТАЛЬНЫЕ ВЕБ-ЭНДПОИНТЫ
 # ------------------------------------------------------------
 @app.route('/setwebhook')
@@ -1983,6 +2474,7 @@ async def index():
     admin_count = len(ADMIN_IDS)
     memory_usage = psutil.Process().memory_info().rss / 1024 / 1024
     start_time_str = bot_stats.start_time.strftime('%d.%m.%Y %H:%M') if bot_stats else 'N/A'
+    subscribers = await get_subscribers()
     
     html = f"""<!DOCTYPE html>
 <html lang="ru">
@@ -2101,7 +2593,7 @@ async def index():
 <body>
     <div class="container">
         <h1>🤖 HR Бот «Мечел»</h1>
-        <div class="subtitle">Версия 12.31 · Исправление русских команд, редактор FAQ</div>
+        <div class="subtitle">Версия 12.34 · Периодическое сохранение, улучшенная рассылка, предупреждение о Render</div>
         
         <div class="grid">
             <div class="card">
@@ -2119,6 +2611,7 @@ async def index():
                 <p>Уникальных пользователей (всего)</p>
                 <p>Активных сегодня: {active_today}</p>
                 <p>Всего запросов: {total_searches}</p>
+                <p>📬 Подписчиков: {len(subscribers)}</p>
             </div>
             <div class="card">
                 <h3>🔌 Система</h3>
@@ -2138,6 +2631,8 @@ async def index():
             <a href="/feedback/export?key={WEBHOOK_SECRET}" class="btn" style="background: #9C27B0;">📝 Отзывы</a>
             <a href="/rate/stats?key={WEBHOOK_SECRET}" class="btn" style="background: #FF9800;">⭐ Оценки</a>
             <a href="/faq" class="btn" style="background: #17a2b8;">📚 Редактор FAQ</a>
+            <a href="/messages" class="btn" style="background: #28a745;">💬 Редактор сообщений</a>
+            <a href="/subscribers/api?key={WEBHOOK_SECRET}" class="btn" style="background: #6f42c1;">📬 Подписчики (JSON)</a>
         </div>
         
         <h2>📈 Статистика за последние 7 дней</h2>

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram-бот для HR-отдела компании "Мечел"
-Версия 12.36 — исправление broadcast, команда /предложения, веб-страница рассылки
+Версия 12.37 — ИСПРАВЛЕНИЕ: асинхронный generate_excel_report, устранена ошибка asyncio.run()
 Полная совместимость с search_engine.py v4.6, оптимизация для Render Free.
 """
 
@@ -584,7 +584,7 @@ async def periodic_subscriber_save():
             logger.error(f"❌ Ошибка периодического сохранения подписчиков: {e}")
 
 # ------------------------------------------------------------
-#  СИСТЕМНЫЕ СООБЩЕНИЯ (EDITABLE) — ИСПРАВЛЕНО
+#  СИСТЕМНЫЕ СООБЩЕНИЯ (EDITABLE)
 # ------------------------------------------------------------
 MESSAGES_FILE = 'messages.json'
 messages_lock = asyncio.Lock()
@@ -1024,7 +1024,7 @@ async def post_init(application: Application):
 # ------------------------------------------------------------
 async def init_bot():
     global application, search_engine, bot_stats
-    logger.info("🚀 Инициализация бота версии 12.36...")
+    logger.info("🚀 Инициализация бота версии 12.37...")
 
     try:
         use_builtin = False
@@ -1067,8 +1067,8 @@ async def init_bot():
         application.add_handler(CommandHandler("help", help_command))
         application.add_handler(CommandHandler("categories", categories_command))
         application.add_handler(CommandHandler("faq", categories_command))
-        application.add_handler(CommandHandler("feedback", feedback_command))      # оставляем /feedback
-        application.add_handler(CommandHandler("suggestions", feedback_command)) # добавляем /suggestions
+        application.add_handler(CommandHandler("feedback", feedback_command))
+        application.add_handler(CommandHandler("suggestions", feedback_command))
         application.add_handler(CommandHandler("feedbacks", feedbacks_command))
         application.add_handler(CommandHandler("stats", stats_command))
         application.add_handler(CommandHandler("export", export_command))
@@ -1085,9 +1085,9 @@ async def init_bot():
                 await help_command(update, context)
             elif text.startswith('/категории'):
                 await categories_command(update, context)
-            elif text.startswith('/предложения'):      # переименовано с /отзыв
+            elif text.startswith('/предложения'):
                 await feedback_command(update, context)
-            elif text.startswith('/отзывы'):           # оставляем /отзывы для выгрузки
+            elif text.startswith('/отзывы'):
                 await feedbacks_command(update, context)
             elif text.startswith('/статистика'):
                 await stats_command(update, context)
@@ -1199,7 +1199,6 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _reply_or_edit(update, "⛔ Нет прав.", parse_mode='HTML')
         return
     if not context.args:
-        # ИСПРАВЛЕНО: убрали parse_mode='HTML', чтобы не было ошибки парсинга тега <текст>
         await _reply_or_edit(update, "ℹ️ Использование: /broadcast <текст сообщения>", parse_mode=None)
         return
     message = ' '.join(context.args)
@@ -1260,7 +1259,6 @@ async def categories_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 @measure_response_time
 async def feedback_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик для /feedback, /suggestions, /предложения."""
     user = update.effective_user
     await ensure_subscribed(user.id)
     if bot_stats:
@@ -1270,7 +1268,6 @@ async def feedback_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @measure_response_time
 async def feedbacks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выгрузка отзывов/предложений (админка)."""
     user = update.effective_user
     await ensure_subscribed(user.id)
     if user.id not in ADMIN_IDS:
@@ -1384,7 +1381,7 @@ async def export_to_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     bot_stats.log_message(user.id, user.username or "Unknown", 'command', '/export')
     try:
-        output = generate_excel_report()
+        output = await generate_excel_report()  # <--- await
         filename = f"mechel_bot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         await update.message.reply_document(
             document=output.getvalue(),
@@ -1397,7 +1394,7 @@ async def export_to_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _reply_or_edit(update, f"❌ Ошибка: {str(e)}", parse_mode='HTML')
 
 # ------------------------------------------------------------
-#  ГЕНЕРАЦИЯ ОТЧЁТОВ EXCEL
+#  ГЕНЕРАЦИЯ ОТЧЁТОВ EXCEL (АСИНХРОННАЯ)
 # ------------------------------------------------------------
 def generate_feedback_report() -> io.BytesIO:
     output = io.BytesIO()
@@ -1433,12 +1430,12 @@ def generate_feedback_report() -> io.BytesIO:
     output.seek(0)
     return output
 
-def generate_excel_report() -> io.BytesIO:
+async def generate_excel_report() -> io.BytesIO:  # <--- теперь async
     output = io.BytesIO()
     wb = Workbook()
     stats = bot_stats.get_summary_stats() if bot_stats else {}
     rating_stats = bot_stats.get_rating_stats() if bot_stats else {}
-    subscribers = asyncio.run(get_subscribers())
+    subscribers = await get_subscribers()  # <--- правильный await
 
     ws1 = wb.active
     ws1.title = "Общая статистика"
@@ -2251,7 +2248,7 @@ async def messages_manager():
     return await render_template_string(MESSAGES_MANAGER_HTML)
 
 # ------------------------------------------------------------
-#  СТРАНИЦА РАССЫЛКИ ПОДПИСЧИКАМ (НОВАЯ)
+#  СТРАНИЦА РАССЫЛКИ ПОДПИСЧИКАМ
 # ------------------------------------------------------------
 BROADCAST_PAGE_HTML = """<!DOCTYPE html>
 <html lang="ru">
@@ -2309,7 +2306,6 @@ BROADCAST_PAGE_HTML = """<!DOCTYPE html>
                 document.getElementById('authError').innerText = 'Введите ключ';
                 return;
             }
-            // Проверяем ключ, выполнив запрос к API подписчиков
             fetch(`${API_BASE}/subscribers/api?key=${encodeURIComponent(currentKey)}`)
                 .then(res => {
                     if (res.ok) {
@@ -2689,7 +2685,7 @@ async def index():
 <body>
     <div class="container">
         <h1>🤖 HR Бот «Мечел»</h1>
-        <div class="subtitle">Версия 12.36 · Команда /предложения, веб-рассылка, исправлен broadcast</div>
+        <div class="subtitle">Версия 12.37 · Исправлен экспорт, асинхронный generate_excel_report</div>
         
         <div class="grid">
             <div class="card">
@@ -2859,7 +2855,7 @@ async def export_excel_web():
     if bot_stats is None:
         return jsonify({'error': 'Статистика не инициализирована'}), 503
     try:
-        excel_file = generate_excel_report()
+        excel_file = await generate_excel_report()  # <--- await
         filename = f'mechel_bot_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xlsx'
         response = await make_response(excel_file.getvalue())
         response.mimetype = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'

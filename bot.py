@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
 Telegram-бот для HR-отдела компании "Мечел"
-Версия 12.38 — отображение количества вопросов в статистике и веб-интерфейсе,
+Версия 12.42 — добавлен эндпоинт /meme/sources для мониторинга источников мемов,
+интегрирован модуль мемов, отображение количества вопросов в стартовом сообщении админа,
 исправлен экспорт Excel (асинхронный), команда /предложения, веб-рассылка.
-Полная совместимость с search_engine.py v4.6, оптимизация для Render Free.
+Полная совместимость с search_engine.py v5.2 и meme_handler.py v9.1, оптимизация для Render Free.
 """
 
 import os
@@ -17,6 +18,7 @@ import hashlib
 import re
 import io
 import inspect
+import signal
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Tuple, Union
 from collections import defaultdict, deque
@@ -76,6 +78,31 @@ from openpyxl.utils import get_column_letter
 from dotenv import load_dotenv
 
 import psutil
+
+# ------------------------------------------------------------
+#  ИМПОРТ МОДУЛЯ МЕМОВ
+# ------------------------------------------------------------
+try:
+    from meme_handler import (
+        init_meme_handler,
+        close_meme_handler,
+        meme_command,
+        meme_subscribe_command,
+        meme_unsubscribe_command,
+        get_meme_handler
+    )
+    MEME_MODULE_AVAILABLE = True
+    print("✅ Модуль мемов загружен")
+except ImportError:
+    MEME_MODULE_AVAILABLE = False
+    print("⚠️ Модуль мемов не найден, команды /мем и подписки будут недоступны")
+    # Заглушки
+    async def init_meme_handler(*args, **kwargs): pass
+    async def close_meme_handler(): pass
+    async def meme_command(*args, **kwargs): pass
+    async def meme_subscribe_command(*args, **kwargs): pass
+    async def meme_unsubscribe_command(*args, **kwargs): pass
+    def get_meme_handler(): return None
 
 # ------------------------------------------------------------
 #  ФУНКЦИЯ ЛЕВЕНШТЕЙНА (ДЛЯ ВСТРОЕННОГО ДВИЖКА)
@@ -1025,7 +1052,7 @@ async def post_init(application: Application):
 # ------------------------------------------------------------
 async def init_bot():
     global application, search_engine, bot_stats
-    logger.info("🚀 Инициализация бота версии 12.38...")
+    logger.info("🚀 Инициализация бота версии 12.42...")
 
     try:
         use_builtin = False
@@ -1063,6 +1090,13 @@ async def init_bot():
         builder = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init)
         application = builder.build()
 
+        # --- Инициализация модуля мемов ---
+        if MEME_MODULE_AVAILABLE:
+            await init_meme_handler(application.job_queue)
+            logger.info("✅ Модуль мемов инициализирован")
+        else:
+            logger.warning("⚠️ Модуль мемов не загружен, команды /мем, /мемподписка, /мемотписка недоступны")
+
         # --- АНГЛИЙСКИЕ КОМАНДЫ ---
         application.add_handler(CommandHandler("start", start_command))
         application.add_handler(CommandHandler("help", help_command))
@@ -1076,6 +1110,12 @@ async def init_bot():
         application.add_handler(CommandHandler("subscribe", subscribe_command))
         application.add_handler(CommandHandler("unsubscribe", unsubscribe_command))
         application.add_handler(CommandHandler("broadcast", broadcast_command))
+
+        # --- КОМАНДЫ МОДУЛЯ МЕМОВ ---
+        if MEME_MODULE_AVAILABLE:
+            application.add_handler(CommandHandler("мем", meme_command))
+            application.add_handler(CommandHandler("мемподписка", meme_subscribe_command))
+            application.add_handler(CommandHandler("мемотписка", meme_unsubscribe_command))
 
         # --- РУССКИЕ КОМАНДЫ ЧЕРЕЗ MessageHandler ---
         async def russian_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1100,9 +1140,15 @@ async def init_bot():
                 await unsubscribe_command(update, context)
             elif text.startswith('/рассылка'):
                 await broadcast_command(update, context)
+            elif text.startswith('/мем') and MEME_MODULE_AVAILABLE:
+                await meme_command(update, context)
+            elif text.startswith('/мемподписка') and MEME_MODULE_AVAILABLE:
+                await meme_subscribe_command(update, context)
+            elif text.startswith('/мемотписка') and MEME_MODULE_AVAILABLE:
+                await meme_unsubscribe_command(update, context)
 
         application.add_handler(MessageHandler(
-            filters.Regex(r'^/(старт|помощь|категории|предложения|отзывы|статистика|экспорт|подписаться|отписаться|рассылка)'),
+            filters.Regex(r'^/(старт|помощь|категории|предложения|отзывы|статистика|экспорт|подписаться|отписаться|рассылка|мем|мемподписка|мемотписка)'),
             russian_command_handler
         ))
 
@@ -1157,7 +1203,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bot_stats.log_message(user.id, user.username or "Unknown", 'subscribe', '')
     text = await get_message('welcome', first_name=user.first_name)
     if user.id in ADMIN_IDS:
-        text += "\n\n👑 Админ-команды:\n/stats [период] — статистика\n/feedbacks — отзывы (выгрузка)\n/export — Excel\n/статистика, /отзывы, /экспорт\n/subscribe /unsubscribe — подписка\n/broadcast — рассылка"
+        faq_count = len(search_engine.faq_data) if search_engine else 0
+        text += f"\n\n👑 Админ-команды:\n/stats [период] — статистика\n/feedbacks — отзывы (выгрузка)\n/export — Excel\n/статистика, /отзывы, /экспорт\n/subscribe /unsubscribe — подписка\n/broadcast — рассылка\n📚 Вопросов в базе: {faq_count}"
     await _reply_or_edit(update, text, parse_mode='HTML')
 
 @measure_response_time
@@ -1309,7 +1356,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_stats.log_message(user.id, user.username or "Unknown", 'command', f'/stats {period}')
     s = bot_stats.get_summary_stats(period)
     subscribers = await get_subscribers()
-    faq_count = len(search_engine.faq_data) if search_engine else 0   # <--- ДОБАВЛЕНО
+    faq_count = len(search_engine.faq_data) if search_engine else 0
     
     period_names = {
         'all': 'всё время',
@@ -1346,7 +1393,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📦 Кэш поиска: {s['cache_size']}\n"
         f"⏱ Uptime: {s['uptime']}\n"
         f"👥 Подписчиков на рассылку: {len(subscribers)}\n"
-        f"📚 Вопросов в базе знаний: {faq_count}\n"   # <--- ДОБАВЛЕНО
+        f"📚 Вопросов в базе знаний: {faq_count}\n"
     )
     
     keyboard = [
@@ -1384,7 +1431,7 @@ async def export_to_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     bot_stats.log_message(user.id, user.username or "Unknown", 'command', '/export')
     try:
-        output = await generate_excel_report()  # <--- await
+        output = await generate_excel_report()
         filename = f"mechel_bot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         await update.message.reply_document(
             document=output.getvalue(),
@@ -1799,6 +1846,9 @@ async def startup():
 @app.after_serving
 async def shutdown():
     logger.info("🔴 Остановка бота...")
+    # Закрываем сессию мемов
+    if MEME_MODULE_AVAILABLE:
+        await close_meme_handler()
     if application:
         try:
             await application.stop()
@@ -2516,6 +2566,18 @@ async def broadcast_api():
         return jsonify({'error': str(e)}), 500
 
 # ------------------------------------------------------------
+#  НОВЫЙ ЭНДПОИНТ: СТАТУС ИСТОЧНИКОВ МЕМОВ
+# ------------------------------------------------------------
+@app.route('/meme/sources', methods=['GET'])
+async def meme_sources_status():
+    if not is_authorized(request):
+        return jsonify({'error': 'Forbidden'}), 403
+    if MEME_MODULE_AVAILABLE:
+        handler = get_meme_handler()
+        return jsonify(handler.get_sources_status())
+    return jsonify({'error': 'Meme module not available'}), 503
+
+# ------------------------------------------------------------
 #  ОСТАЛЬНЫЕ ВЕБ-ЭНДПОИНТЫ
 # ------------------------------------------------------------
 @app.route('/setwebhook')
@@ -2570,7 +2632,29 @@ async def index():
     memory_usage = psutil.Process().memory_info().rss / 1024 / 1024
     start_time_str = bot_stats.start_time.strftime('%d.%m.%Y %H:%M') if bot_stats else 'N/A'
     subscribers = await get_subscribers()
-    faq_count = len(search_engine.faq_data) if search_engine else 0   # <--- ДОБАВЛЕНО
+    faq_count = len(search_engine.faq_data) if search_engine else 0
+
+    # Статистика мемов
+    meme_subscribers = 0
+    meme_sources_status = "⏳ проверка..."
+    meme_sources_available = False
+    if MEME_MODULE_AVAILABLE:
+        handler = get_meme_handler()
+        meme_stats = handler.get_stats()
+        meme_subscribers = meme_stats['subscribers_count']
+        sources_status = handler.get_sources_status()
+        if sources_status and sources_status.get('last_check'):
+            last_check = sources_status['last_check']
+            if datetime.now() - last_check < timedelta(hours=2):
+                if sources_status['available']:
+                    meme_sources_status = "✅ доступны"
+                    meme_sources_available = True
+                else:
+                    meme_sources_status = "❌ недоступны"
+            else:
+                meme_sources_status = "⚠️ данные устарели"
+        else:
+            meme_sources_status = "❌ нет данных"
     
     html = f"""<!DOCTYPE html>
 <html lang="ru">
@@ -2689,7 +2773,7 @@ async def index():
 <body>
     <div class="container">
         <h1>🤖 HR Бот «Мечел»</h1>
-        <div class="subtitle">Версия 12.38 · Отображение количества вопросов в статистике и веб-панели</div>
+        <div class="subtitle">Версия 12.42 · Мониторинг источников мемов</div>
         
         <div class="grid">
             <div class="card">
@@ -2707,8 +2791,8 @@ async def index():
                 <p>Уникальных пользователей (всего)</p>
                 <p>Активных сегодня: {active_today}</p>
                 <p>Всего запросов: {total_searches}</p>
-                <p>📬 Подписчиков: {len(subscribers)}</p>
-                <p>📚 Вопросов в базе: {faq_count}</p>   <!-- ДОБАВЛЕНО -->
+                <p>📬 Подписчиков (HR): {len(subscribers)}</p>
+                <p>📚 Вопросов в базе: {faq_count}</p>
             </div>
             <div class="card">
                 <h3>🔌 Система</h3>
@@ -2718,6 +2802,12 @@ async def index():
                 <p>Webhook: {'✅ Активен' if WEBHOOK_URL else '⏹ Локальный'}</p>
                 <p>Администраторы: {admin_count}</p>
                 <p>Память: {memory_usage:.1f} МБ</p>
+            </div>
+            <div class="card">
+                <h3>😄 Мемы</h3>
+                <div class="stat-value">{meme_subscribers}</div>
+                <p>Подписчиков на мемы</p>
+                <p>Источники мемов: <span style="color:{'#4CAF50' if meme_sources_available else '#F44336'};">{meme_sources_status}</span></p>
             </div>
         </div>
         
@@ -2781,6 +2871,11 @@ async def index():
 
 @app.route('/health')
 async def health_check():
+    meme_subscribers = 0
+    if MEME_MODULE_AVAILABLE:
+        handler = get_meme_handler()
+        meme_stats = handler.get_stats()
+        meme_subscribers = meme_stats['subscribers_count']
     return jsonify({
         'status': 'ok',
         'bot': 'running' if application else 'stopped',
@@ -2788,7 +2883,8 @@ async def health_check():
         'uptime': str(datetime.now() - bot_stats.start_time) if bot_stats else 'N/A',
         'avg_response': bot_stats.get_avg_response_time() if bot_stats else 0,
         'cache_size': len(search_engine.cache) if search_engine else 0,
-        'faq_count': len(search_engine.faq_data) if search_engine else 0
+        'faq_count': len(search_engine.faq_data) if search_engine else 0,
+        'meme_subscribers': meme_subscribers
     })
 
 @app.route('/search/stats', methods=['GET', 'POST'])
@@ -2860,7 +2956,7 @@ async def export_excel_web():
     if bot_stats is None:
         return jsonify({'error': 'Статистика не инициализирована'}), 503
     try:
-        excel_file = await generate_excel_report()  # <--- await
+        excel_file = await generate_excel_report()
         filename = f'mechel_bot_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xlsx'
         response = await make_response(excel_file.getvalue())
         response.mimetype = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
@@ -2909,4 +3005,8 @@ async def main():
             pass
 
 if __name__ == '__main__':
+    # Настройка обработки сигналов для корректного завершения
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(shutdown_signal(s)))
     asyncio.run(main())

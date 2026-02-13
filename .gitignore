@@ -7,3 +7,4 @@ data/*.xlsx
 *.db
 instance/
 .DS_Store
+meme_data.json

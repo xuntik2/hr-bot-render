@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Telegram-бот для HR-отдела компании "Мечел"
-Версия 12.37 — ИСПРАВЛЕНИЕ: асинхронный generate_excel_report, устранена ошибка asyncio.run()
+Версия 12.38 — отображение количества вопросов в статистике и веб-интерфейсе,
+исправлен экспорт Excel (асинхронный), команда /предложения, веб-рассылка.
 Полная совместимость с search_engine.py v4.6, оптимизация для Render Free.
 """
 
@@ -1024,7 +1025,7 @@ async def post_init(application: Application):
 # ------------------------------------------------------------
 async def init_bot():
     global application, search_engine, bot_stats
-    logger.info("🚀 Инициализация бота версии 12.37...")
+    logger.info("🚀 Инициализация бота версии 12.38...")
 
     try:
         use_builtin = False
@@ -1076,7 +1077,7 @@ async def init_bot():
         application.add_handler(CommandHandler("unsubscribe", unsubscribe_command))
         application.add_handler(CommandHandler("broadcast", broadcast_command))
 
-        # --- РУССКИЕ КОМАНДЫ ---
+        # --- РУССКИЕ КОМАНДЫ ЧЕРЕЗ MessageHandler ---
         async def russian_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = update.message.text.lower()
             if text.startswith('/старт'):
@@ -1308,6 +1309,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_stats.log_message(user.id, user.username or "Unknown", 'command', f'/stats {period}')
     s = bot_stats.get_summary_stats(period)
     subscribers = await get_subscribers()
+    faq_count = len(search_engine.faq_data) if search_engine else 0   # <--- ДОБАВЛЕНО
     
     period_names = {
         'all': 'всё время',
@@ -1344,6 +1346,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📦 Кэш поиска: {s['cache_size']}\n"
         f"⏱ Uptime: {s['uptime']}\n"
         f"👥 Подписчиков на рассылку: {len(subscribers)}\n"
+        f"📚 Вопросов в базе знаний: {faq_count}\n"   # <--- ДОБАВЛЕНО
     )
     
     keyboard = [
@@ -1394,7 +1397,7 @@ async def export_to_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _reply_or_edit(update, f"❌ Ошибка: {str(e)}", parse_mode='HTML')
 
 # ------------------------------------------------------------
-#  ГЕНЕРАЦИЯ ОТЧЁТОВ EXCEL (АСИНХРОННАЯ)
+#  ГЕНЕРАЦИЯ ОТЧЁТОВ EXCEL
 # ------------------------------------------------------------
 def generate_feedback_report() -> io.BytesIO:
     output = io.BytesIO()
@@ -1430,12 +1433,12 @@ def generate_feedback_report() -> io.BytesIO:
     output.seek(0)
     return output
 
-async def generate_excel_report() -> io.BytesIO:  # <--- теперь async
+async def generate_excel_report() -> io.BytesIO:
     output = io.BytesIO()
     wb = Workbook()
     stats = bot_stats.get_summary_stats() if bot_stats else {}
     rating_stats = bot_stats.get_rating_stats() if bot_stats else {}
-    subscribers = await get_subscribers()  # <--- правильный await
+    subscribers = await get_subscribers()
 
     ws1 = wb.active
     ws1.title = "Общая статистика"
@@ -1805,7 +1808,7 @@ async def shutdown():
             logger.error(f"❌ Ошибка при остановке бота: {e}")
 
 # ------------------------------------------------------------
-#  СТРАНИЦА УПРАВЛЕНИЯ FAQ (с предупреждением о Render Free)
+#  СТРАНИЦА УПРАВЛЕНИЯ FAQ
 # ------------------------------------------------------------
 FAQ_MANAGER_HTML = """<!DOCTYPE html>
 <html lang="ru">
@@ -2567,6 +2570,7 @@ async def index():
     memory_usage = psutil.Process().memory_info().rss / 1024 / 1024
     start_time_str = bot_stats.start_time.strftime('%d.%m.%Y %H:%M') if bot_stats else 'N/A'
     subscribers = await get_subscribers()
+    faq_count = len(search_engine.faq_data) if search_engine else 0   # <--- ДОБАВЛЕНО
     
     html = f"""<!DOCTYPE html>
 <html lang="ru">
@@ -2685,7 +2689,7 @@ async def index():
 <body>
     <div class="container">
         <h1>🤖 HR Бот «Мечел»</h1>
-        <div class="subtitle">Версия 12.37 · Исправлен экспорт, асинхронный generate_excel_report</div>
+        <div class="subtitle">Версия 12.38 · Отображение количества вопросов в статистике и веб-панели</div>
         
         <div class="grid">
             <div class="card">
@@ -2704,6 +2708,7 @@ async def index():
                 <p>Активных сегодня: {active_today}</p>
                 <p>Всего запросов: {total_searches}</p>
                 <p>📬 Подписчиков: {len(subscribers)}</p>
+                <p>📚 Вопросов в базе: {faq_count}</p>   <!-- ДОБАВЛЕНО -->
             </div>
             <div class="card">
                 <h3>🔌 Система</h3>

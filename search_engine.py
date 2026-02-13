@@ -1,5 +1,6 @@
+"""
 ПОИСКОВЫЙ ДВИЖОК ДЛЯ HR-БОТА МЕЧЕЛ
-Версия 5.0 — максимальная оптимизация для бесплатного тарифа:
+Версия 5.2 — максимальная оптимизация для бесплатного тарифа:
 - Инвертированный индекс (O(1) доступ к кандидатам)
 - TF‑IDF ранжирование
 - Быстрый Левенштейн с порогом
@@ -7,6 +8,9 @@
 - Умная фильтрация по категории
 - Динамическое число кандидатов
 - Кэш с TTL 30 минут
+- Поле priority для важных вопросов
+- Автопоказ всех вопросов категории при совпадении запроса с категорией >=75%
+- Валидация поля priority при загрузке JSON
 """
 
 import logging
@@ -67,6 +71,7 @@ def levenshtein_distance(s1: str, s2: str, threshold: int = None) -> int:
 @dataclass
 class FAQEntry:
     id: int
+    priority: int = 0                # добавлено поле priority (по умолчанию 0)
     question: str
     answer: str
     keywords: str
@@ -407,7 +412,7 @@ class SearchEngine:
         'инженерная служба': 'сервисные службы',
     }
 
-    # Стоп-слова оставлены без изменений
+    # Стоп-слова (без изменений)
     STOP_WORDS = {
         'как', 'что', 'где', 'когда', 'почему', 'зачем', 'сколько', 'чей',
         'а', 'и', 'но', 'или', 'если', 'то', 'же', 'бы', 'в', 'на', 'с', 'по',
@@ -425,6 +430,7 @@ class SearchEngine:
         self._inverted_index: Dict[str, Set[FAQEntry]] = defaultdict(set)
         self._doc_count: int = 0
         self._idf_cache: Dict[str, float] = {}
+        self.categories_norm: List[Tuple[str, str]] = []   # (оригинал, нормализованная)
 
         self.stats = {
             'total_searches': 0,
@@ -435,7 +441,7 @@ class SearchEngine:
 
         self._load_faq()
         self._build_indexes()
-        logger.info(f"✅ SearchEngine v5.0: загружено {len(self.faq_data)} записей, "
+        logger.info(f"✅ SearchEngine v5.2: загружено {len(self.faq_data)} записей, "
                     f"инвертированный индекс: {len(self._inverted_index)} уникальных слов, "
                     f"источник: {self.stats['loaded_from']}")
 
@@ -466,6 +472,14 @@ class SearchEngine:
                 if not question or not answer:
                     continue
 
+                # Валидация priority
+                priority_raw = item.get('priority', 0)
+                try:
+                    priority = int(priority_raw)
+                except (ValueError, TypeError):
+                    priority = 0
+                    logger.warning(f"⚠️ Некорректное значение priority для записи {idx}, установлено 0")
+
                 keywords_raw = item.get('keywords', '')
                 if isinstance(keywords_raw, list):
                     keywords_str = ', '.join(keywords_raw)
@@ -482,6 +496,7 @@ class SearchEngine:
 
                 faq = FAQEntry(
                     id=idx,
+                    priority=priority,
                     question=question,
                     answer=answer,
                     keywords=keywords_str,
@@ -503,6 +518,7 @@ class SearchEngine:
         self.faq_data = [
             FAQEntry(
                 id=1,
+                priority=1,
                 question="Как оформить отпуск?",
                 answer="Обратитесь в отдел кадров с заявлением за 2 недели до начала отпуска.",
                 keywords="отпуск, оформить, кадры, заявление",
@@ -512,6 +528,7 @@ class SearchEngine:
             ),
             FAQEntry(
                 id=2,
+                priority=1,
                 question="Когда выплачивается зарплата?",
                 answer="Зарплата выплачивается 5 и 20 числа каждого месяца.",
                 keywords="зарплата, выплата, дата, аванс",
@@ -530,11 +547,13 @@ class SearchEngine:
         self._category_index.clear()
         self._inverted_index.clear()
         self._doc_count = len(self.faq_data)
+        categories_raw = set()
 
         for faq in self.faq_data:
             # Категорийный индекс (нормализованный)
             cat_lower = faq.category.lower().strip()
             self._category_index[cat_lower].append(faq)
+            categories_raw.add(faq.category)
 
             # Инвертированный индекс
             words = set()
@@ -550,6 +569,9 @@ class SearchEngine:
         for word, doc_set in self._inverted_index.items():
             df = len(doc_set)
             self._idf_cache[word] = math.log((self._doc_count + 1) / (df + 1)) + 1  # +1 для сглаживания
+
+        # Нормализованные названия категорий для поиска по категории
+        self.categories_norm = [(cat, self._normalize_text(cat)) for cat in categories_raw]
 
         logger.debug(f"Инвертированный индекс содержит {len(self._inverted_index)} уникальных слов")
 
@@ -704,6 +726,30 @@ class SearchEngine:
         return min(score, 100.0)
 
     # ------------------------------------------------------------
+    #  ПРОВЕРКА СОВПАДЕНИЯ ЗАПРОСА С КАТЕГОРИЕЙ (>=75%)
+    # ------------------------------------------------------------
+    def _category_match_score(self, norm_query: str) -> Optional[str]:
+        """Возвращает название категории, если запрос совпадает с ней не менее чем на 75% (по Левенштейну)."""
+        if not norm_query or len(norm_query) < 3:
+            return None
+        best_cat = None
+        best_ratio = 0.0
+        for cat, norm_cat in self.categories_norm:
+            if not norm_cat:
+                continue
+            max_len = max(len(norm_query), len(norm_cat))
+            if max_len == 0:
+                continue
+            dist = levenshtein_distance(norm_query, norm_cat, threshold=int(max_len * 0.3))
+            if dist > max_len * 0.25:   # если расстояние >25% длины, пропускаем
+                continue
+            ratio = 1.0 - (dist / max_len)
+            if ratio >= 0.75 and ratio > best_ratio:
+                best_ratio = ratio
+                best_cat = cat
+        return best_cat
+
+    # ------------------------------------------------------------
     #  ОСНОВНОЙ ПОИСК
     # ------------------------------------------------------------
     def search(self, query: str, category: Optional[str] = None, top_k: int = 5) -> List[Tuple[str, str, float]]:
@@ -716,6 +762,15 @@ class SearchEngine:
         norm_query = self._normalize_text(query)
         if not norm_query:
             return []
+
+        # ---- НОВАЯ ЛОГИКА: проверка совпадения с категорией ----
+        if category is None:   # только если категория не задана явно
+            matched_cat = self._category_match_score(norm_query)
+            if matched_cat:
+                logger.info(f"🔍 Запрос '{query}' совпал с категорией '{matched_cat}' на >=75%, показываем все вопросы категории")
+                # Получаем все вопросы этой категории (до top_k)
+                return [(faq.question, faq.answer, 100.0) for faq in self.faq_data if faq.category == matched_cat][:top_k]
+        # ---------------------------------------------------------
 
         cache_key = f"{norm_query}_{category}_{top_k}"
         cache_key_hash = hashlib.md5(cache_key.encode()).hexdigest()[:16]
@@ -750,6 +805,10 @@ class SearchEngine:
         results = []
         for faq in candidates:
             score = self._calculate_full_score(norm_query, query_words, faq)
+            # Добавляем небольшой бонус за priority (например, +10% от максимального балла * priority)
+            # priority может быть 0 или 1, но можно масштабировать
+            if faq.priority > 0:
+                score += 5.0   # небольшой приоритет важным вопросам
             if score > 0:
                 results.append((faq.question, faq.answer, score))
 
@@ -859,6 +918,7 @@ class SearchEngine:
             if faq.id == faq_id:
                 return {
                     'id': faq.id,
+                    'priority': faq.priority,
                     'question': faq.question,
                     'answer': faq.answer,
                     'category': faq.category,

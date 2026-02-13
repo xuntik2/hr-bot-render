@@ -1,10 +1,9 @@
 """
 Модуль обработки мемов для бота
 Работает на бесплатном тарифе Render
-Версия 9.1 — добавлен tzinfo в расписание для точного времени МСК,
-мониторинг источников мемов для веб‑панели, батчинг рассылки,
-улучшенный фильтр мата.
-Полная совместимость с bot.py версии 12.41
+Версия 9.2 — исправлены все синтаксические ошибки, добавлен tzinfo для МСК,
+мониторинг источников, батчинг рассылки, улучшенный фильтр мата.
+Полная совместимость с bot.py версии 12.40
 """
 import asyncio
 import aiohttp
@@ -399,7 +398,7 @@ class MemeHandler:
         self.session: Optional[aiohttp.ClientSession] = None
         self.job_queue: Optional[JobQueue] = None
         self._daily_job = None
-        self._sources_job = None   # Задача периодической проверки источников
+        self._sources_job = None  # Задача периодической проверки источников
         self._sources_status = {
             'last_check': None,
             'available': False,

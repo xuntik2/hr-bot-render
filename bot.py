@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
 Telegram-бот для HR-отдела компании "Мечел"
-Версия 12.54 — финальная, с пробуждением и полным запуском:
-• Добавлен вызов application.start() после инициализации
-• Добавлен эндпоинт /wake для UptimeRobot
-• Добавлен after_serving для сброса флага при остановке
-• Все лучшие решения из предыдущих версий объединены
+Версия 12.57 — финальная, с правильной регистрацией маршрутов после инициализации
+• Регистрация веб-маршрутов перенесена внутрь setup_bot (после создания объектов)
+• Удалён глобальный блок регистрации маршрутов (предотвращал повторную регистрацию, но использовал None-объекты)
+• Все лучшие решения из предыдущих версий сохранены
 """
 import os
 import sys
@@ -446,6 +445,9 @@ _bot_initialized = False
 _bot_initializing = False
 _bot_init_lock = asyncio.Lock()
 
+# Флаг для защиты повторной регистрации веб-маршрутов
+_routes_registered = False
+
 # ------------------------------------------------------------
 #  БЛОКИРОВКИ ДЛЯ РАБОТЫ С JSON
 # ------------------------------------------------------------
@@ -780,7 +782,7 @@ async def shutdown():
 @app.before_serving
 async def setup_bot():
     """Инициализация бота при запуске Quart-приложения"""
-    global application, search_engine, bot_stats, _bot_initialized, _bot_initializing
+    global application, search_engine, bot_stats, _bot_initialized, _bot_initializing, _routes_registered
     
     async with _bot_init_lock:
         if _bot_initialized or _bot_initializing:
@@ -788,7 +790,7 @@ async def setup_bot():
             return
         
         _bot_initializing = True
-        logger.info("🚀 Инициализация бота версии 12.54...")
+        logger.info("🚀 Инициализация бота версии 12.57...")
         
         try:
             use_builtin = False
@@ -901,6 +903,30 @@ async def setup_bot():
             application.add_handler(CallbackQueryHandler(handle_callback_query))
             application.add_error_handler(error_handler)
             
+            # === КРИТИЧЕСКИ ВАЖНО: Регистрация маршрутов ТОЛЬКО ПОСЛЕ инициализации ===
+            if not _routes_registered:
+                register_web_routes(
+                    app,
+                    application=application,      # ← Теперь НЕ None!
+                    search_engine=search_engine,  # ← Теперь НЕ None!
+                    bot_stats=bot_stats,          # ← Теперь НЕ None!
+                    load_faq_json=load_faq_json,
+                    save_faq_json=save_faq_json,
+                    get_next_faq_id=get_next_faq_id,
+                    load_messages=load_messages,
+                    save_messages=save_messages,
+                    get_subscribers=get_subscribers,
+                    WEBHOOK_SECRET=WEBHOOK_SECRET,
+                    BASE_URL=BASE_URL,
+                    MEME_MODULE_AVAILABLE=MEME_MODULE_AVAILABLE,
+                    get_meme_handler=get_meme_handler
+                )
+                _routes_registered = True
+                logger.info("✅ Веб-маршруты зарегистрированы один раз")
+            else:
+                logger.info("ℹ️ Веб-маршруты уже зарегистрированы, пропускаем повторную регистрацию")
+            # ========================================================================
+            
             # Инициализация и ЗАПУСК приложения (обязательно для JobQueue)
             await application.initialize()
             await application.start()  # ← КРИТИЧЕСКИ ВАЖНО!
@@ -927,24 +953,6 @@ async def setup_bot():
             else:
                 await application.bot.delete_webhook(drop_pending_updates=True)
                 logger.info("✅ Режим поллинга (локальная разработка)")
-            
-            # Регистрация веб-маршрутов (админка)
-            register_web_routes(
-                app,
-                application=application,
-                search_engine=search_engine,
-                bot_stats=bot_stats,
-                load_faq_json=load_faq_json,
-                save_faq_json=save_faq_json,
-                get_next_faq_id=get_next_faq_id,
-                load_messages=load_messages,
-                save_messages=save_messages,
-                get_subscribers=get_subscribers,
-                WEBHOOK_SECRET=WEBHOOK_SECRET,
-                BASE_URL=BASE_URL,
-                MEME_MODULE_AVAILABLE=MEME_MODULE_AVAILABLE,
-                get_meme_handler=get_meme_handler
-            )
             
             # Запуск периодического сохранения подписчиков
             asyncio.create_task(periodic_subscriber_save())
@@ -1073,7 +1081,7 @@ async def index():
             <h1>🤖 HR Bot - Мечел</h1>
             <p class="status">{status_text}</p>
             <div class="info">
-                <strong>Версия:</strong> 12.54 (Render)<br>
+                <strong>Версия:</strong> 12.57 (Render)<br>
                 <strong>Режим:</strong> {"Render (Production)" if RENDER else "Local (Development)"}<br>
                 <strong>Вебхук:</strong> {WEBHOOK_URL + WEBHOOK_PATH if RENDER else "не настроен"}<br>
                 <strong>База знаний:</strong> {faq_count} записей

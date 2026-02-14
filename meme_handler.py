@@ -1,10 +1,9 @@
 """
 Модуль обработки мемов для бота
 Работает на бесплатном тарифе Render
-Версия 9.2 — исправлены все синтаксические ошибки, добавлены латинские команды в тексты ответов,
-часовой пояс с tzinfo для точного времени МСК, мониторинг источников, батчинг рассылки,
-улучшенный фильтр мата с нормализацией латиницы.
-Полная совместимость с bot.py версии 12.43
+Версия 9.6 — добавлено логгирование администраторов, оптимизированное сохранение,
+поддержка разных лимитов для админов (5 мемов в сутки),
+хранение истории запросов за 24 часа, полная совместимость с bot.py версии 12.45
 """
 import asyncio
 import aiohttp
@@ -13,7 +12,7 @@ import os
 import random
 import re
 from datetime import datetime, timedelta, time
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, Set
 from telegram import Update
 from telegram.ext import ContextTypes, JobQueue
 import logging
@@ -89,32 +88,59 @@ RUSSIAN_BAD_WORDS = {
 }
 
 # ============================================================
-#  ИСТОЧНИКИ МЕМОВ (БЕЗ ПРОБЕЛОВ В КОНЦЕ — КРИТИЧЕСКИ ВАЖНО!)
+#  ИСТОЧНИКИ МЕМОВ (С ПРИОРИТЕТАМИ: 1 — русские, 2 — общие)
 # ============================================================
 MEME_SOURCES = [
+    # Приоритет 1: Русскоязычные сабреддиты
     {
-        'name': 'Reddit r/PrequelMemes',
-        'url': 'https://meme-api.com/gimme/PrequelMemes',
+        'name': 'Reddit r/Pikabu',
+        'url': 'https://meme-api.com/gimme/Pikabu',
         'timeout': 5,
-        'retries': 2
+        'retries': 2,
+        'priority': 1
+    },
+    {
+        'name': 'Reddit r/russianmemes',
+        'url': 'https://meme-api.com/gimme/russianmemes',
+        'timeout': 5,
+        'retries': 2,
+        'priority': 1
+    },
+    {
+        'name': 'Reddit r/2russianstf',
+        'url': 'https://meme-api.com/gimme/2russianstf',
+        'timeout': 5,
+        'retries': 2,
+        'priority': 1
+    },
+    # Приоритет 2: Универсальные мемы (fallback)
+    {
+        'name': 'Reddit r/memes',
+        'url': 'https://meme-api.com/gimme/memes',
+        'timeout': 5,
+        'retries': 2,
+        'priority': 2
     },
     {
         'name': 'Reddit r/wholesomememes',
         'url': 'https://meme-api.com/gimme/wholesomememes',
         'timeout': 5,
-        'retries': 2
-    },
-    {
-        'name': 'Reddit r/memes',
-        'url': 'https://meme-api.com/gimme/memes',
-        'timeout': 5,
-        'retries': 2
+        'retries': 2,
+        'priority': 2
     },
     {
         'name': 'Reddit r/dankmemes',
         'url': 'https://meme-api.com/gimme/dankmemes',
         'timeout': 5,
-        'retries': 2
+        'retries': 2,
+        'priority': 2
+    },
+    {
+        'name': 'Reddit r/PrequelMemes',
+        'url': 'https://meme-api.com/gimme/PrequelMemes',
+        'timeout': 5,
+        'retries': 2,
+        'priority': 2
     }
 ]
 
@@ -125,16 +151,22 @@ FALLBACK_RUSSIAN_CHANNELS = [
     "@memes_ru"
 ]
 
+# Задержка перед сохранением данных (секунды) для оптимизации частой записи
+SAVE_DELAY = 5.0
+
 
 class MemeStorage:
-    """Хранилище для данных о мемах (работает в памяти + файл)"""
+    """Хранилище для данных о мемах: история запросов за 24ч + подписчики с отложенной записью"""
 
     def __init__(self, file_path: str = 'meme_data.json'):
         self.file_path = file_path
-        self.last_meme_time: Dict[int, datetime] = {}  # user_id -> время последнего мема
-        self.last_request_time: Dict[int, datetime] = {}  # user_id -> время последнего запроса (защита от спама)
-        self.subscribers: set = set()  # user_id подписчиков
+        # История получения мемов: user_id -> список datetime (только за последние 24ч)
+        self.meme_history: Dict[int, List[datetime]] = {}
+        self.last_request_time: Dict[int, datetime] = {}  # защита от спама (последний запрос)
+        self.subscribers: Set[int] = set()
         self._lock = asyncio.Lock()
+        self._save_task: Optional[asyncio.Task] = None
+        self._dirty = False
         self._load_data()
 
     def _load_data(self):
@@ -143,81 +175,130 @@ class MemeStorage:
             if os.path.exists(self.file_path):
                 with open(self.file_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                    # Загружаем время последнего мема
-                    self.last_meme_time = {
-                        int(user_id): datetime.fromisoformat(timestamp)
-                        for user_id, timestamp in data.get('last_meme_time', {}).items()
-                    }
+                    # Загружаем историю мемов
+                    for user_id_str, timestamps in data.get('meme_history', {}).items():
+                        user_id = int(user_id_str)
+                        # Преобразуем строки ISO в datetime и фильтруем только последние 24ч
+                        now = datetime.now()
+                        history = []
+                        for ts_str in timestamps:
+                            try:
+                                ts = datetime.fromisoformat(ts_str)
+                                if (now - ts).total_seconds() < 86400:
+                                    history.append(ts)
+                            except Exception:
+                                continue
+                        if history:
+                            self.meme_history[user_id] = history
                     # Загружаем подписчиков
                     self.subscribers = set(data.get('subscribers', []))
-                logger.info(f"✅ Загружено {len(self.subscribers)} подписчиков из {self.file_path}")
+                logger.info(f"✅ Загружена история для {len(self.meme_history)} пользователей, "
+                           f"подписчиков: {len(self.subscribers)}")
         except Exception as e:
             logger.error(f"❌ Ошибка загрузки данных мемов: {e}")
 
-    async def _save_data(self):
-        """Асинхронное сохранение данных в файл"""
+    async def _save_data_if_dirty(self):
+        """Сохраняет данные только если были изменения"""
+        if not self._dirty:
+            return
         async with self._lock:
             try:
+                # Преобразуем историю в строки ISO для сохранения
+                history_serializable = {}
+                for user_id, timestamps in self.meme_history.items():
+                    history_serializable[str(user_id)] = [ts.isoformat() for ts in timestamps]
                 data = {
-                    'last_meme_time': {
-                        str(user_id): dt.isoformat()
-                        for user_id, dt in self.last_meme_time.items()
-                    },
+                    'meme_history': history_serializable,
                     'subscribers': list(self.subscribers)
                 }
                 with open(self.file_path, 'w', encoding='utf-8') as f:
                     json.dump(data, f, ensure_ascii=False, indent=2)
-                logger.debug(f"💾 Сохранено {len(self.subscribers)} подписчиков")
+                self._dirty = False
+                logger.debug(f"💾 Сохранена история для {len(self.meme_history)} пользователей, "
+                            f"подписчиков: {len(self.subscribers)}")
             except Exception as e:
                 logger.error(f"❌ Ошибка сохранения данных мемов: {e}")
 
-    async def can_get_meme(self, user_id: int) -> Tuple[bool, Optional[str]]:
-        """Проверяет, может ли пользователь получить мем сейчас (1 раз в 24 часа)"""
+    def _schedule_save(self):
+        """Планирует сохранение через SAVE_DELAY секунд с отменой предыдущей задачи"""
+        if self._save_task and not self._save_task.done():
+            self._save_task.cancel()
+        self._save_task = asyncio.create_task(self._delayed_save())
+
+    async def _delayed_save(self):
+        """Задача сохранения после задержки"""
+        try:
+            await asyncio.sleep(SAVE_DELAY)
+            await self._save_data_if_dirty()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"❌ Ошибка в отложенном сохранении: {e}")
+
+    def _clean_old_entries(self, user_id: int):
+        """Удаляет записи старше 24 часов для указанного пользователя"""
+        if user_id not in self.meme_history:
+            return
         now = datetime.now()
-        last_time = self.last_meme_time.get(user_id)
+        self.meme_history[user_id] = [
+            ts for ts in self.meme_history[user_id]
+            if (now - ts).total_seconds() < 86400
+        ]
+        if not self.meme_history[user_id]:
+            del self.meme_history[user_id]
 
-        if last_time is None:
+    async def can_get_meme(self, user_id: int, limit: int = 1) -> Tuple[bool, Optional[str]]:
+        """
+        Проверяет, может ли пользователь получить мем сейчас.
+        :param user_id: ID пользователя
+        :param limit: максимальное количество мемов за последние 24 часа
+        :return: (разрешено, сообщение_если_нет)
+        """
+        # Очищаем старые записи
+        self._clean_old_entries(user_id)
+        current_count = len(self.meme_history.get(user_id, []))
+        if current_count < limit:
             return True, None
-
-        if (now - last_time).total_seconds() >= 86400:  # 24 часа
-            return True, None
-
-        remaining = 86400 - (now - last_time).total_seconds()
-        hours = int(remaining // 3600)
-        minutes = int((remaining % 3600) // 60)
-
-        return False, (
-            f"😅 Вы уже получали мем сегодня!\n"
-            f"Следующий мем будет доступен через {hours}ч {minutes}мин"
-        )
+        else:
+            return False, (
+                f"😅 Вы уже получили {current_count} мемов за последние 24 часа.\n"
+                f"Лимит: {limit}. Попробуйте позже."
+            )
 
     async def is_spamming(self, user_id: int) -> bool:
         """Проверяет, не спамит ли пользователь (защита от флуда)"""
         now = datetime.now()
         last_request = self.last_request_time.get(user_id)
-        
+
         if last_request is None:
             self.last_request_time[user_id] = now
             return False
-        
+
         # Минимум 3 секунды между запросами
         if (now - last_request).total_seconds() < 3:
             return True
-        
+
         self.last_request_time[user_id] = now
         return False
 
     async def record_meme_usage(self, user_id: int):
-        """Записывает время получения мема пользователем"""
-        self.last_meme_time[user_id] = datetime.now()
-        await self._save_data()
+        """Записывает факт получения мема пользователем (с отложенным сохранением)"""
+        now = datetime.now()
+        if user_id not in self.meme_history:
+            self.meme_history[user_id] = []
+        self.meme_history[user_id].append(now)
+        # Оставляем только последние 24ч
+        self._clean_old_entries(user_id)
+        self._dirty = True
+        self._schedule_save()
 
     async def subscribe(self, user_id: int) -> bool:
         """Подписывает пользователя на рассылку мемов"""
         if user_id in self.subscribers:
             return False
         self.subscribers.add(user_id)
-        await self._save_data()
+        self._dirty = True
+        self._schedule_save()
         return True
 
     async def unsubscribe(self, user_id: int) -> bool:
@@ -225,7 +306,8 @@ class MemeStorage:
         if user_id not in self.subscribers:
             return False
         self.subscribers.remove(user_id)
-        await self._save_data()
+        self._dirty = True
+        self._schedule_save()
         return True
 
     def is_subscribed(self, user_id: int) -> bool:
@@ -235,6 +317,27 @@ class MemeStorage:
     def get_subscribers_count(self) -> int:
         """Возвращает количество подписчиков"""
         return len(self.subscribers)
+
+    async def flush(self):
+        """Принудительное сохранение (при завершении работы)"""
+        if self._save_task and not self._save_task.done():
+            self._save_task.cancel()
+        await self._save_data_if_dirty()
+
+    def get_stats(self) -> dict:
+        """Возвращает статистику по мемам"""
+        # Очищаем старые записи у всех пользователей перед подсчётом
+        for uid in list(self.meme_history.keys()):
+            self._clean_old_entries(uid)
+
+        total_requests_24h = sum(len(hist) for hist in self.meme_history.values())
+        users_with_history = len(self.meme_history)
+
+        return {
+            'subscribers_count': self.get_subscribers_count(),
+            'users_with_history': users_with_history,          # количество пользователей, получавших мемы
+            'total_requests_24h': total_requests_24h           # запросов за последние 24 часа
+        }
 
 
 class ContentFilter:
@@ -293,7 +396,7 @@ class ContentFilter:
 
 
 class MemeFetcher:
-    """Загрузчик мемов из различных источников с кэшированием"""
+    """Загрузчик мемов из различных источников с кэшированием и учётом приоритетов"""
 
     def __init__(self, session: Optional[aiohttp.ClientSession] = None):
         self.session = session
@@ -302,31 +405,37 @@ class MemeFetcher:
         self._cache_ttl = {}  # Время жизни кэша
 
     async def fetch_meme(self) -> Optional[dict]:
-        """Получает случайный мем из доступных источников с кэшированием"""
+        """Получает случайный мем из доступных источников с учётом приоритетов и кэшированием"""
         # Проверяем кэш (5 минут)
         now = datetime.now()
         if 'cached_meme' in self._cache and now < self._cache_ttl.get('cached_meme', now):
             logger.info("📦 Используем кэшированный мем")
             return self._cache['cached_meme']
 
-        # Перемешиваем источники для случайности
-        sources = MEME_SOURCES.copy()
-        random.shuffle(sources)
-        failed_sources = []
+        # Группируем источники по приоритету
+        sources_by_priority = {}
+        for src in MEME_SOURCES:
+            priority = src.get('priority', 2)  # по умолчанию приоритет 2
+            sources_by_priority.setdefault(priority, []).append(src)
 
-        for source in sources:
-            try:
-                meme = await self._fetch_from_source(source)
-                if meme and self.content_filter.is_safe_meme(meme):
-                    logger.info(f"✅ Получен мем из {source['name']}: {meme.get('title', 'Без названия')[:50]}")
-                    # Сохраняем в кэш на 5 минут
-                    self._cache['cached_meme'] = meme
-                    self._cache_ttl['cached_meme'] = now + timedelta(minutes=5)
-                    return meme
-            except Exception as e:
-                failed_sources.append(source['name'])
-                logger.warning(f"⚠️ Ошибка получения мема из {source['name']}: {e}")
-                continue
+        # Перебираем группы в порядке возрастания priority (сначала 1, потом 2)
+        failed_sources = []
+        for priority in sorted(sources_by_priority.keys()):
+            sources = sources_by_priority[priority].copy()
+            random.shuffle(sources)  # случайный порядок внутри группы
+            for source in sources:
+                try:
+                    meme = await self._fetch_from_source(source)
+                    if meme and self.content_filter.is_safe_meme(meme):
+                        logger.info(f"✅ Получен мем из {source['name']}: {meme.get('title', 'Без названия')[:50]}")
+                        # Сохраняем в кэш на 5 минут
+                        self._cache['cached_meme'] = meme
+                        self._cache_ttl['cached_meme'] = now + timedelta(minutes=5)
+                        return meme
+                except Exception as e:
+                    failed_sources.append(source['name'])
+                    logger.warning(f"⚠️ Ошибка получения мема из {source['name']}: {e}")
+                    continue
 
         logger.error(f"❌ Все источники не сработали: {', '.join(failed_sources)}")
         return None
@@ -399,18 +508,25 @@ class MemeHandler:
         self.session: Optional[aiohttp.ClientSession] = None
         self.job_queue: Optional[JobQueue] = None
         self._daily_job = None
-        self._sources_job = None  # Задача периодической проверки источников
+        self._sources_job = None
         self._sources_status = {
             'last_check': None,
             'available': False,
             'details': {}
         }
+        # ID администраторов (для расширенного лимита)
+        self.admin_ids: Set[int] = set()
         # Настройка часового пояса для МСК
         try:
             self.moscow_tz = ZoneInfo("Europe/Moscow")
         except Exception as e:
             logger.warning(f"⚠️ Не удалось установить часовой пояс: {e}. Используется системное время.")
             self.moscow_tz = None
+
+    def set_admin_ids(self, admin_ids: List[int]):
+        """Устанавливает список администраторов (для расширенного лимита)"""
+        self.admin_ids = set(admin_ids)
+        logger.info(f"👑 Администраторы мемов: {admin_ids}")  # ← добавлено требуемое сообщение
 
     def set_job_queue(self, job_queue: JobQueue):
         """Устанавливает очередь задач для планирования рассылки"""
@@ -424,7 +540,8 @@ class MemeHandler:
         return MemeFetcher(self.session)
 
     async def close_session(self):
-        """Закрывает сессию при остановке бота"""
+        """Закрывает сессию при остановке бота и сохраняет данные"""
+        await self.storage.flush()
         if self.session and not self.session.closed:
             await self.session.close()
             logger.info("✅ Сессия aiohttp закрыта")
@@ -447,7 +564,7 @@ class MemeHandler:
         return False
 
     async def handle_meme_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик команды /мем с защитой от спама и fallback"""
+        """Обработчик команды /мем с защитой от спама и разными лимитами для админов"""
         user = update.effective_user
         user_id = user.id
 
@@ -460,8 +577,12 @@ class MemeHandler:
                 )
                 return
 
-            # Проверка лимита 1 мем/сутки
-            can_get, message = await self.storage.can_get_meme(user_id)
+            # Определяем лимит в зависимости от прав
+            is_admin = user_id in self.admin_ids
+            limit = 5 if is_admin else 1
+
+            # Проверка лимита
+            can_get, message = await self.storage.can_get_meme(user_id, limit=limit)
             if not can_get:
                 await update.message.reply_text(message, parse_mode='HTML')
                 return
@@ -573,7 +694,7 @@ class MemeHandler:
             batch_size = 25
             for i in range(0, len(subscribers), batch_size):
                 batch = subscribers[i:i + batch_size]
-                
+
                 for user_id in batch:
                     try:
                         await context.bot.send_photo(
@@ -591,7 +712,7 @@ class MemeHandler:
                         logger.error(f"❌ Ошибка отправки мема пользователю {user_id}: {e}")
                         failed_count += 1
                         await asyncio.sleep(0.5)  # Длинная пауза при ошибках
-                
+
                 # Пауза между батчами для избежания лимитов
                 if i + batch_size < len(subscribers):
                     await asyncio.sleep(1.0)
@@ -620,7 +741,7 @@ class MemeHandler:
             target_time = time(hour=9, minute=30)
             wake_up_time = time(hour=9, minute=25)
             logger.warning("⚠️ Часовой пояс не определён, используется локальное время сервера")
-        
+
         # Основная рассылка в 09:30 МСК
         self._daily_job = self.job_queue.run_daily(
             callback=self.send_daily_meme,
@@ -683,13 +804,8 @@ class MemeHandler:
         return self._sources_status
 
     def get_stats(self) -> dict:
-        """Возвращает статистику по мемам"""
-        return {
-            'subscribers_count': self.storage.get_subscribers_count(),
-            'last_meme_usage': len(self.storage.last_meme_time),
-            'total_requests_today': len([dt for dt in self.storage.last_meme_time.values() 
-                                        if (datetime.now() - dt).days == 0])
-        }
+        """Возвращает статистику по мемам (для веб-панели)"""
+        return self.storage.get_stats()
 
 
 # ============================================================
@@ -706,12 +822,16 @@ def get_meme_handler() -> MemeHandler:
     return _meme_handler
 
 
-async def init_meme_handler(job_queue: JobQueue):
+async def init_meme_handler(job_queue: JobQueue, admin_ids: Optional[List[int]] = None):
     """
     Инициализирует обработчик мемов при запуске бота
+    :param job_queue: очередь задач Telegram
+    :param admin_ids: список ID администраторов для расширенного лимита
     """
     handler = get_meme_handler()
     handler.set_job_queue(job_queue)
+    if admin_ids:
+        handler.set_admin_ids(admin_ids)
     handler.schedule_daily_meme()
     handler.schedule_sources_check(interval_hours=1)  # проверка каждый час
     # Первоначальная проверка
@@ -720,7 +840,7 @@ async def init_meme_handler(job_queue: JobQueue):
 
 
 async def close_meme_handler():
-    """Закрывает обработчик мемов при остановке бота (очищает ресурсы)"""
+    """Закрывает обработчик мемов при остановке бота (очищает ресурсы и сохраняет данные)"""
     handler = get_meme_handler()
     await handler.close_session()
     logger.info("✅ Модуль мемов закрыт")

@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram-бот для HR-отдела компании "Мечел"
-Версия 12.59 — исправлена обработка кнопок (редактирование сообщения), добавлено логирование
-• Кнопки в приветствии теперь редактируют текущее сообщение
-• Логирование нажатий на кнопки
-• Все предыдущие улучшения сохранены
+Версия 12.62 — исправлена передача ID для оценок, улучшена навигация
 """
 import os
 import sys
@@ -65,9 +62,6 @@ from telegram.ext import (
     ApplicationBuilder
 )
 import pandas as pd
-from openpyxl import Workbook
-from openpyxl.styles import Font
-from openpyxl.utils import get_column_letter
 from dotenv import load_dotenv
 
 # ------------------------------------------------------------
@@ -106,6 +100,12 @@ from web_panel import register_web_routes
 #  СОЗДАНИЕ QUART ПРИЛОЖЕНИЯ
 # ------------------------------------------------------------
 app = Quart(__name__)
+
+# Флаги инициализации
+_bot_initialized = False
+_bot_initializing = False
+_bot_init_lock = asyncio.Lock()
+_routes_registered = False
 
 # ------------------------------------------------------------
 #  ФУНКЦИЯ ЛЕВЕНШТЕЙНА
@@ -205,7 +205,7 @@ def check_optional_files():
 check_optional_files()
 
 # ------------------------------------------------------------
-#  ВСТРОЕННЫЙ ПОИСКОВЫЙ ДВИЖОК
+#  ВСТРОЕННЫЙ ПОИСКОВЫЙ ДВИЖОК (исправлен: возвращает id)
 # ------------------------------------------------------------
 class BuiltinSearchEngine:
     def __init__(self, max_cache_size: int = 500):
@@ -230,7 +230,10 @@ class BuiltinSearchEngine:
         self._load_data()
         self.cache.clear()
     
-    def search(self, query: str, category: str = None, top_k: int = 5) -> List[Tuple[str, str, float]]:
+    def search(self, query: str, category: str = None, top_k: int = 5) -> List[Tuple[int, str, str, float]]:
+        """
+        Возвращает список кортежей (id, question, answer, score)
+        """
         cache_key = f"{query}:{category}"
         if cache_key in self.cache:
             return self.cache[cache_key]
@@ -241,15 +244,18 @@ class BuiltinSearchEngine:
         for item in self.faq_data:
             if category and item.get('category') != category:
                 continue
+            
             question = item.get('question', '')
             answer = item.get('answer', '')
-            if not question or not answer:
+            faq_id = item.get('id')
+            if not question or not answer or faq_id is None:
                 continue
+            
             score = self._calculate_score(query_lower, question.lower())
             if score > 0.3:
-                results.append((question, answer, score))
+                results.append((faq_id, question, answer, score))
         
-        results.sort(key=lambda x: x[2], reverse=True)
+        results.sort(key=lambda x: x[3], reverse=True)  # сортировка по score
         top_results = results[:top_k]
         
         if len(self.cache) >= self.max_cache_size:
@@ -288,10 +294,11 @@ class ExternalSearchEngineAdapter:
         self.engine = engine
         self.cache = {}
     
-    def search(self, query: str, category: str = None, top_k: int = 5):
+    def search(self, query: str, category: str = None, top_k: int = 5) -> List[Tuple[int, str, str, float]]:
         cache_key = f"{query}:{category}"
         if cache_key in self.cache:
             return self.cache[cache_key]
+        
         try:
             if hasattr(self.engine, 'search'):
                 sig = inspect.signature(self.engine.search)
@@ -300,8 +307,31 @@ class ExternalSearchEngineAdapter:
                     results = self.engine.search(query, category=category, top_k=top_k)
                 else:
                     results = self.engine.search(query, top_k=top_k)
-                self.cache[cache_key] = results
-                return results
+                
+                # Преобразуем результат в единый формат (id, question, answer, score)
+                normalized = []
+                for r in results:
+                    if isinstance(r, tuple) and len(r) >= 3:
+                        # если внешний движок возвращает (question, answer, score)
+                        # id берём из хеша вопроса (не идеально, но лучше, чем ничего)
+                        q, a, s = r[0], r[1], r[2]
+                        fake_id = hash(q) % 1000000
+                        normalized.append((fake_id, q, a, s))
+                    elif isinstance(r, dict):
+                        q = r.get('question', r.get('Question', ''))
+                        a = r.get('answer', r.get('Answer', ''))
+                        s = r.get('score', r.get('Score', 0.0))
+                        fid = r.get('id', hash(q) % 1000000)
+                        normalized.append((fid, q, a, float(s)))
+                    elif hasattr(r, 'question') and hasattr(r, 'answer'):
+                        q = r.question
+                        a = r.answer
+                        s = getattr(r, 'score', 0.0)
+                        fid = getattr(r, 'id', hash(q) % 1000000)
+                        normalized.append((fid, q, a, float(s)))
+                normalized.sort(key=lambda x: x[3], reverse=True)
+                self.cache[cache_key] = normalized[:top_k]
+                return normalized[:top_k]
         except Exception as e:
             logger.error(f"Ошибка поиска во внешнем движке: {e}")
             return []
@@ -330,6 +360,7 @@ async def load_subscribers():
     global _subscribers_cache, _subscribers_cache_loaded
     if _subscribers_cache_loaded:
         return _subscribers_cache or []
+    
     try:
         async with subscribers_lock:
             if os.path.exists(SUBSCRIBERS_FILE):
@@ -339,6 +370,7 @@ async def load_subscribers():
                     return _subscribers_cache
     except Exception as e:
         logger.error(f"Ошибка загрузки подписчиков: {e}")
+    
     _subscribers_cache = []
     _subscribers_cache_loaded = True
     return []
@@ -388,7 +420,7 @@ async def periodic_subscriber_save():
             logger.error(f"Ошибка периодического сохранения: {e}")
 
 # ------------------------------------------------------------
-#  СИСТЕМНЫЕ СООБЩЕНИЯ (обновлено с кнопками)
+#  СИСТЕМНЫЕ СООБЩЕНИЯ
 # ------------------------------------------------------------
 MESSAGES_FILE = 'messages.json'
 messages_lock = asyncio.Lock()
@@ -396,16 +428,20 @@ messages_lock = asyncio.Lock()
 DEFAULT_MESSAGES = {
     "welcome": (
         "🦸‍♂️ <b>Привет, {first_name}!</b>\n\n"
-        "Я — HR-помощник компании <b>«Мечел»</b>.\n\n"
-        "Могу помочь с вопросами:\n"
-        "• 🏖️ Отпуска и отгулы\n"
-        "• 💰 Зарплата и премии\n"
-        "• 📚 Обучение и развитие\n"
-        "• 🏥 ДМС и льготы\n"
-        "• 📋 Документы и справки\n\n"
-        "Нажмите кнопку ниже, чтобы начать! 👇"
+        "Я — официальный HR-помощник компании <b>«Мечел»</b>.\n\n"
+        "🤖 <b>Что я умею:</b>\n"
+        "• Отвечать на вопросы по отпускам, зарплате, ДМС и документам\n"
+        "• Показывать категории вопросов для быстрого поиска\n"
+        "• Присылать мемы для поднятия настроения 😄\n"
+        "• Принимать ваши предложения по улучшению базы знаний\n\n"
+        "👇 Нажмите кнопку ниже, чтобы начать!"
     ),
-    "help": "📚 <b>Доступные команды:</b>\n\n/start - начать работу с ботом\n/help - показать эту справку\n/categories - показать категории вопросов\n/feedback - оставить отзыв или предложение\n/subscribe - подписаться на рассылку\n/unsubscribe - отписаться от рассылки\n/whatcanido - что я умею",
+    "main_menu": (
+        "📋 <b>Главное меню</b>\n\n"
+        "Выберите категорию или задайте вопрос текстом.\n\n"
+        "<i>Пример: «Как оформить отпуск?» или «Справка 2-НДФЛ»</i>"
+    ),
+    "help": "📚 <b>Доступные команды:</b>\n\n/start - начать работу с ботом\\n/help - показать эту справку\\n/categories - показать категории вопросов\\n/feedback - оставить отзыв или предложение\\n/subscribe - подписаться на рассылку\\n/unsubscribe - отписаться от рассылки\\n/whatcanido - что я умею",
     "greeting_response": "👋 Здравствуйте! Чем могу помочь?",
     "subscribe_success": "✅ Вы успешно подписались на рассылку!",
     "already_subscribed": "ℹ️ Вы уже подписаны на рассылку.",
@@ -445,18 +481,11 @@ async def get_message(key: str, **kwargs) -> str:
         return text
 
 # ------------------------------------------------------------
-#  ГЛОБАЛЬНЫЕ ОБЪЕКТЫ И ФЛАГИ ИНИЦИАЛИЗАЦИИ
+#  ГЛОБАЛЬНЫЕ ОБЪЕКТЫ
 # ------------------------------------------------------------
 application: Optional[Application] = None
 search_engine: Optional[Union[BuiltinSearchEngine, ExternalSearchEngineAdapter]] = None
 bot_stats: Optional[BotStatistics] = None
-
-_bot_initialized = False
-_bot_initializing = False
-_bot_init_lock = asyncio.Lock()
-
-# Флаг для защиты повторной регистрации веб-маршрутов
-_routes_registered = False
 
 # ------------------------------------------------------------
 #  БЛОКИРОВКИ ДЛЯ РАБОТЫ С JSON
@@ -515,22 +544,31 @@ async def post_init(application: Application):
 # ------------------------------------------------------------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    
-    # Клавиатура с кнопками
+    PHOTO_PATH = os.path.join(os.path.dirname(__file__), 'mechel_start.png')
     keyboard = [
-        [InlineKeyboardButton("🚀 СТАРТ", callback_data="start_pressed")],
-        [InlineKeyboardButton("📚 Что я умею", callback_data="whatcanido")],
-        [InlineKeyboardButton("📂 Категории", callback_data="categories")]
+        [InlineKeyboardButton("🚀 СТАРТ", callback_data="menu_start")],
+        [InlineKeyboardButton("📚 Что я умею", callback_data="menu_features")],
+        [InlineKeyboardButton("📂 Категории вопросов", callback_data="menu_categories")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
     text = await get_message("welcome", first_name=user.first_name)
-    await update.message.reply_text(
-        text, 
-        parse_mode='HTML',
-        reply_markup=reply_markup
-    )
-    bot_stats.log_message(user.id, user.username or "unknown", 'command')
+    
+    if os.path.exists(PHOTO_PATH):
+        try:
+            with open(PHOTO_PATH, 'rb') as photo_file:
+                await update.message.reply_photo(
+                    photo=photo_file,
+                    caption=text,
+                    parse_mode='HTML',
+                    reply_markup=reply_markup
+                )
+            bot_stats.log_message(user.id, user.username or "unknown", 'command_start_with_image')
+            return
+        except Exception as e:
+            logger.warning(f"Ошибка отправки картинки: {e}")
+    
+    await update.message.reply_text(text, parse_mode='HTML', reply_markup=reply_markup)
+    bot_stats.log_message(user.id, user.username or "unknown", 'command_start')
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = await get_message("help")
@@ -698,10 +736,13 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Мемы: /memsub, /memunsub\n"
         f"• Веб-интерфейс: {BASE_URL}"
     )
-    await update.message.reply_text(text, parse_mode='HTML')
+    keyboard = [[InlineKeyboardButton("👑 Открыть админ-меню", callback_data="menu_admin")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(text, parse_mode='HTML', reply_markup=reply_markup)
+    bot_stats.log_message(update.effective_user.id, update.effective_user.username or "unknown", 'command_admin')
 
 # ------------------------------------------------------------
-#  ОБРАБОТЧИК СООБЩЕНИЙ
+#  ОБРАБОТЧИК СООБЩЕНИЙ (исправлен: использует id из результата)
 # ------------------------------------------------------------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -739,7 +780,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(reply, parse_mode='HTML')
         return
     
-    for i, (q, a, score) in enumerate(results, 1):
+    # Отправка результатов (теперь results — список (id, question, answer, score))
+    for i, (faq_id, q, a, score) in enumerate(results, 1):
         short_q = truncate_question(q, 50)
         text = f"<b>{short_q}</b>\n{a}"
         if i < len(results):
@@ -747,11 +789,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text, parse_mode='HTML')
         await asyncio.sleep(0.5)
     
+    # Кнопки оценки с правильным ID
     keyboard = [
         [
-            InlineKeyboardButton("👍 Полезно", callback_data=f"helpful_{i}"),
-            InlineKeyboardButton("👎 Бесполезно", callback_data=f"unhelpful_{i}")
-        ] for i, _ in enumerate(results, 1)
+            InlineKeyboardButton("👍 Полезно", callback_data=f"helpful_{faq_id}"),
+            InlineKeyboardButton("👎 Бесполезно", callback_data=f"unhelpful_{faq_id}")
+        ] for (faq_id, _, _, _) in results
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
@@ -760,62 +803,168 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ------------------------------------------------------------
-#  ОБРАБОТЧИК CALLBACK (ОЦЕНКИ И КНОПКИ)
+#  ОБРАБОТЧИК CALLBACK (исправлен: принимает реальные ID)
 # ------------------------------------------------------------
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
     
-    # Обработка новых кнопок из /start
-    if data == "start_pressed":
-        await query.edit_message_text(
-            "✅ <b>Отлично! Я готов помочь!</b>\n\n"
-            "Напишите ваш вопрос, например:\n"
-            "• «Как оформить отпуск?»\n"
-            "• «Справка 2-НДФЛ»\n"
-            "• «График работы»\n\n"
-            "Или выберите категорию: /categories",
-            parse_mode='HTML'
-        )
-        bot_stats.log_message(query.from_user.id, query.from_user.username or "unknown", 'button_start')
-        return
-    
-    elif data == "whatcanido":
-        text = (
-            "📋 <b>Что я умею:</b>\n"
-            "• Отвечать на HR-вопросы (просто напишите)\n"
-            "• Показывать категории: /categories\n"
-            "• Принимать предложения: /feedback\n"
-            "• Присылать мемы: /мем или /mem\n"
-            "• Подписаться на рассылку: /subscribe\n"
-            "💡 Совет: можно писать «отпуск: как перенести?» — я найду точнее!"
-        )
-        await query.edit_message_text(text, parse_mode='HTML')
-        bot_stats.log_message(query.from_user.id, query.from_user.username or "unknown", 'button_whatcanido')
-        return
-    
-    elif data == "categories":
+    # === ГЛАВНОЕ МЕНЮ ===
+    if data == "menu_start":
         if not search_engine or not search_engine.faq_data:
             text = "📂 База знаний пока пуста."
-        else:
-            categories = set(item.get('category', 'Без категории') for item in search_engine.faq_data)
-            text = "📂 <b>Доступные категории:</b>\n" + "\n".join(f"• {cat}" for cat in sorted(categories))
-        await query.edit_message_text(text, parse_mode='HTML')
-        bot_stats.log_message(query.from_user.id, query.from_user.username or "unknown", 'button_categories')
+            await query.edit_message_text(text, parse_mode='HTML')
+            bot_stats.log_message(query.from_user.id, query.from_user.username or "unknown", 'menu_start_empty')
+            return
+        
+        categories = sorted(set(item.get('category', 'Без категории') for item in search_engine.faq_data))
+        categories_text = "📂 <b>Доступные категории:</b>\n" + "\n".join(f"• {cat}" for cat in categories[:5])
+        
+        example_item = next((item for item in search_engine.faq_data if item.get('category') == categories[0]), None)
+        example_text = f"\n\n💡 <b>Пример вопроса из категории «{categories[0]}»:</b>\n«{example_item['question']}»" if example_item else ""
+        
+        full_text = categories_text + example_text + "\n\nВыберите действие:"
+        
+        keyboard = [
+            [InlineKeyboardButton("📂 Категории вопросов", callback_data="menu_categories")],
+            [InlineKeyboardButton("📋 Что я ещё умею", callback_data="menu_features")],
+            [InlineKeyboardButton("🏠 Вернуться в начало", callback_data="menu_start")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(full_text, parse_mode='HTML', reply_markup=reply_markup)
+        bot_stats.log_message(query.from_user.id, query.from_user.username or "unknown", 'menu_start')
         return
     
-    # Обработка оценок
-    if data.startswith("helpful_"):
+    # === СПИСОК КАТЕГОРИЙ ===
+    elif data == "menu_categories":
+        if not search_engine or not search_engine.faq_data:
+            text = "📂 База знаний пока пуста."
+            await query.edit_message_text(text, parse_mode='HTML')
+            bot_stats.log_message(query.from_user.id, query.from_user.username or "unknown", 'menu_categories_empty')
+            return
+        
+        categories = sorted(set(item.get('category', 'Без категории') for item in search_engine.faq_data))
+        keyboard = []
+        for cat in categories[:10]:
+            keyboard.append([InlineKeyboardButton(f"📁 {cat}", callback_data=f"category_{cat}")])
+        keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="menu_start")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        text = "📂 <b>Выберите категорию вопросов:</b>"
+        if len(categories) > 10:
+            text += f"\n\n(Показаны первые 10 из {len(categories)} категорий)"
+        
+        await query.edit_message_text(text, parse_mode='HTML', reply_markup=reply_markup)
+        bot_stats.log_message(query.from_user.id, query.from_user.username or "unknown", 'menu_categories')
+        return
+    
+    # === ВОПРОСЫ В КАТЕГОРИИ ===
+    elif data.startswith("category_"):
+        category = data.split("_", 1)[1]
+        if not search_engine or not search_engine.faq_data:
+            text = "📂 База знаний пока пуста."
+            await query.edit_message_text(text, parse_mode='HTML')
+            return
+        
+        questions = [item for item in search_engine.faq_data if item.get('category') == category][:10]
+        if not questions:
+            text = f"❌ В категории «{category}» пока нет вопросов."
+            keyboard = [[InlineKeyboardButton("⬅️ Назад к категориям", callback_data="menu_categories")]]
+            await query.edit_message_text(text, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(keyboard))
+            return
+        
+        questions_text = f"📂 <b>Вопросы в категории «{category}»:</b>\n\n"
+        for i, q in enumerate(questions, 1):
+            short_q = truncate_question(q['question'], 60)
+            questions_text += f"{i}. {short_q}\n"
+        questions_text += f"\n💡 Напишите свой вопрос или выберите из списка выше!"
+        
+        keyboard = [
+            [InlineKeyboardButton("⬅️ Назад к категориям", callback_data="menu_categories")],
+            [InlineKeyboardButton("🏠 В начало", callback_data="menu_start")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(questions_text, parse_mode='HTML', reply_markup=reply_markup)
+        bot_stats.log_message(query.from_user.id, query.from_user.username or "unknown", f'category_view_{category}')
+        return
+    
+    # === ДОПОЛНИТЕЛЬНЫЕ ВОЗМОЖНОСТИ ===
+    elif data == "menu_features":
+        features_text = (
+            "📋 <b>Что я ещё умею:</b>\n\n"
+            "😄 <b>Мемы</b>\n"
+            "• /mem — прислать случайный мем\n"
+            "• /memsub — подписаться на ежедневную мем-рассылку (в 9:30 МСК)\n"
+            "• /memunsub — отписаться от рассылки мемов\n\n"
+            "📚 <b>База знаний</b>\n"
+            "• /categories — показать все категории вопросов\n"
+            "• /feedback — предложить добавить новый вопрос в базу знаний\n\n"
+            "🔔 <b>Уведомления</b>\n"
+            "• /subscribe — подписаться на важные уведомления от HR\n"
+            "• /unsubscribe — отписаться от уведомлений\n\n"
+            "🔄 <b>Перезагрузка</b>\n"
+            "• /start — начать диалог заново"
+        )
+        
+        keyboard = [
+            [InlineKeyboardButton("📂 Категории вопросов", callback_data="menu_categories")],
+            [InlineKeyboardButton("🏠 Вернуться в начало", callback_data="menu_start")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(features_text, parse_mode='HTML', reply_markup=reply_markup)
+        bot_stats.log_message(query.from_user.id, query.from_user.username or "unknown", 'menu_features')
+        return
+    
+    # === АДМИН-МЕНЮ ===
+    elif data == "menu_admin" and query.from_user.id in ADMIN_IDS:
+        admin_text = (
+            "👑 <b>Админ-панель</b>\n\n"
+            "📊 <b>Статистика:</b>\n"
+            "• /stats — общая статистика бота\n"
+            "• /stats day — за сегодня\n"
+            "• /stats week — за неделю\n"
+            "• /stats month — за месяц\n"
+            "• /feedbacks — последние отзывы пользователей\n\n"
+            "⚙️ <b>Управление контентом:</b>\n"
+            "• /faq — веб-панель управления базой знаний (в браузере)\n"
+            "• /messages — редактирование системных сообщений\n"
+            "• /export — экспорт статистики в Excel\n\n"
+            "📣 <b>Рассылки:</b>\n"
+            "• /broadcast текст — рассылка всем подписчикам\n"
+            "• /рассылка текст — альтернативная команда на русском\n\n"
+            "🤖 <b>Мемы:</b>\n"
+            "• /memsub — подписка на ежедневную мем-рассылку (09:30 МСК)\n"
+            "• /memunsub — отписка от мем-рассылки"
+        )
+        
+        keyboard = [
+            [InlineKeyboardButton("📂 Категории", callback_data="menu_categories")],
+            [InlineKeyboardButton("🏠 В начало", callback_data="menu_start")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(admin_text, parse_mode='HTML', reply_markup=reply_markup)
+        bot_stats.log_message(query.from_user.id, query.from_user.username or "unknown", 'menu_admin')
+        return
+    
+    # === ОЦЕНКИ ОТВЕТОВ (исправлено: используются реальные ID) ===
+    elif data.startswith("helpful_"):
         faq_id = int(data.split("_")[1])
         bot_stats.record_rating(faq_id, True)
         bot_stats.log_message(query.from_user.id, query.from_user.username or "unknown", 'rating_helpful')
-        await query.edit_message_text("✅ Спасибо за оценку!")
+        await query.edit_message_text("✅ Спасибо за оценку! Рад был помочь!")
     elif data.startswith("unhelpful_"):
         faq_id = int(data.split("_")[1])
         bot_stats.record_rating(faq_id, False)
         bot_stats.log_message(query.from_user.id, query.from_user.username or "unknown", 'rating_unhelpful')
-        await query.edit_message_text("✅ Спасибо за обратную связь!")
+        await query.edit_message_text(
+            "🙏 Спасибо за обратную связь! Мы улучшим ответы.\n"
+            "Напишите ваш вопрос подробнее или используйте /feedback для предложения."
+        )
 
 # ------------------------------------------------------------
 #  ОБРАБОТЧИК ОШИБОК
@@ -844,7 +993,6 @@ async def shutdown():
 # ------------------------------------------------------------
 @app.before_serving
 async def setup_bot():
-    """Инициализация бота при запуске Quart-приложения"""
     global application, search_engine, bot_stats, _bot_initialized, _bot_initializing, _routes_registered
     
     async with _bot_init_lock:
@@ -853,7 +1001,7 @@ async def setup_bot():
             return
         
         _bot_initializing = True
-        logger.info("🚀 Инициализация бота версии 12.59...")
+        logger.info("🚀 Инициализация бота версии 12.62...")
         
         try:
             use_builtin = False
@@ -955,7 +1103,6 @@ async def setup_bot():
                     await what_can_i_do(update, context)
                 elif text.startswith('/админ'):
                     await admin_panel(update, context)
-                # Не обрабатываем английские команды здесь, они уже в CommandHandler
             
             application.add_handler(MessageHandler(
                 filters.Regex(r'^/(старт|помощь|категории|предложения|отзывы|статистика|экспорт|подписаться|отписаться|рассылка|мем|мемподписка|мемотписка|что_могу|админ)'),
@@ -966,13 +1113,13 @@ async def setup_bot():
             application.add_handler(CallbackQueryHandler(handle_callback_query))
             application.add_error_handler(error_handler)
             
-            # === РЕГИСТРАЦИЯ ВЕБ-МАРШРУТОВ (ТОЛЬКО ПОСЛЕ ИНИЦИАЛИЗАЦИИ) ===
+            # === РЕГИСТРАЦИЯ ВЕБ-МАРШРУТОВ ===
             if not _routes_registered:
                 register_web_routes(
                     app,
-                    application=application,      # ← Теперь НЕ None!
-                    search_engine=search_engine,  # ← Теперь НЕ None!
-                    bot_stats=bot_stats,          # ← Теперь НЕ None!
+                    application=application,
+                    search_engine=search_engine,
+                    bot_stats=bot_stats,
                     load_faq_json=load_faq_json,
                     save_faq_json=save_faq_json,
                     get_next_faq_id=get_next_faq_id,
@@ -988,13 +1135,10 @@ async def setup_bot():
                 logger.info("✅ Веб-маршруты зарегистрированы один раз")
             else:
                 logger.info("ℹ️ Веб-маршруты уже зарегистрированы, пропускаем повторную регистрацию")
-            # =================================================================
             
-            # Инициализация и ЗАПУСК приложения (обязательно для JobQueue)
             await application.initialize()
-            await application.start()  # ← КРИТИЧЕСКИ ВАЖНО!
+            await application.start()
             
-            # Настройка вебхука для Render
             if RENDER:
                 webhook_url = WEBHOOK_URL + WEBHOOK_PATH
                 logger.info(f"🔄 Установка вебхука на {webhook_url}...")
@@ -1017,34 +1161,30 @@ async def setup_bot():
                 await application.bot.delete_webhook(drop_pending_updates=True)
                 logger.info("✅ Режим поллинга (локальная разработка)")
             
-            # Запуск периодического сохранения подписчиков
             asyncio.create_task(periodic_subscriber_save())
             
             _bot_initialized = True
             _bot_initializing = False
             logger.info("✅✅✅ Бот полностью инициализирован и готов к работе ✅✅✅")
-            
+        
         except Exception as e:
             _bot_initializing = False
             logger.critical(f"❌❌❌ КРИТИЧЕСКАЯ ОШИБКА ИНИЦИАЛИЗАЦИИ: {e}", exc_info=True)
-            # Не прерываем запуск сервера, чтобы можно было диагностировать через /health
 
 # ------------------------------------------------------------
-#  AFTER_SERVING (ОЧИСТКА ПРИ ОСТАНОВКЕ)
+#  AFTER_SERVING
 # ------------------------------------------------------------
 @app.after_serving
 async def cleanup():
-    """Сброс флага при остановке сервера"""
     global _bot_initialized
     _bot_initialized = False
     logger.info("💤 Сервер останавливается, бот засыпает")
 
 # ------------------------------------------------------------
-#  ЭНДПОИНТ /WAKE ДЛЯ ПРОБУЖДЕНИЯ
+#  ЭНДПОИНТ /WAKE
 # ------------------------------------------------------------
 @app.route('/wake', methods=['GET', 'POST'])
 async def wake():
-    """Пробуждение бота на бесплатном тарифе Render"""
     if not _bot_initialized:
         logger.info("🔄 Пробуждение: запуск инициализации")
         asyncio.create_task(setup_bot())
@@ -1052,43 +1192,35 @@ async def wake():
     return jsonify({'status': 'ok', 'awake': True}), 200
 
 # ------------------------------------------------------------
-#  ОБРАБОТЧИК ВЕБХУКА С ЗАЩИТОЙ ОТ РАННИХ ЗАПРОСОВ
+#  ОБРАБОТЧИК ВЕБХУКА
 # ------------------------------------------------------------
 @app.route(WEBHOOK_PATH, methods=['POST'])
 async def telegram_webhook():
-    """Обработка вебхуков от Telegram с ожиданием инициализации до 10 секунд"""
     global _bot_initialized, _bot_initializing
-    
     timeout = 10
     start_time = time.time()
     while not _bot_initialized and _bot_initializing and (time.time() - start_time) < timeout:
         await asyncio.sleep(0.1)
-    
     if not _bot_initialized:
         logger.warning("⚠️ Получен вебхук до завершения инициализации бота")
         return jsonify({'error': 'Bot not initialized yet'}), 503
-    
     try:
         secret_token = request.headers.get('X-Telegram-Bot-Api-Secret-Token')
         if secret_token != WEBHOOK_SECRET:
             logger.warning(f"Неверный секретный токен: {secret_token}")
             return jsonify({'error': 'Invalid secret token'}), 403
-        
         update_data = await request.get_json()
         if not update_data:
             return jsonify({'error': 'No data'}), 400
-        
         update = Update.de_json(update_data, application.bot)
         await application.process_update(update)
-        
         return jsonify({'status': 'ok'}), 200
-    
     except Exception as e:
         logger.error(f"Ошибка обработки вебхука: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
 # ------------------------------------------------------------
-#  МАРШРУТ /HEALTH (РАСШИРЕННЫЙ)
+#  МАРШРУТ /HEALTH
 # ------------------------------------------------------------
 @app.route('/health', methods=['GET'])
 async def health_check():
@@ -1102,15 +1234,12 @@ async def health_check():
         'search_engine': 'loaded' if search_engine else 'not_loaded',
         'bot_stats': 'initialized' if bot_stats else 'not_initialized',
         'application': 'initialized' if application and _bot_initialized else 'not_initialized',
-        'initialization': {
-            'completed': _bot_initialized,
-            'in_progress': _bot_initializing
-        }
+        'initialization': {'completed': _bot_initialized, 'in_progress': _bot_initializing}
     }
     return jsonify(status), 200 if _bot_initialized else 202
 
 # ------------------------------------------------------------
-#  МАРШРУТ / (КОРНЕВОЙ, ДИНАМИЧЕСКИЙ)
+#  МАРШРУТ /
 # ------------------------------------------------------------
 @app.route('/', methods=['GET'])
 async def index():
@@ -1144,7 +1273,7 @@ async def index():
             <h1>🤖 HR Bot - Мечел</h1>
             <p class="status">{status_text}</p>
             <div class="info">
-                <strong>Версия:</strong> 12.59 (Render)<br>
+                <strong>Версия:</strong> 12.62 (Render)<br>
                 <strong>Режим:</strong> {"Render (Production)" if RENDER else "Local (Development)"}<br>
                 <strong>Вебхук:</strong> {WEBHOOK_URL + WEBHOOK_PATH if RENDER else "не настроен"}<br>
                 <strong>База знаний:</strong> {faq_count} записей
@@ -1158,11 +1287,10 @@ async def index():
     return html, 200
 
 # ------------------------------------------------------------
-#  MAIN (ДЛЯ ЛОКАЛЬНОГО ЗАПУСКА)
+#  MAIN (ЛОКАЛЬНЫЙ ЗАПУСК)
 # ------------------------------------------------------------
 async def main():
     logger.info("🔄 Локальный запуск...")
-    # Инициализация через @before_serving не сработает при прямом запуске, вызываем вручную
     await setup_bot()
     if not RENDER:
         polling_task = asyncio.create_task(application.start_polling(allowed_updates=Update.ALL_TYPES))

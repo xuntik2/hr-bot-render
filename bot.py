@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
 Telegram-бот для HR-отдела компании "Мечел"
-Версия 12.42 — добавлен эндпоинт /meme/sources для мониторинга источников мемов,
-интегрирован модуль мемов, отображение количества вопросов в стартовом сообщении админа,
+Версия 12.44 — добавлены английские команды мемов (/mem, /memsub, /memunsub),
+информация о них в стартовом сообщении админа,
+исправлена регистрация русских команд (теперь только через MessageHandler),
+эндпоинт /meme/sources, интеграция модуля мемов,
+отображение количества вопросов в стартовом сообщении админа,
 исправлен экспорт Excel (асинхронный), команда /предложения, веб-рассылка.
-Полная совместимость с search_engine.py v5.2 и meme_handler.py v9.1, оптимизация для Render Free.
+Полная совместимость с search_engine.py v5.2 и meme_handler.py v9.2, оптимизация для Render Free.
 """
 
 import os
@@ -1052,7 +1055,7 @@ async def post_init(application: Application):
 # ------------------------------------------------------------
 async def init_bot():
     global application, search_engine, bot_stats
-    logger.info("🚀 Инициализация бота версии 12.42...")
+    logger.info("🚀 Инициализация бота версии 12.44...")
 
     try:
         use_builtin = False
@@ -1097,7 +1100,7 @@ async def init_bot():
         else:
             logger.warning("⚠️ Модуль мемов не загружен, команды /мем, /мемподписка, /мемотписка недоступны")
 
-        # --- АНГЛИЙСКИЕ КОМАНДЫ ---
+        # --- АНГЛИЙСКИЕ КОМАНДЫ (включая мемы) ---
         application.add_handler(CommandHandler("start", start_command))
         application.add_handler(CommandHandler("help", help_command))
         application.add_handler(CommandHandler("categories", categories_command))
@@ -1111,11 +1114,11 @@ async def init_bot():
         application.add_handler(CommandHandler("unsubscribe", unsubscribe_command))
         application.add_handler(CommandHandler("broadcast", broadcast_command))
 
-        # --- КОМАНДЫ МОДУЛЯ МЕМОВ ---
+        # Английские команды для мемов
         if MEME_MODULE_AVAILABLE:
-            application.add_handler(CommandHandler("мем", meme_command))
-            application.add_handler(CommandHandler("мемподписка", meme_subscribe_command))
-            application.add_handler(CommandHandler("мемотписка", meme_unsubscribe_command))
+            application.add_handler(CommandHandler("mem", meme_command))
+            application.add_handler(CommandHandler("memsub", meme_subscribe_command))
+            application.add_handler(CommandHandler("memunsub", meme_unsubscribe_command))
 
         # --- РУССКИЕ КОМАНДЫ ЧЕРЕЗ MessageHandler ---
         async def russian_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1204,7 +1207,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = await get_message('welcome', first_name=user.first_name)
     if user.id in ADMIN_IDS:
         faq_count = len(search_engine.faq_data) if search_engine else 0
-        text += f"\n\n👑 Админ-команды:\n/stats [период] — статистика\n/feedbacks — отзывы (выгрузка)\n/export — Excel\n/статистика, /отзывы, /экспорт\n/subscribe /unsubscribe — подписка\n/broadcast — рассылка\n📚 Вопросов в базе: {faq_count}"
+        # Добавляем информацию о мемах для админов (если модуль доступен)
+        meme_info = " | 📌 Мемы: /mem, /memsub, /memunsub (или /мем, /мемподписка, /мемотписка)" if MEME_MODULE_AVAILABLE else ""
+        text += f"\n\n👑 Админ-команды:\n/stats [период] — статистика\n/feedbacks — отзывы (выгрузка)\n/export — Excel\n/статистика, /отзывы, /экспорт\n/subscribe /unsubscribe — подписка\n/broadcast — рассылка{meme_info}\n📚 Вопросов в базе: {faq_count}"
     await _reply_or_edit(update, text, parse_mode='HTML')
 
 @measure_response_time
@@ -2773,7 +2778,7 @@ async def index():
 <body>
     <div class="container">
         <h1>🤖 HR Бот «Мечел»</h1>
-        <div class="subtitle">Версия 12.42 · Мониторинг источников мемов</div>
+        <div class="subtitle">Версия 12.44 · Мониторинг источников мемов</div>
         
         <div class="grid">
             <div class="card">

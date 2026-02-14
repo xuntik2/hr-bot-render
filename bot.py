@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Telegram-бот для HR-отдела компании "Мечел"
-Версия 12.50 — исправлены синтаксические ошибки, добавлен недостающий импорт,
-              полностью рабочая версия для Render
+Версия 12.51 — исправлена инициализация на Render через before_serving,
+              добавлен флаг защиты от двойной инициализации
 """
 import os
 import sys
@@ -204,7 +204,7 @@ def check_optional_files():
 check_optional_files()
 
 # ------------------------------------------------------------
-#  ВСТРОЕННЫЙ ПОИСКОВЫЙ ДВИЖОК (С ОПТИМИЗАЦИЕЙ И ПРЕДЛОЖЕНИЯМИ)
+#  ВСТРОЕННЫЙ ПОИСКОВЫЙ ДВИЖОК
 # ------------------------------------------------------------
 class BuiltinSearchEngine:
     def __init__(self, max_cache_size: int = 500):
@@ -226,7 +226,6 @@ class BuiltinSearchEngine:
             self.faq_data = []
     
     def refresh_data(self):
-        """Обновить данные из файла"""
         self._load_data()
         self.cache.clear()
     
@@ -238,7 +237,7 @@ class BuiltinSearchEngine:
         results = []
         query_lower = query.lower()
         
-        for item in self.faq_data:                     # исправлено: было self.faq_
+        for item in self.faq_data:
             if category and item.get('category') != category:
                 continue
             
@@ -279,7 +278,7 @@ class BuiltinSearchEngine:
         suggestions = set()
         query_lower = query.lower()
         
-        for item in self.faq_data:                     # исправлено: было self.faq_
+        for item in self.faq_data:
             question = item.get('question', '')
             if not question:
                 continue
@@ -333,7 +332,7 @@ class ExternalSearchEngineAdapter:
             self.engine.refresh_data()
 
 # ------------------------------------------------------------
-#  СИСТЕМА ПОДПИСОК (с кэшированием)
+#  СИСТЕМА ПОДПИСОК
 # ------------------------------------------------------------
 SUBSCRIBERS_FILE = 'subscribers.json'
 subscribers_lock = asyncio.Lock()
@@ -396,7 +395,7 @@ async def ensure_subscribed(user_id: int):
 # ------------------------------------------------------------
 async def periodic_subscriber_save():
     while True:
-        await asyncio.sleep(300)  # каждые 5 минут
+        await asyncio.sleep(300)
         try:
             subscribers = await load_subscribers()
             await save_subscribers(subscribers)
@@ -489,7 +488,7 @@ async def load_faq_json():
         logger.error(f"Ошибка загрузки faq.json: {e}")
         return []
 
-async def save_faq_json(data: List[Dict]):          # исправлено: добавлен параметр data
+async def save_faq_json(data: List[Dict]):
     async with faq_lock:
         with open('faq.json', 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -498,7 +497,7 @@ async def save_faq_json(data: List[Dict]):          # исправлено: до
 
 async def get_next_faq_id() -> int:
     data = await load_faq_json()
-    if not data:                                     # исправлено: было пустое условие
+    if not data:
         return 1
     max_id = max((item.get('id', 0) for item in data), default=0)
     return max_id + 1
@@ -524,7 +523,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_stats.log_message(update.effective_user.id, update.effective_user.username or "unknown", 'command')
 
 async def categories_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not search_engine or not search_engine.faq_data:   # исправлено: было search_engine.faq_
+    if not search_engine or not search_engine.faq_data:
         await update.message.reply_text("📂 База знаний пока пуста.", parse_mode='HTML')
         return
     
@@ -612,7 +611,7 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     subscribers = await get_subscribers()
     try:
-        output = await generate_excel_report(bot_stats, subscribers)   # теперь импортировано
+        output = await generate_excel_report(bot_stats, subscribers)
         await update.message.reply_document(
             document=output,
             filename=f"hr_bot_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
@@ -799,99 +798,17 @@ async def shutdown():
     logger.info("✅ Завершено.")
 
 # ------------------------------------------------------------
-#  ОБРАБОТЧИК ВЕБХУКА
+#  ИНИЦИАЛИЗАЦИЯ БОТА (вызывается один раз)
 # ------------------------------------------------------------
-@app.route(WEBHOOK_PATH, methods=['POST'])
-async def telegram_webhook():
-    """Обработка вебхуков от Telegram"""
-    try:
-        secret_token = request.headers.get('X-Telegram-Bot-Api-Secret-Token')
-        if secret_token != WEBHOOK_SECRET:
-            logger.warning(f"Неверный секретный токен: {secret_token}")
-            return jsonify({'error': 'Invalid secret token'}), 403
-        
-        update_data = await request.get_json()
-        if not update_data:                           # исправлено: было update_
-            return jsonify({'error': 'No data'}), 400
-        
-        update = Update.de_json(update_data, application.bot)
-        await application.process_update(update)
-        
-        return jsonify({'status': 'ok'}), 200
-    
-    except Exception as e:
-        logger.error(f"Ошибка обработки вебхука: {e}", exc_info=True)
-        return jsonify({'error': str(e)}), 500
+_bot_initialized = False
 
-# ------------------------------------------------------------
-#  МАРШРУТ /HEALTH
-# ------------------------------------------------------------
-@app.route('/health', methods=['GET'])
-async def health_check():
-    """Проверка работоспособности сервиса"""
-    status = {
-        'status': 'ok',
-        'bot': 'running',
-        'timestamp': datetime.now().isoformat(),
-        'webhook_path': WEBHOOK_PATH,
-        'webhook_url': WEBHOOK_URL + WEBHOOK_PATH if RENDER else 'local',
-        'search_engine': 'loaded' if search_engine else 'not_loaded',
-        'bot_stats': 'initialized' if bot_stats else 'not_initialized'
-    }
-    return jsonify(status), 200
-
-# ------------------------------------------------------------
-#  МАРШРУТ / (КОРНЕВОЙ)
-# ------------------------------------------------------------
-@app.route('/', methods=['GET'])
-async def index():
-    """Корневая страница"""
-    html = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>HR Bot - Мечел</title>
-        <meta charset="utf-8">
-        <style>
-            body { font-family: Arial, sans-serif; padding: 20px; background: #f5f5f5; }
-            .container { max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-            h1 { color: #2c3e50; }
-            .status { color: #27ae60; font-weight: bold; }
-            .info { margin: 15px 0; padding: 10px; background: #f8f9fa; border-radius: 5px; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>🤖 HR Bot - Мечел</h1>
-            <p class="status">✅ Бот запущен и работает</p>
-            <div class="info">
-                <strong>Версия:</strong> 12.50 (Render)<br>
-                <strong>Режим:</strong> RENDER_MODE<br>
-                <strong>Вебхук:</strong> WEBHOOK_INFO<br>
-                <strong>База знаний:</strong> FAQ_COUNT записей
-            </div>
-            <p><a href="/health">Проверить статус</a></p>
-        </div>
-    </body>
-    </html>
-    """
-    
-    render_mode = "Render (Production)" if RENDER else "Local (Development)"
-    webhook_info = WEBHOOK_URL + WEBHOOK_PATH if RENDER else "не настроен"
-    faq_count = len(search_engine.faq_data) if search_engine and hasattr(search_engine, 'faq_data') else 0
-    
-    html = html.replace("RENDER_MODE", render_mode)
-    html = html.replace("WEBHOOK_INFO", webhook_info)
-    html = html.replace("FAQ_COUNT", str(faq_count))
-    
-    return html, 200
-
-# ------------------------------------------------------------
-#  ИНИЦИАЛИЗАЦИЯ БОТА
-# ------------------------------------------------------------
 async def init_bot():
-    global application, search_engine, bot_stats
-    logger.info("🚀 Инициализация бота версии 12.50...")
+    global application, search_engine, bot_stats, _bot_initialized
+    if _bot_initialized:
+        logger.info("ℹ️ Бот уже инициализирован, пропускаем")
+        return True
+    
+    logger.info("🚀 Инициализация бота версии 12.51...")
     
     try:
         use_builtin = False
@@ -1050,6 +967,7 @@ async def init_bot():
             get_meme_handler=get_meme_handler
         )
         
+        _bot_initialized = True
         logger.info("✅ Бот полностью инициализирован и готов к работе")
         return True
     
@@ -1058,20 +976,123 @@ async def init_bot():
         return False
 
 # ------------------------------------------------------------
-#  MAIN
+#  ЗАПУСК ИНИЦИАЛИЗАЦИИ ПЕРЕД ЗАПУСКОМ СЕРВЕРА (ДЛЯ RENDER)
+# ------------------------------------------------------------
+@app.before_serving
+async def startup():
+    """Инициализация бота перед запуском веб-сервера"""
+    logger.info("🔄 Вызов before_serving: инициализация бота...")
+    if not await init_bot():
+        logger.critical("❌ Критическая ошибка инициализации бота, сервер может работать некорректно")
+        # Не завершаем процесс, чтобы Render не перезапускал бесконечно
+
+# ------------------------------------------------------------
+#  ОБРАБОТЧИК ВЕБХУКА
+# ------------------------------------------------------------
+@app.route(WEBHOOK_PATH, methods=['POST'])
+async def telegram_webhook():
+    """Обработка вебхуков от Telegram"""
+    try:
+        secret_token = request.headers.get('X-Telegram-Bot-Api-Secret-Token')
+        if secret_token != WEBHOOK_SECRET:
+            logger.warning(f"Неверный секретный токен: {secret_token}")
+            return jsonify({'error': 'Invalid secret token'}), 403
+        
+        update_data = await request.get_json()
+        if not update_data:
+            return jsonify({'error': 'No data'}), 400
+        
+        if application is None:
+            logger.error("❌ Бот не инициализирован, отклоняем вебхук")
+            return jsonify({'error': 'Bot not initialized'}), 503
+        
+        update = Update.de_json(update_data, application.bot)
+        await application.process_update(update)
+        
+        return jsonify({'status': 'ok'}), 200
+    
+    except Exception as e:
+        logger.error(f"Ошибка обработки вебхука: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+# ------------------------------------------------------------
+#  МАРШРУТ /HEALTH
+# ------------------------------------------------------------
+@app.route('/health', methods=['GET'])
+async def health_check():
+    """Проверка работоспособности сервиса"""
+    status = {
+        'status': 'ok',
+        'bot': 'running' if application else 'not_initialized',
+        'timestamp': datetime.now().isoformat(),
+        'webhook_path': WEBHOOK_PATH,
+        'webhook_url': WEBHOOK_URL + WEBHOOK_PATH if RENDER else 'local',
+        'search_engine': 'loaded' if search_engine else 'not_loaded',
+        'bot_stats': 'initialized' if bot_stats else 'not_initialized'
+    }
+    return jsonify(status), 200
+
+# ------------------------------------------------------------
+#  МАРШРУТ / (КОРНЕВОЙ)
+# ------------------------------------------------------------
+@app.route('/', methods=['GET'])
+async def index():
+    """Корневая страница"""
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>HR Bot - Мечел</title>
+        <meta charset="utf-8">
+        <style>
+            body { font-family: Arial, sans-serif; padding: 20px; background: #f5f5f5; }
+            .container { max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+            h1 { color: #2c3e50; }
+            .status { color: #27ae60; font-weight: bold; }
+            .info { margin: 15px 0; padding: 10px; background: #f8f9fa; border-radius: 5px; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🤖 HR Bot - Мечел</h1>
+            <p class="status">✅ Бот запущен и работает</p>
+            <div class="info">
+                <strong>Версия:</strong> 12.51 (Render)<br>
+                <strong>Режим:</strong> RENDER_MODE<br>
+                <strong>Вебхук:</strong> WEBHOOK_INFO<br>
+                <strong>База знаний:</strong> FAQ_COUNT записей
+            </div>
+            <p><a href="/health">Проверить статус</a></p>
+        </div>
+    </body>
+    </html>
+    """
+    
+    render_mode = "Render (Production)" if RENDER else "Local (Development)"
+    webhook_info = WEBHOOK_URL + WEBHOOK_PATH if RENDER else "не настроен"
+    faq_count = len(search_engine.faq_data) if search_engine and hasattr(search_engine, 'faq_data') else 0
+    
+    html = html.replace("RENDER_MODE", render_mode)
+    html = html.replace("WEBHOOK_INFO", webhook_info)
+    html = html.replace("FAQ_COUNT", str(faq_count))
+    
+    return html, 200
+
+# ------------------------------------------------------------
+#  MAIN (ТОЛЬКО ДЛЯ ЛОКАЛЬНОГО ЗАПУСКА)
 # ------------------------------------------------------------
 async def main():
-    # Инициализация бота ДО запуска сервера
-    if not await init_bot():
-        logger.critical("Не удалось инициализировать бота")
-        sys.exit(1)
-    
     if RENDER:
+        # На Render инициализация уже выполнена в before_serving, здесь только запуск сервера
         logger.info("✅ Запуск в режиме Render (вебхук)")
         config = Config()
         config.bind = [f"0.0.0.0:{PORT}"]
         await serve(app, config)
     else:
+        # Локальный режим: инициализируем бота и запускаем поллинг + сервер
+        if not await init_bot():
+            logger.critical("Не удалось инициализировать бота")
+            sys.exit(1)
         logger.info("🔄 Запуск в режиме поллинга")
         polling_task = asyncio.create_task(application.start_polling(allowed_updates=Update.ALL_TYPES))
         config = Config()

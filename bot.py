@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 Telegram-бот для HR-отдела компании "Мечел"
-Версия 12.57 — финальная, с правильной регистрацией маршрутов после инициализации
-• Регистрация веб-маршрутов перенесена внутрь setup_bot (после создания объектов)
-• Удалён глобальный блок регистрации маршрутов (предотвращал повторную регистрацию, но использовал None-объекты)
-• Все лучшие решения из предыдущих версий сохранены
+Версия 12.59 — исправлена обработка кнопок (редактирование сообщения), добавлено логирование
+• Кнопки в приветствии теперь редактируют текущее сообщение
+• Логирование нажатий на кнопки
+• Все предыдущие улучшения сохранены
 """
 import os
 import sys
@@ -388,13 +388,23 @@ async def periodic_subscriber_save():
             logger.error(f"Ошибка периодического сохранения: {e}")
 
 # ------------------------------------------------------------
-#  СИСТЕМНЫЕ СООБЩЕНИЯ
+#  СИСТЕМНЫЕ СООБЩЕНИЯ (обновлено с кнопками)
 # ------------------------------------------------------------
 MESSAGES_FILE = 'messages.json'
 messages_lock = asyncio.Lock()
 
 DEFAULT_MESSAGES = {
-    "welcome": "👋 Здравствуйте, {first_name}!\n\nЯ — бот для сотрудников компании Мечел. Чем могу помочь?",
+    "welcome": (
+        "🦸‍♂️ <b>Привет, {first_name}!</b>\n\n"
+        "Я — HR-помощник компании <b>«Мечел»</b>.\n\n"
+        "Могу помочь с вопросами:\n"
+        "• 🏖️ Отпуска и отгулы\n"
+        "• 💰 Зарплата и премии\n"
+        "• 📚 Обучение и развитие\n"
+        "• 🏥 ДМС и льготы\n"
+        "• 📋 Документы и справки\n\n"
+        "Нажмите кнопку ниже, чтобы начать! 👇"
+    ),
     "help": "📚 <b>Доступные команды:</b>\n\n/start - начать работу с ботом\n/help - показать эту справку\n/categories - показать категории вопросов\n/feedback - оставить отзыв или предложение\n/subscribe - подписаться на рассылку\n/unsubscribe - отписаться от рассылки\n/whatcanido - что я умею",
     "greeting_response": "👋 Здравствуйте! Чем могу помочь?",
     "subscribe_success": "✅ Вы успешно подписались на рассылку!",
@@ -505,8 +515,21 @@ async def post_init(application: Application):
 # ------------------------------------------------------------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    
+    # Клавиатура с кнопками
+    keyboard = [
+        [InlineKeyboardButton("🚀 СТАРТ", callback_data="start_pressed")],
+        [InlineKeyboardButton("📚 Что я умею", callback_data="whatcanido")],
+        [InlineKeyboardButton("📂 Категории", callback_data="categories")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
     text = await get_message("welcome", first_name=user.first_name)
-    await update.message.reply_text(text, parse_mode='HTML')
+    await update.message.reply_text(
+        text, 
+        parse_mode='HTML',
+        reply_markup=reply_markup
+    )
     bot_stats.log_message(user.id, user.username or "unknown", 'command')
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -737,12 +760,52 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ------------------------------------------------------------
-#  ОБРАБОТЧИК CALLBACK
+#  ОБРАБОТЧИК CALLBACK (ОЦЕНКИ И КНОПКИ)
 # ------------------------------------------------------------
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
+    
+    # Обработка новых кнопок из /start
+    if data == "start_pressed":
+        await query.edit_message_text(
+            "✅ <b>Отлично! Я готов помочь!</b>\n\n"
+            "Напишите ваш вопрос, например:\n"
+            "• «Как оформить отпуск?»\n"
+            "• «Справка 2-НДФЛ»\n"
+            "• «График работы»\n\n"
+            "Или выберите категорию: /categories",
+            parse_mode='HTML'
+        )
+        bot_stats.log_message(query.from_user.id, query.from_user.username or "unknown", 'button_start')
+        return
+    
+    elif data == "whatcanido":
+        text = (
+            "📋 <b>Что я умею:</b>\n"
+            "• Отвечать на HR-вопросы (просто напишите)\n"
+            "• Показывать категории: /categories\n"
+            "• Принимать предложения: /feedback\n"
+            "• Присылать мемы: /мем или /mem\n"
+            "• Подписаться на рассылку: /subscribe\n"
+            "💡 Совет: можно писать «отпуск: как перенести?» — я найду точнее!"
+        )
+        await query.edit_message_text(text, parse_mode='HTML')
+        bot_stats.log_message(query.from_user.id, query.from_user.username or "unknown", 'button_whatcanido')
+        return
+    
+    elif data == "categories":
+        if not search_engine or not search_engine.faq_data:
+            text = "📂 База знаний пока пуста."
+        else:
+            categories = set(item.get('category', 'Без категории') for item in search_engine.faq_data)
+            text = "📂 <b>Доступные категории:</b>\n" + "\n".join(f"• {cat}" for cat in sorted(categories))
+        await query.edit_message_text(text, parse_mode='HTML')
+        bot_stats.log_message(query.from_user.id, query.from_user.username or "unknown", 'button_categories')
+        return
+    
+    # Обработка оценок
     if data.startswith("helpful_"):
         faq_id = int(data.split("_")[1])
         bot_stats.record_rating(faq_id, True)
@@ -790,7 +853,7 @@ async def setup_bot():
             return
         
         _bot_initializing = True
-        logger.info("🚀 Инициализация бота версии 12.57...")
+        logger.info("🚀 Инициализация бота версии 12.59...")
         
         try:
             use_builtin = False
@@ -903,7 +966,7 @@ async def setup_bot():
             application.add_handler(CallbackQueryHandler(handle_callback_query))
             application.add_error_handler(error_handler)
             
-            # === КРИТИЧЕСКИ ВАЖНО: Регистрация маршрутов ТОЛЬКО ПОСЛЕ инициализации ===
+            # === РЕГИСТРАЦИЯ ВЕБ-МАРШРУТОВ (ТОЛЬКО ПОСЛЕ ИНИЦИАЛИЗАЦИИ) ===
             if not _routes_registered:
                 register_web_routes(
                     app,
@@ -925,7 +988,7 @@ async def setup_bot():
                 logger.info("✅ Веб-маршруты зарегистрированы один раз")
             else:
                 logger.info("ℹ️ Веб-маршруты уже зарегистрированы, пропускаем повторную регистрацию")
-            # ========================================================================
+            # =================================================================
             
             # Инициализация и ЗАПУСК приложения (обязательно для JobQueue)
             await application.initialize()
@@ -1081,7 +1144,7 @@ async def index():
             <h1>🤖 HR Bot - Мечел</h1>
             <p class="status">{status_text}</p>
             <div class="info">
-                <strong>Версия:</strong> 12.57 (Render)<br>
+                <strong>Версия:</strong> 12.59 (Render)<br>
                 <strong>Режим:</strong> {"Render (Production)" if RENDER else "Local (Development)"}<br>
                 <strong>Вебхук:</strong> {WEBHOOK_URL + WEBHOOK_PATH if RENDER else "не настроен"}<br>
                 <strong>База знаний:</strong> {faq_count} записей

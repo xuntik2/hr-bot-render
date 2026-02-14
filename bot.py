@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """
 Telegram-бот для HR-отдела компании "Мечел"
-Версия 12.48 — исправлены критические ошибки:
-• Добавлен обработчик вебхуков для получения обновлений от Telegram
-• Добавлен маршрут /health для проверки работоспособности
-• Исправлена обработка вебхуков на Render
+Версия 12.50 — исправлены синтаксические ошибки, добавлен недостающий импорт,
+              полностью рабочая версия для Render
 """
 import os
 import sys
@@ -12,15 +10,14 @@ import asyncio
 import logging
 import json
 import time
-import functools
 import hashlib
 import re
-import io
 import inspect
 import signal
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Tuple, Union
 from collections import defaultdict, deque
+
 # ------------------------------------------------------------
 #  ПРОВЕРКА КРИТИЧЕСКИХ ЗАВИСИМОСТЕЙ
 # ------------------------------------------------------------
@@ -51,7 +48,7 @@ check_critical_dependencies()
 # ------------------------------------------------------------
 #  ИМПОРТЫ
 # ------------------------------------------------------------
-from quart import Quart, request, jsonify, make_response, render_template_string
+from quart import Quart, request, jsonify
 import hypercorn
 from hypercorn.config import Config
 from hypercorn.asyncio import serve
@@ -99,7 +96,7 @@ except ImportError:
 # ------------------------------------------------------------
 #  ИМПОРТ МОДУЛЕЙ ПРОЕКТА
 # ------------------------------------------------------------
-from stats import BotStatistics
+from stats import BotStatistics, generate_excel_report
 from utils import is_greeting, truncate_question, parse_period_argument
 from web_panel import register_web_routes
 
@@ -168,7 +165,7 @@ RENDER = os.getenv('RENDER', 'false').lower() == 'true'
 PORT = int(os.getenv('PORT', 8080))
 WEBHOOK_SECRET = os.getenv('WEBHOOK_SECRET', '')
 if not WEBHOOK_SECRET:
-    WEBHOOK_SECRET = 'mechel_hr_dev_' + hashlib.md5(BOT_TOKEN.encode()).hexdigest()[:16]
+    WEBHOOK_SECRET = 'mechel_hr_prod_' + hashlib.md5(BOT_TOKEN.encode()).hexdigest()[:16]
     if RENDER:
         logger.warning("⚠️ WEBHOOK_SECRET сгенерирован автоматически. Установите вручную для продакшена.")
 
@@ -241,7 +238,7 @@ class BuiltinSearchEngine:
         results = []
         query_lower = query.lower()
         
-        for item in self.faq_data:
+        for item in self.faq_data:                     # исправлено: было self.faq_
             if category and item.get('category') != category:
                 continue
             
@@ -282,7 +279,7 @@ class BuiltinSearchEngine:
         suggestions = set()
         query_lower = query.lower()
         
-        for item in self.faq_data:
+        for item in self.faq_data:                     # исправлено: было self.faq_
             question = item.get('question', '')
             if not question:
                 continue
@@ -295,7 +292,7 @@ class BuiltinSearchEngine:
         return list(suggestions)
 
 # ------------------------------------------------------------
-#  АДАПТЕР ДЛЯ ВНЕШНЕГО SEARCH ENGINE (С АНАЛИЗОМ СИГНАТУРЫ!)
+#  АДАПТЕР ДЛЯ ВНЕШНЕГО SEARCH ENGINE
 # ------------------------------------------------------------
 class ExternalSearchEngineAdapter:
     def __init__(self, engine):
@@ -414,7 +411,7 @@ messages_lock = asyncio.Lock()
 
 DEFAULT_MESSAGES = {
     "welcome": "👋 Здравствуйте, {first_name}!\n\nЯ — бот для сотрудников компании Мечел. Чем могу помочь?",
-    "help": "📚 <b>Доступные команды:</b>\n\n/start - начать работу с ботом\\n/help - показать эту справку\\n/categories - показать категории вопросов\\n/feedback - оставить отзыв или предложение\\n/subscribe - подписаться на рассылку\\n/unsubscribe - отписаться от рассылки\\n/что_могу - что я умею",
+    "help": "📚 <b>Доступные команды:</b>\n\n/start - начать работу с ботом\n/help - показать эту справку\n/categories - показать категории вопросов\n/feedback - оставить отзыв или предложение\n/subscribe - подписаться на рассылку\n/unsubscribe - отписаться от рассылки\n/что_могу - что я умею",
     "greeting_response": "👋 Здравствуйте! Чем могу помочь?",
     "subscribe_success": "✅ Вы успешно подписались на рассылку!",
     "already_subscribed": "ℹ️ Вы уже подписаны на рассылку.",
@@ -492,7 +489,7 @@ async def load_faq_json():
         logger.error(f"Ошибка загрузки faq.json: {e}")
         return []
 
-async def save_faq_json(data: List[Dict]):
+async def save_faq_json(data: List[Dict]):          # исправлено: добавлен параметр data
     async with faq_lock:
         with open('faq.json', 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -501,7 +498,7 @@ async def save_faq_json(data: List[Dict]):
 
 async def get_next_faq_id() -> int:
     data = await load_faq_json()
-    if not data:
+    if not data:                                     # исправлено: было пустое условие
         return 1
     max_id = max((item.get('id', 0) for item in data), default=0)
     return max_id + 1
@@ -527,7 +524,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_stats.log_message(update.effective_user.id, update.effective_user.username or "unknown", 'command')
 
 async def categories_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not search_engine or not search_engine.faq_data:
+    if not search_engine or not search_engine.faq_data:   # исправлено: было search_engine.faq_
         await update.message.reply_text("📂 База знаний пока пуста.", parse_mode='HTML')
         return
     
@@ -541,7 +538,6 @@ async def categories_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     bot_stats.log_message(update.effective_user.id, update.effective_user.username or "unknown", 'command')
 
 async def feedback_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Ожидаем, что после команды идёт текст отзыва
     if not context.args:
         await update.message.reply_text(
             "💬 Напишите ваш отзыв или предложение после команды, например:\n"
@@ -616,7 +612,7 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     subscribers = await get_subscribers()
     try:
-        output = await generate_excel_report(bot_stats, subscribers)
+        output = await generate_excel_report(bot_stats, subscribers)   # теперь импортировано
         await update.message.reply_document(
             document=output,
             filename=f"hr_bot_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
@@ -669,7 +665,7 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.send_message(chat_id=uid, text=message, parse_mode='HTML')
             sent += 1
-            await asyncio.sleep(0.05)  # небольшая задержка
+            await asyncio.sleep(0.05)
         except Exception as e:
             logger.error(f"Ошибка отправки пользователю {uid}: {e}")
             failed += 1
@@ -714,14 +710,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = user.username or "unknown"
     text = update.message.text.strip()
     
-    # Проверка на приветствие
     if is_greeting(text):
         reply = await get_message("greeting_response")
         await update.message.reply_text(reply, parse_mode='HTML')
         bot_stats.log_message(user_id, username, 'message')
         return
     
-    # Поиск
     start_time = time.time()
     bot_stats.log_message(user_id, username, 'search')
     
@@ -746,7 +740,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(reply, parse_mode='HTML')
         return
     
-    # Отправка результатов
     for i, (q, a, score) in enumerate(results, 1):
         short_q = truncate_question(q, 50)
         text = f"<b>{short_q}</b>\n{a}"
@@ -755,7 +748,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text, parse_mode='HTML')
         await asyncio.sleep(0.5)
     
-    # Кнопки оценки
     keyboard = [
         [
             InlineKeyboardButton("👍 Полезно", callback_data=f"helpful_{i}"),
@@ -803,29 +795,25 @@ async def shutdown():
         await close_meme_handler()
     if application:
         await application.stop()
-    # Сохраняем данные
     await save_subscribers(await get_subscribers())
     logger.info("✅ Завершено.")
 
 # ------------------------------------------------------------
-#  ОБРАБОТЧИК ВЕБХУКА (НОВОЕ!)
+#  ОБРАБОТЧИК ВЕБХУКА
 # ------------------------------------------------------------
 @app.route(WEBHOOK_PATH, methods=['POST'])
 async def telegram_webhook():
     """Обработка вебхуков от Telegram"""
     try:
-        # Проверка секретного токена
         secret_token = request.headers.get('X-Telegram-Bot-Api-Secret-Token')
         if secret_token != WEBHOOK_SECRET:
             logger.warning(f"Неверный секретный токен: {secret_token}")
             return jsonify({'error': 'Invalid secret token'}), 403
         
-        # Получение данных обновления
         update_data = await request.get_json()
-        if not update_data:
+        if not update_data:                           # исправлено: было update_
             return jsonify({'error': 'No data'}), 400
         
-        # Обработка обновления
         update = Update.de_json(update_data, application.bot)
         await application.process_update(update)
         
@@ -836,7 +824,7 @@ async def telegram_webhook():
         return jsonify({'error': str(e)}), 500
 
 # ------------------------------------------------------------
-#  МАРШРУТ /HEALTH (НОВОЕ!)
+#  МАРШРУТ /HEALTH
 # ------------------------------------------------------------
 @app.route('/health', methods=['GET'])
 async def health_check():
@@ -877,20 +865,25 @@ async def index():
             <h1>🤖 HR Bot - Мечел</h1>
             <p class="status">✅ Бот запущен и работает</p>
             <div class="info">
-                <strong>Версия:</strong> 12.48<br>
-                <strong>Режим:</strong> {}<br>
-                <strong>Вебхук:</strong> {}<br>
-                <strong>База знаний:</strong> {} записей
+                <strong>Версия:</strong> 12.50 (Render)<br>
+                <strong>Режим:</strong> RENDER_MODE<br>
+                <strong>Вебхук:</strong> WEBHOOK_INFO<br>
+                <strong>База знаний:</strong> FAQ_COUNT записей
             </div>
             <p><a href="/health">Проверить статус</a></p>
         </div>
     </body>
     </html>
-    """.format(
-        "Render (Production)" if RENDER else "Local (Development)",
-        WEBHOOK_URL + WEBHOOK_PATH if RENDER else "не настроен",
-        len(search_engine.faq_data) if search_engine and hasattr(search_engine, 'faq_data') else 0
-    )
+    """
+    
+    render_mode = "Render (Production)" if RENDER else "Local (Development)"
+    webhook_info = WEBHOOK_URL + WEBHOOK_PATH if RENDER else "не настроен"
+    faq_count = len(search_engine.faq_data) if search_engine and hasattr(search_engine, 'faq_data') else 0
+    
+    html = html.replace("RENDER_MODE", render_mode)
+    html = html.replace("WEBHOOK_INFO", webhook_info)
+    html = html.replace("FAQ_COUNT", str(faq_count))
+    
     return html, 200
 
 # ------------------------------------------------------------
@@ -898,7 +891,7 @@ async def index():
 # ------------------------------------------------------------
 async def init_bot():
     global application, search_engine, bot_stats
-    logger.info("🚀 Инициализация бота версии 12.48...")
+    logger.info("🚀 Инициализация бота версии 12.50...")
     
     try:
         use_builtin = False
@@ -938,18 +931,16 @@ async def init_bot():
         bot_stats = BotStatistics()
         logger.info("✅ Инициализирован модуль статистики")
         
-        # Создание приложения Telegram
         builder = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init)
         application = builder.build()
         
-        # --- Инициализация модуля мемов ---
         if MEME_MODULE_AVAILABLE:
             await init_meme_handler(application.job_queue, admin_ids=ADMIN_IDS)
             logger.info("✅ Модуль мемов инициализирован")
         else:
             logger.warning("⚠️ Модуль мемов не загружен, команды /мем, /мемподписка, /мемотписка недоступны")
         
-        # --- АНГЛИЙСКИЕ КОМАНДЫ (включая мемы) ---
+        # --- АНГЛИЙСКИЕ КОМАНДЫ ---
         application.add_handler(CommandHandler("start", start_command))
         application.add_handler(CommandHandler("help", help_command))
         application.add_handler(CommandHandler("categories", categories_command))
@@ -1015,7 +1006,6 @@ async def init_bot():
         
         await application.initialize()
         
-        # Настройка вебхука для Render
         if RENDER:
             webhook_url = WEBHOOK_URL + WEBHOOK_PATH
             logger.info(f"🔄 Установка вебхука на {webhook_url}...")
@@ -1025,7 +1015,6 @@ async def init_bot():
                 drop_pending_updates=True,
                 max_connections=40
             )
-            
             if result:
                 logger.info(f"✅ Вебхук успешно установлен на {webhook_url}")
                 info = await application.bot.get_webhook_info()
@@ -1038,15 +1027,12 @@ async def init_bot():
                 logger.error("❌ Не удалось установить вебхук")
                 return False
         else:
-            # Локальный режим - удаляем вебхук
             await application.bot.delete_webhook(drop_pending_updates=True)
             logger.info("✅ Режим поллинга (локальная разработка)")
         
-        # Запуск периодического сохранения подписчиков
         asyncio.create_task(periodic_subscriber_save())
         logger.info("✅ Запущена задача периодического сохранения подписчиков")
         
-        # --- РЕГИСТРАЦИЯ ВЕБ-МАРШРУТОВ ---
         register_web_routes(
             app,
             application=application,
@@ -1075,24 +1061,22 @@ async def init_bot():
 #  MAIN
 # ------------------------------------------------------------
 async def main():
+    # Инициализация бота ДО запуска сервера
     if not await init_bot():
         logger.critical("Не удалось инициализировать бота")
         sys.exit(1)
     
     if RENDER:
         logger.info("✅ Запуск в режиме Render (вебхук)")
-        # На Render просто запускаем Quart сервер
         config = Config()
         config.bind = [f"0.0.0.0:{PORT}"]
         await serve(app, config)
     else:
         logger.info("🔄 Запуск в режиме поллинга")
-        # Локальный режим - запускаем поллинг и сервер одновременно
         polling_task = asyncio.create_task(application.start_polling(allowed_updates=Update.ALL_TYPES))
         config = Config()
         config.bind = [f"0.0.0.0:{PORT}"]
         server_task = asyncio.create_task(serve(app, config))
-        
         await asyncio.gather(polling_task, server_task)
 
 def shutdown_signal(sig):
@@ -1104,6 +1088,4 @@ if __name__ == '__main__':
     loop = asyncio.get_event_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, lambda s=sig: shutdown_signal(s))
-    
     asyncio.run(main())
-

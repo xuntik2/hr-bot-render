@@ -196,7 +196,7 @@ def check_optional_files():
     optional_files = ['search_engine.py']
     missing = []
     for file in optional_files:
-        if not os.os.path.exists(file):
+        if not os.path.exists(file):
             missing.append(file)
     if missing:
         logger.warning(f"⚠️ Отсутствуют файлы: {', '.join(missing)}")
@@ -1106,3 +1106,4 @@ if __name__ == '__main__':
         loop.add_signal_handler(sig, lambda s=sig: shutdown_signal(s))
     
     asyncio.run(main())
+

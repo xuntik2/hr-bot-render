@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
 Telegram-бот для HR-отдела компании "Мечел"
-Версия 12.47 — исправлены все критические ошибки:
-• Добавлен импорт BotStatistics
-• Добавлено объявление app = Quart(__name__)
-• Восстановлены все обработчики команд
-• Исправлены синтаксические ошибки в web_panel.py
+Версия 12.48 — исправлены критические ошибки:
+• Добавлен обработчик вебхуков для получения обновлений от Telegram
+• Добавлен маршрут /health для проверки работоспособности
+• Исправлена обработка вебхуков на Render
 """
 import os
 import sys
@@ -22,7 +21,6 @@ import signal
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Tuple, Union
 from collections import defaultdict, deque
-
 # ------------------------------------------------------------
 #  ПРОВЕРКА КРИТИЧЕСКИХ ЗАВИСИМОСТЕЙ
 # ------------------------------------------------------------
@@ -181,12 +179,13 @@ if RENDER and not WEBHOOK_URL:
     sys.exit(1)
 
 BASE_URL = f"http://localhost:{PORT}" if not RENDER else WEBHOOK_URL.rstrip('/')
+
 ADMIN_IDS = []
 try:
     admin_str = os.getenv('ADMIN_IDS', '')
     if admin_str:
         ADMIN_IDS = [int(x.strip()) for x in admin_str.split(',') if x.strip().isdigit()]
-        logger.info(f"✅ Администраторы: {ADMIN_IDS}")
+    logger.info(f"✅ Администраторы: {ADMIN_IDS}")
 except Exception as e:
     logger.error(f"❌ Ошибка парсинга ADMIN_IDS: {e}")
 
@@ -197,7 +196,7 @@ def check_optional_files():
     optional_files = ['search_engine.py']
     missing = []
     for file in optional_files:
-        if not os.path.exists(file):
+        if not os.os.path.exists(file):
             missing.append(file)
     if missing:
         logger.warning(f"⚠️ Отсутствуют файлы: {', '.join(missing)}")
@@ -211,18 +210,130 @@ check_optional_files()
 #  ВСТРОЕННЫЙ ПОИСКОВЫЙ ДВИЖОК (С ОПТИМИЗАЦИЕЙ И ПРЕДЛОЖЕНИЯМИ)
 # ------------------------------------------------------------
 class BuiltinSearchEngine:
-    # ... (полный код как в версии 12.45, без изменений) ...
-    # Для краткости я не буду повторять весь код класса, он остаётся таким же, как в исходном файле.
-    # В реальном ответе нужно включить его полностью.
-    # Здесь я оставлю заглушку, но при генерации финального ответа включу полный код из предыдущего сообщения.
-    pass
+    def __init__(self, max_cache_size: int = 500):
+        self.faq_data = []
+        self.cache = {}
+        self.max_cache_size = max_cache_size
+        self._load_data()
+    
+    def _load_data(self):
+        try:
+            with open('faq.json', 'r', encoding='utf-8') as f:
+                self.faq_data = json.load(f)
+            logger.info(f"✅ Загружено {len(self.faq_data)} записей из faq.json")
+        except FileNotFoundError:
+            logger.warning("⚠️ faq.json не найден, база знаний пуста")
+            self.faq_data = []
+        except Exception as e:
+            logger.error(f"❌ Ошибка загрузки faq.json: {e}")
+            self.faq_data = []
+    
+    def refresh_data(self):
+        """Обновить данные из файла"""
+        self._load_data()
+        self.cache.clear()
+    
+    def search(self, query: str, category: str = None, top_k: int = 5) -> List[Tuple[str, str, float]]:
+        cache_key = f"{query}:{category}"
+        if cache_key in self.cache:
+            return self.cache[cache_key]
+        
+        results = []
+        query_lower = query.lower()
+        
+        for item in self.faq_data:
+            if category and item.get('category') != category:
+                continue
+            
+            question = item.get('question', '')
+            answer = item.get('answer', '')
+            
+            if not question or not answer:
+                continue
+            
+            score = self._calculate_score(query_lower, question.lower())
+            
+            if score > 0.3:
+                results.append((question, answer, score))
+        
+        results.sort(key=lambda x: x[2], reverse=True)
+        top_results = results[:top_k]
+        
+        if len(self.cache) >= self.max_cache_size:
+            self.cache.clear()
+        
+        self.cache[cache_key] = top_results
+        return top_results
+    
+    def _calculate_score(self, query: str, text: str) -> float:
+        if query in text:
+            return 1.0
+        
+        query_words = set(query.split())
+        text_words = set(text.split())
+        
+        if not query_words:
+            return 0.0
+        
+        match_count = len(query_words & text_words)
+        return match_count / len(query_words)
+    
+    def suggest_correction(self, query: str, top_k: int = 3) -> List[str]:
+        suggestions = set()
+        query_lower = query.lower()
+        
+        for item in self.faq_data:
+            question = item.get('question', '')
+            if not question:
+                continue
+            
+            if levenshtein_distance(query_lower, question.lower()) <= 3:
+                suggestions.add(question)
+                if len(suggestions) >= top_k:
+                    break
+        
+        return list(suggestions)
 
 # ------------------------------------------------------------
 #  АДАПТЕР ДЛЯ ВНЕШНЕГО SEARCH ENGINE (С АНАЛИЗОМ СИГНАТУРЫ!)
 # ------------------------------------------------------------
 class ExternalSearchEngineAdapter:
-    # ... (полный код) ...
-    pass
+    def __init__(self, engine):
+        self.engine = engine
+        self.cache = {}
+    
+    def search(self, query: str, category: str = None, top_k: int = 5):
+        cache_key = f"{query}:{category}"
+        if cache_key in self.cache:
+            return self.cache[cache_key]
+        
+        try:
+            if hasattr(self.engine, 'search'):
+                sig = inspect.signature(self.engine.search)
+                params = sig.parameters
+                
+                if 'category' in params:
+                    results = self.engine.search(query, category=category, top_k=top_k)
+                else:
+                    results = self.engine.search(query, top_k=top_k)
+                
+                self.cache[cache_key] = results
+                return results
+        except Exception as e:
+            logger.error(f"Ошибка поиска во внешнем движке: {e}")
+            return []
+    
+    def suggest_correction(self, query: str, top_k: int = 3):
+        try:
+            if hasattr(self.engine, 'suggest_correction'):
+                return self.engine.suggest_correction(query, top_k=top_k)
+        except Exception as e:
+            logger.error(f"Ошибка предложения во внешнем движке: {e}")
+        return []
+    
+    def refresh_data(self):
+        if hasattr(self.engine, 'refresh_data'):
+            self.engine.refresh_data()
 
 # ------------------------------------------------------------
 #  СИСТЕМА ПОДПИСОК (с кэшированием)
@@ -233,55 +344,114 @@ _subscribers_cache = None
 _subscribers_cache_loaded = False
 
 async def load_subscribers():
-    # ... (полный код) ...
-    pass
+    global _subscribers_cache, _subscribers_cache_loaded
+    if _subscribers_cache_loaded:
+        return _subscribers_cache or []
+    
+    try:
+        async with subscribers_lock:
+            if os.path.exists(SUBSCRIBERS_FILE):
+                with open(SUBSCRIBERS_FILE, 'r', encoding='utf-8') as f:
+                    _subscribers_cache = json.load(f)
+                    _subscribers_cache_loaded = True
+                    return _subscribers_cache
+    except Exception as e:
+        logger.error(f"Ошибка загрузки подписчиков: {e}")
+    
+    _subscribers_cache = []
+    _subscribers_cache_loaded = True
+    return []
 
 async def save_subscribers(subscribers: List[int]):
-    # ... (полный код) ...
-    pass
+    global _subscribers_cache
+    try:
+        async with subscribers_lock:
+            with open(SUBSCRIBERS_FILE, 'w', encoding='utf-8') as f:
+                json.dump(subscribers, f, ensure_ascii=False, indent=2)
+            _subscribers_cache = subscribers.copy()
+    except Exception as e:
+        logger.error(f"Ошибка сохранения подписчиков: {e}")
 
 async def add_subscriber(user_id: int):
-    # ... (полный код) ...
-    pass
+    subscribers = await load_subscribers()
+    if user_id not in subscribers:
+        subscribers.append(user_id)
+        await save_subscribers(subscribers)
+        return True
+    return False
 
 async def remove_subscriber(user_id: int):
-    # ... (полный код) ...
-    pass
+    subscribers = await load_subscribers()
+    if user_id in subscribers:
+        subscribers.remove(user_id)
+        await save_subscribers(subscribers)
+        return True
+    return False
 
 async def get_subscribers() -> List[int]:
-    # ... (полный код) ...
-    pass
+    return await load_subscribers()
 
 async def ensure_subscribed(user_id: int):
-    # ... (полный код) ...
-    pass
+    await add_subscriber(user_id)
 
 # ------------------------------------------------------------
 #  ПЕРИОДИЧЕСКОЕ СОХРАНЕНИЕ ПОДПИСЧИКОВ
 # ------------------------------------------------------------
 async def periodic_subscriber_save():
-    # ... (полный код) ...
-    pass
+    while True:
+        await asyncio.sleep(300)  # каждые 5 минут
+        try:
+            subscribers = await load_subscribers()
+            await save_subscribers(subscribers)
+        except Exception as e:
+            logger.error(f"Ошибка периодического сохранения: {e}")
 
 # ------------------------------------------------------------
 #  СИСТЕМНЫЕ СООБЩЕНИЯ (EDITABLE)
 # ------------------------------------------------------------
 MESSAGES_FILE = 'messages.json'
 messages_lock = asyncio.Lock()
+
 DEFAULT_MESSAGES = {
-    # ... (полный словарь) ...
+    "welcome": "👋 Здравствуйте, {first_name}!\n\nЯ — бот для сотрудников компании Мечел. Чем могу помочь?",
+    "help": "📚 <b>Доступные команды:</b>\n\n/start - начать работу с ботом\\n/help - показать эту справку\\n/categories - показать категории вопросов\\n/feedback - оставить отзыв или предложение\\n/subscribe - подписаться на рассылку\\n/unsubscribe - отписаться от рассылки\\n/что_могу - что я умею",
+    "greeting_response": "👋 Здравствуйте! Чем могу помочь?",
+    "subscribe_success": "✅ Вы успешно подписались на рассылку!",
+    "already_subscribed": "ℹ️ Вы уже подписаны на рассылку.",
+    "unsubscribe_success": "✅ Вы успешно отписались от рассылки.",
+    "not_subscribed": "ℹ️ Вы не подписаны на рассылку.",
+    "feedback_ack": "✅ Спасибо за ваш отзыв! Мы обязательно учтём ваши предложения.",
+    "suggestions": "🤔 Возможно, вы имели в виду:\n\n{suggestions}\n\nПопробуйте уточнить ваш запрос.",
+    "no_results": "😔 К сожалению, я не нашёл ответ на ваш вопрос. Попробуйте переформулировать или напишите /feedback с вашим предложением добавить этот вопрос в базу знаний."
 }
+
 async def load_messages():
-    # ... (полный код) ...
-    pass
+    try:
+        async with messages_lock:
+            if os.path.exists(MESSAGES_FILE):
+                with open(MESSAGES_FILE, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+    except Exception as e:
+        logger.error(f"Ошибка загрузки сообщений: {e}")
+    return DEFAULT_MESSAGES.copy()
 
 async def save_messages(messages: Dict):
-    # ... (полный код) ...
-    pass
+    try:
+        async with messages_lock:
+            with open(MESSAGES_FILE, 'w', encoding='utf-8') as f:
+                json.dump(messages, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"Ошибка сохранения сообщений: {e}")
 
 async def get_message(key: str, **kwargs) -> str:
-    # ... (полный код) ...
-    pass
+    messages = await load_messages()
+    text = messages.get(key, DEFAULT_MESSAGES.get(key, ''))
+    if not text:
+        text = f'⚠️ Сообщение "{key}" не найдено'
+    try:
+        return text.format(**kwargs)
+    except KeyError:
+        return text
 
 # ------------------------------------------------------------
 #  ГЛОБАЛЬНЫЕ ОБЪЕКТЫ
@@ -360,10 +530,12 @@ async def categories_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not search_engine or not search_engine.faq_data:
         await update.message.reply_text("📂 База знаний пока пуста.", parse_mode='HTML')
         return
+    
     categories = set(item.get('category', 'Без категории') for item in search_engine.faq_data)
     if not categories:
         await update.message.reply_text("📂 Категории не найдены.", parse_mode='HTML')
         return
+    
     text = "📂 <b>Доступные категории:</b>\n" + "\n".join(f"• {cat}" for cat in sorted(categories))
     await update.message.reply_text(text, parse_mode='HTML')
     bot_stats.log_message(update.effective_user.id, update.effective_user.username or "unknown", 'command')
@@ -377,6 +549,7 @@ async def feedback_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='HTML'
         )
         return
+    
     feedback_text = ' '.join(context.args)
     bot_stats.log_message(
         update.effective_user.id,
@@ -393,28 +566,34 @@ async def feedbacks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("⛔ Доступ запрещён.")
         return
+    
     feedbacks = bot_stats.get_feedback_list(limit=20)
     if not feedbacks:
         await update.message.reply_text("📭 Отзывов пока нет.")
         return
+    
     text = "📝 <b>Последние отзывы:</b>\n"
     for fb in feedbacks[:10]:
         dt = fb['timestamp'].strftime("%d.%m %H:%M")
         username = fb['username'] or str(fb['user_id'])
         short_text = fb['text'][:100] + "..." if len(fb['text']) > 100 else fb['text']
         text += f"\n{dt} @{username}: {short_text}"
+    
     await update.message.reply_text(text, parse_mode='HTML')
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("⛔ Доступ запрещён.")
         return
+    
     period = 'all'
     if context.args:
         period = parse_period_argument(context.args[0])
+    
     cache_size = len(getattr(search_engine, 'cache', {})) if search_engine else 0
     stats = bot_stats.get_summary_stats(period=period, cache_size=cache_size)
     rating_stats = bot_stats.get_rating_stats()
+    
     text = (
         f"📊 <b>Статистика ({period})</b>\n"
         f"👥 Пользователей: {stats['total_users']}\n"
@@ -434,6 +613,7 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("⛔ Доступ запрещён.")
         return
+    
     subscribers = await get_subscribers()
     try:
         output = await generate_excel_report(bot_stats, subscribers)
@@ -468,17 +648,20 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("⛔ Доступ запрещён.")
         return
+    
     if not context.args:
         await update.message.reply_text(
             "📢 Использование: /broadcast <текст сообщения>\n"
             "Можно использовать HTML-разметку."
         )
         return
+    
     message = ' '.join(context.args)
     subscribers = await get_subscribers()
     if not subscribers:
         await update.message.reply_text("❌ Нет подписчиков для рассылки.")
         return
+    
     await update.message.reply_text(f"📢 Начинаю рассылку {len(subscribers)} подписчикам...")
     sent = 0
     failed = 0
@@ -490,6 +673,7 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Ошибка отправки пользователю {uid}: {e}")
             failed += 1
+    
     await update.message.reply_text(f"✅ Рассылка завершена. Отправлено: {sent}, ошибок: {failed}")
 
 async def what_can_i_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -499,7 +683,7 @@ async def what_can_i_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Показывать категории: /categories\n"
         "• Принимать предложения: /feedback\n"
         "• Присылать мемы: /мем\n"
-        "• Подписаться на рассылку: /subscribe\n\n"
+        "• Подписаться на рассылку: /subscribe\n"
         "💡 Совет: можно писать «отпуск: как перенести?» — я найду точнее!"
     )
     await update.message.reply_text(text, parse_mode='HTML')
@@ -508,6 +692,7 @@ async def what_can_i_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         return
+    
     text = (
         "👑 <b>Админ-панель</b>\n"
         "• Статистика: /stats [day|week|month]\n"
@@ -516,7 +701,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Экспорт: /export\n"
         "• Отзывы: /feedbacks\n"
         "• Мемы: /memsub, /memunsub\n"
-        "• Веб-интерфейс: " + BASE_URL
+        f"• Веб-интерфейс: {BASE_URL}"
     )
     await update.message.reply_text(text, parse_mode='HTML')
 
@@ -528,30 +713,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = user.id
     username = user.username or "unknown"
     text = update.message.text.strip()
-
+    
     # Проверка на приветствие
     if is_greeting(text):
         reply = await get_message("greeting_response")
         await update.message.reply_text(reply, parse_mode='HTML')
         bot_stats.log_message(user_id, username, 'message')
         return
-
+    
     # Поиск
     start_time = time.time()
     bot_stats.log_message(user_id, username, 'search')
-
+    
     category = None
     query = text
     if ':' in text:
         parts = text.split(':', 1)
         category = parts[0].strip()
         query = parts[1].strip()
-
+    
     results = search_engine.search(query, category=category, top_k=5) if search_engine else []
-
     response_time = time.time() - start_time
     bot_stats.track_response_time(response_time)
-
+    
     if not results:
         suggestions = search_engine.suggest_correction(query, top_k=3) if search_engine else []
         if suggestions:
@@ -561,16 +745,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply = await get_message("no_results")
         await update.message.reply_text(reply, parse_mode='HTML')
         return
-
+    
     # Отправка результатов
     for i, (q, a, score) in enumerate(results, 1):
         short_q = truncate_question(q, 50)
         text = f"<b>{short_q}</b>\n{a}"
         if i < len(results):
-            text += "\n\n---"
+            text += "\n---"
         await update.message.reply_text(text, parse_mode='HTML')
         await asyncio.sleep(0.5)
-
+    
     # Кнопки оценки
     keyboard = [
         [
@@ -591,6 +775,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer()
     data = query.data
+    
     if data.startswith("helpful_"):
         faq_id = int(data.split("_")[1])
         bot_stats.record_rating(faq_id, True)
@@ -623,13 +808,102 @@ async def shutdown():
     logger.info("✅ Завершено.")
 
 # ------------------------------------------------------------
+#  ОБРАБОТЧИК ВЕБХУКА (НОВОЕ!)
+# ------------------------------------------------------------
+@app.route(WEBHOOK_PATH, methods=['POST'])
+async def telegram_webhook():
+    """Обработка вебхуков от Telegram"""
+    try:
+        # Проверка секретного токена
+        secret_token = request.headers.get('X-Telegram-Bot-Api-Secret-Token')
+        if secret_token != WEBHOOK_SECRET:
+            logger.warning(f"Неверный секретный токен: {secret_token}")
+            return jsonify({'error': 'Invalid secret token'}), 403
+        
+        # Получение данных обновления
+        update_data = await request.get_json()
+        if not update_data:
+            return jsonify({'error': 'No data'}), 400
+        
+        # Обработка обновления
+        update = Update.de_json(update_data, application.bot)
+        await application.process_update(update)
+        
+        return jsonify({'status': 'ok'}), 200
+    
+    except Exception as e:
+        logger.error(f"Ошибка обработки вебхука: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+# ------------------------------------------------------------
+#  МАРШРУТ /HEALTH (НОВОЕ!)
+# ------------------------------------------------------------
+@app.route('/health', methods=['GET'])
+async def health_check():
+    """Проверка работоспособности сервиса"""
+    status = {
+        'status': 'ok',
+        'bot': 'running',
+        'timestamp': datetime.now().isoformat(),
+        'webhook_path': WEBHOOK_PATH,
+        'webhook_url': WEBHOOK_URL + WEBHOOK_PATH if RENDER else 'local',
+        'search_engine': 'loaded' if search_engine else 'not_loaded',
+        'bot_stats': 'initialized' if bot_stats else 'not_initialized'
+    }
+    return jsonify(status), 200
+
+# ------------------------------------------------------------
+#  МАРШРУТ / (КОРНЕВОЙ)
+# ------------------------------------------------------------
+@app.route('/', methods=['GET'])
+async def index():
+    """Корневая страница"""
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>HR Bot - Мечел</title>
+        <meta charset="utf-8">
+        <style>
+            body { font-family: Arial, sans-serif; padding: 20px; background: #f5f5f5; }
+            .container { max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+            h1 { color: #2c3e50; }
+            .status { color: #27ae60; font-weight: bold; }
+            .info { margin: 15px 0; padding: 10px; background: #f8f9fa; border-radius: 5px; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🤖 HR Bot - Мечел</h1>
+            <p class="status">✅ Бот запущен и работает</p>
+            <div class="info">
+                <strong>Версия:</strong> 12.48<br>
+                <strong>Режим:</strong> {}<br>
+                <strong>Вебхук:</strong> {}<br>
+                <strong>База знаний:</strong> {} записей
+            </div>
+            <p><a href="/health">Проверить статус</a></p>
+        </div>
+    </body>
+    </html>
+    """.format(
+        "Render (Production)" if RENDER else "Local (Development)",
+        WEBHOOK_URL + WEBHOOK_PATH if RENDER else "не настроен",
+        len(search_engine.faq_data) if search_engine and hasattr(search_engine, 'faq_data') else 0
+    )
+    return html, 200
+
+# ------------------------------------------------------------
 #  ИНИЦИАЛИЗАЦИЯ БОТА
 # ------------------------------------------------------------
 async def init_bot():
     global application, search_engine, bot_stats
-    logger.info("🚀 Инициализация бота версии 12.47...")
+    logger.info("🚀 Инициализация бота версии 12.48...")
+    
     try:
         use_builtin = False
+        
+        # Попытка загрузить EnhancedSearchEngine
         try:
             from search_engine import EnhancedSearchEngine
             ext_engine = EnhancedSearchEngine(max_cache_size=1000)
@@ -641,6 +915,8 @@ async def init_bot():
                 raise ImportError("Тест не пройден")
         except (ImportError, Exception) as e:
             logger.debug(f"EnhancedSearchEngine не подходит: {e}")
+            
+            # Попытка загрузить обычный SearchEngine
             try:
                 from search_engine import SearchEngine as ExternalSearchEngine
                 ext_engine = ExternalSearchEngine()
@@ -653,24 +929,26 @@ async def init_bot():
             except (ImportError, Exception) as e2:
                 logger.debug(f"Внешний SearchEngine не подходит: {e2}")
                 use_builtin = True
-
+        
+        # Использование встроенного движка
         if use_builtin:
             search_engine = BuiltinSearchEngine()
             logger.info("✅ Используется встроенный BuiltinSearchEngine (оптимизированный нечёткий поиск)")
-
+        
         bot_stats = BotStatistics()
         logger.info("✅ Инициализирован модуль статистики")
-
+        
+        # Создание приложения Telegram
         builder = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init)
         application = builder.build()
-
+        
         # --- Инициализация модуля мемов ---
         if MEME_MODULE_AVAILABLE:
             await init_meme_handler(application.job_queue, admin_ids=ADMIN_IDS)
             logger.info("✅ Модуль мемов инициализирован")
         else:
             logger.warning("⚠️ Модуль мемов не загружен, команды /мем, /мемподписка, /мемотписка недоступны")
-
+        
         # --- АНГЛИЙСКИЕ КОМАНДЫ (включая мемы) ---
         application.add_handler(CommandHandler("start", start_command))
         application.add_handler(CommandHandler("help", help_command))
@@ -686,12 +964,12 @@ async def init_bot():
         application.add_handler(CommandHandler("broadcast", broadcast_command))
         application.add_handler(CommandHandler("что_могу", what_can_i_do))
         application.add_handler(CommandHandler("админ", admin_panel))
-
+        
         if MEME_MODULE_AVAILABLE:
             application.add_handler(CommandHandler("mem", meme_command))
             application.add_handler(CommandHandler("memsub", meme_subscribe_command))
             application.add_handler(CommandHandler("memunsub", meme_unsubscribe_command))
-
+        
         # --- РУССКИЕ КОМАНДЫ ЧЕРЕЗ MessageHandler ---
         async def russian_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = update.message.text.lower()
@@ -725,18 +1003,19 @@ async def init_bot():
                 await what_can_i_do(update, context)
             elif text.startswith('/админ'):
                 await admin_panel(update, context)
-
+        
         application.add_handler(MessageHandler(
             filters.Regex(r'^/(старт|помощь|категории|предложения|отзывы|статистика|экспорт|подписаться|отписаться|рассылка|мем|мемподписка|мемотписка|что_могу|админ)'),
             russian_command_handler
         ))
-
+        
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         application.add_handler(CallbackQueryHandler(handle_callback_query))
         application.add_error_handler(error_handler)
-
+        
         await application.initialize()
-
+        
+        # Настройка вебхука для Render
         if RENDER:
             webhook_url = WEBHOOK_URL + WEBHOOK_PATH
             logger.info(f"🔄 Установка вебхука на {webhook_url}...")
@@ -746,6 +1025,7 @@ async def init_bot():
                 drop_pending_updates=True,
                 max_connections=40
             )
+            
             if result:
                 logger.info(f"✅ Вебхук успешно установлен на {webhook_url}")
                 info = await application.bot.get_webhook_info()
@@ -758,12 +1038,14 @@ async def init_bot():
                 logger.error("❌ Не удалось установить вебхук")
                 return False
         else:
+            # Локальный режим - удаляем вебхук
             await application.bot.delete_webhook(drop_pending_updates=True)
             logger.info("✅ Режим поллинга (локальная разработка)")
-
+        
+        # Запуск периодического сохранения подписчиков
         asyncio.create_task(periodic_subscriber_save())
         logger.info("✅ Запущена задача периодического сохранения подписчиков")
-
+        
         # --- РЕГИСТРАЦИЯ ВЕБ-МАРШРУТОВ ---
         register_web_routes(
             app,
@@ -781,10 +1063,10 @@ async def init_bot():
             MEME_MODULE_AVAILABLE=MEME_MODULE_AVAILABLE,
             get_meme_handler=get_meme_handler
         )
-
+        
         logger.info("✅ Бот полностью инициализирован и готов к работе")
         return True
-
+    
     except Exception as e:
         logger.critical(f"❌ Ошибка инициализации бота: {e}", exc_info=True)
         return False
@@ -796,20 +1078,22 @@ async def main():
     if not await init_bot():
         logger.critical("Не удалось инициализировать бота")
         sys.exit(1)
+    
     if RENDER:
-        logger.warning("⚠️ main() вызван на Render — используйте before_serving")
-    else:
-        logger.info("🔄 Запуск в режиме поллинга")
-        polling_task = asyncio.create_task(application.start_polling(allowed_updates=Update.ALL_TYPES))
+        logger.info("✅ Запуск в режиме Render (вебхук)")
+        # На Render просто запускаем Quart сервер
         config = Config()
         config.bind = [f"0.0.0.0:{PORT}"]
         await serve(app, config)
-        await application.stop()
-        polling_task.cancel()
-        try:
-            await polling_task
-        except asyncio.CancelledError:
-            pass
+    else:
+        logger.info("🔄 Запуск в режиме поллинга")
+        # Локальный режим - запускаем поллинг и сервер одновременно
+        polling_task = asyncio.create_task(application.start_polling(allowed_updates=Update.ALL_TYPES))
+        config = Config()
+        config.bind = [f"0.0.0.0:{PORT}"]
+        server_task = asyncio.create_task(serve(app, config))
+        
+        await asyncio.gather(polling_task, server_task)
 
 def shutdown_signal(sig):
     logger.info(f"Получен сигнал {sig}, инициируем завершение...")
@@ -820,4 +1104,5 @@ if __name__ == '__main__':
     loop = asyncio.get_event_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, lambda s=sig: shutdown_signal(s))
+    
     asyncio.run(main())

@@ -1,6 +1,7 @@
+# search_engine.py
 """
 ПОИСКОВЫЙ ДВИЖОК ДЛЯ HR-БОТА МЕЧЕЛ
-Версия 5.2 — максимальная оптимизация для бесплатного тарифа:
+Версия 5.4 — добавлена возможность инициализации из списка данных (для интеграции с БД)
 - Инвертированный индекс (O(1) доступ к кандидатам)
 - TF‑IDF ранжирование
 - Быстрый Левенштейн с порогом
@@ -70,14 +71,16 @@ def levenshtein_distance(s1: str, s2: str, threshold: int = None) -> int:
 
 @dataclass
 class FAQEntry:
+    # Поля без значений по умолчанию (обязательные)
     id: int
-    priority: int = 0                # добавлено поле priority (по умолчанию 0)
     question: str
     answer: str
     keywords: str
     norm_keywords: str
     norm_question: str
     category: str
+    # Поля со значениями по умолчанию (необязательные) — идут после
+    priority: int = 0
     usage_count: int = 0
 
 
@@ -412,7 +415,7 @@ class SearchEngine:
         'инженерная служба': 'сервисные службы',
     }
 
-    # Стоп-слова (без изменений)
+    # Стоп-слова
     STOP_WORDS = {
         'как', 'что', 'где', 'когда', 'почему', 'зачем', 'сколько', 'чей',
         'а', 'и', 'но', 'или', 'если', 'то', 'же', 'бы', 'в', 'на', 'с', 'по',
@@ -421,7 +424,13 @@ class SearchEngine:
         'можно', 'нужно', 'надо', 'будет', 'есть', 'быть', 'весь', 'эта', 'эти'
     }
 
-    def __init__(self, max_cache_size: int = 200):
+    def __init__(self, max_cache_size: int = 200, faq_data: List[Dict] = None):
+        """
+        Инициализация поискового движка.
+        :param max_cache_size: максимальный размер кэша результатов.
+        :param faq_data: опциональный список словарей с данными FAQ (если передан, загружается из него,
+                         иначе загружается из файла faq.json).
+        """
         self.max_cache_size = max_cache_size
         self.cache = OrderedDict()
         self.cache_ttl = {}
@@ -439,9 +448,15 @@ class SearchEngine:
             'loaded_from': 'не загружено'
         }
 
-        self._load_faq()
+        # Загрузка данных
+        if faq_data is not None:
+            self._load_from_list(faq_data)
+            logger.info(f"✅ SearchEngine инициализирован переданными данными ({len(self.faq_data)} записей)")
+        else:
+            self._load_faq()
+
         self._build_indexes()
-        logger.info(f"✅ SearchEngine v5.2: загружено {len(self.faq_data)} записей, "
+        logger.info(f"✅ SearchEngine v5.4: загружено {len(self.faq_data)} записей, "
                     f"инвертированный индекс: {len(self._inverted_index)} уникальных слов, "
                     f"источник: {self.stats['loaded_from']}")
 
@@ -449,6 +464,7 @@ class SearchEngine:
     #  ЗАГРУЗКА ДАННЫХ
     # ------------------------------------------------------------
     def _load_faq(self):
+        """Загружает данные из faq.json или использует резервные."""
         if self._load_from_json():
             return
         logger.warning("⚠️ Не удалось загрузить faq.json, используются встроенные резервные вопросы")
@@ -496,13 +512,14 @@ class SearchEngine:
 
                 faq = FAQEntry(
                     id=idx,
-                    priority=priority,
                     question=question,
                     answer=answer,
                     keywords=keywords_str,
                     norm_keywords=norm_keywords,
                     norm_question=norm_question,
-                    category=item.get('category', 'Без категории').strip()
+                    category=item.get('category', 'Без категории').strip(),
+                    priority=priority,
+                    usage_count=0
                 )
                 self.faq_data.append(faq)
                 loaded_count += 1
@@ -514,27 +531,82 @@ class SearchEngine:
             logger.error(f"❌ Ошибка загрузки JSON: {e}")
             return False
 
+    def _load_from_list(self, data: List[Dict]):
+        """
+        Загружает данные из переданного списка словарей.
+        Ожидается, что каждый словарь содержит ключи: id, question, answer, category,
+        keywords (опционально), priority (опционально).
+        """
+        self.faq_data.clear()
+        loaded_count = 0
+        for idx, item in enumerate(data, start=1):
+            question = item.get('question', '').strip()
+            answer = item.get('answer', '').strip()
+            if not question or not answer:
+                continue
+
+            # ID может быть передан, иначе используем idx
+            faq_id = item.get('id', idx)
+
+            priority = item.get('priority', 0)
+            try:
+                priority = int(priority)
+            except (ValueError, TypeError):
+                priority = 0
+
+            keywords = item.get('keywords', '')
+            if isinstance(keywords, list):
+                keywords = ', '.join(keywords)
+
+            # Нормализация
+            norm_keywords = item.get('norm_keywords', '')
+            if not norm_keywords and keywords:
+                norm_keywords = self._normalize_text(keywords)
+
+            norm_question = item.get('norm_question', '')
+            if not norm_question and question:
+                norm_question = self._normalize_text(question)
+
+            faq = FAQEntry(
+                id=faq_id,
+                question=question,
+                answer=answer,
+                keywords=keywords,
+                norm_keywords=norm_keywords,
+                norm_question=norm_question,
+                category=item.get('category', 'Без категории').strip(),
+                priority=priority,
+                usage_count=0
+            )
+            self.faq_data.append(faq)
+            loaded_count += 1
+
+        self.stats['loaded_from'] = f'переданные данные ({loaded_count} записей)'
+        logger.info(f"✅ Загружено {loaded_count} записей из переданных данных")
+
     def _load_fallback(self):
         self.faq_data = [
             FAQEntry(
                 id=1,
-                priority=1,
                 question="Как оформить отпуск?",
                 answer="Обратитесь в отдел кадров с заявлением за 2 недели до начала отпуска.",
                 keywords="отпуск, оформить, кадры, заявление",
                 norm_keywords="отпуск оформить кадры заявление",
                 norm_question="как оформить отпуск",
-                category="Отпуск"
+                category="Отпуск",
+                priority=1,
+                usage_count=0
             ),
             FAQEntry(
                 id=2,
-                priority=1,
                 question="Когда выплачивается зарплата?",
                 answer="Зарплата выплачивается 5 и 20 числа каждого месяца.",
                 keywords="зарплата, выплата, дата, аванс",
                 norm_keywords="зарплата выплата дата аванс",
                 norm_question="когда выплачивается зарплата",
-                category="Зарплата"
+                category="Зарплата",
+                priority=1,
+                usage_count=0
             )
         ]
         self.stats['loaded_from'] = 'резервные данные (2 записи)'
@@ -805,10 +877,9 @@ class SearchEngine:
         results = []
         for faq in candidates:
             score = self._calculate_full_score(norm_query, query_words, faq)
-            # Добавляем небольшой бонус за priority (например, +10% от максимального балла * priority)
-            # priority может быть 0 или 1, но можно масштабировать
+            # Добавляем небольшой бонус за priority
             if faq.priority > 0:
-                score += 5.0   # небольшой приоритет важным вопросам
+                score += 5.0
             if score > 0:
                 results.append((faq.question, faq.answer, score))
 
@@ -878,9 +949,15 @@ class SearchEngine:
     # ------------------------------------------------------------
     #  ОБНОВЛЕНИЕ ДАННЫХ
     # ------------------------------------------------------------
-    def refresh_data(self):
-        """Принудительная перезагрузка данных из faq.json и перестройка индексов."""
-        self._load_faq()
+    def refresh_data(self, new_faq_data: List[Dict] = None):
+        """
+        Принудительная перезагрузка данных.
+        Если передан new_faq_data, загружает из него, иначе перезагружает из файла.
+        """
+        if new_faq_data is not None:
+            self._load_from_list(new_faq_data)
+        else:
+            self._load_faq()
         self._build_indexes()
         self.cache.clear()
         self.cache_ttl.clear()

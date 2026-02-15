@@ -1,25 +1,19 @@
 #!/usr/bin/env python3
 """
 Telegram-бот для HR-отдела компании "Мечел"
-Версия 13.0 — переход на Supabase
+Версия 13.6 – финальная с кэшированием предложений и улучшенной обработкой ошибок
 """
 import os
 import sys
 import asyncio
 import logging
-import json  # больше не используется для хранения, но может пригодиться для других целей
 import time
 import hashlib
-import re
-import inspect
 import signal
+import json
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any, Tuple, Union
-from collections import defaultdict, deque
+from typing import List, Optional, Union, Tuple, Any, Dict
 
-# ------------------------------------------------------------
-#  ИМПОРТЫ (добавлен database)
-# ------------------------------------------------------------
 from quart import Quart, request, jsonify
 import hypercorn
 from hypercorn.config import Config
@@ -34,52 +28,26 @@ from telegram.ext import (
     ContextTypes,
     ApplicationBuilder
 )
-import pandas as pd
 from dotenv import load_dotenv
+from cachetools import TTLCache
 
-# ИМПОРТ НАШЕГО НОВОГО МОДУЛЯ БАЗЫ ДАННЫХ
+# Импорты наших модулей
 from database import (
-    init_db,
+    init_db, shutdown_db, get_pool,
     get_subscribers, add_subscriber, remove_subscriber, ensure_subscribed,
     get_message, save_message, load_all_messages,
-    load_all_faq, get_faq_by_id, add_faq, update_faq, delete_faq,
+    load_all_faq,
     add_meme_history, get_meme_count_last_24h,
     add_meme_subscriber, remove_meme_subscriber, is_meme_subscribed, get_all_meme_subscribers,
-    save_feedback, get_all_feedback,
-    save_rating, get_rating_stats,
-    log_daily_stat, add_response_time, log_error
+    save_feedback,
+    save_rating,
+    log_error
 )
+from stats import BotStatistics, generate_excel_report
+from utils import is_greeting, truncate_question, parse_period_argument
+from web_panel import register_web_routes
 
-# ------------------------------------------------------------
-#  ПРОВЕРКА КРИТИЧЕСКИХ ЗАВИСИМОСТЕЙ (без изменений)
-# ------------------------------------------------------------
-def check_critical_dependencies():
-    try:
-        from importlib.metadata import version, PackageNotFoundError
-    except ImportError:
-        try:
-            from importlib_metadata import version, PackageNotFoundError
-        except ImportError:
-            print("❌ Не удалось импортировать importlib.metadata", file=sys.stderr)
-            sys.exit(1)
-    critical_packages = ['quart', 'python-telegram-bot', 'hypercorn', 'pandas', 'openpyxl']
-    missing = []
-    for pkg in critical_packages:
-        try:
-            ver = version(pkg)
-            print(f"✅ {pkg} версия {ver} установлена")
-        except PackageNotFoundError:
-            missing.append(pkg)
-    if missing:
-        print(f"❌ Отсутствуют критические зависимости: {', '.join(missing)}", file=sys.stderr)
-        sys.exit(1)
-    print("✅ Все критические зависимости установлены")
-
-check_critical_dependencies()
-
-# ------------------------------------------------------------
-#  ИМПОРТ МОДУЛЯ МЕМОВ (без изменений)
-# ------------------------------------------------------------
+# Модуль мемов
 try:
     from meme_handler import (
         init_meme_handler,
@@ -102,17 +70,71 @@ except ImportError:
     async def meme_unsubscribe_command(*args, **kwargs): pass
     def get_meme_handler(): return None
 
+# Поисковый движок (может быть внешний или встроенный)
+try:
+    from search_engine import SearchEngine as ExternalSearchEngine
+    from search_engine import EnhancedSearchEngine
+except ImportError:
+    ExternalSearchEngine = None
+    EnhancedSearchEngine = None
+
 # ------------------------------------------------------------
-#  ИМПОРТ МОДУЛЕЙ ПРОЕКТА (без изменений)
+#  КОНФИГУРАЦИЯ
 # ------------------------------------------------------------
-from stats import BotStatistics, generate_excel_report
-from utils import is_greeting, truncate_question, parse_period_argument
-from web_panel import register_web_routes
+load_dotenv()
+
+def get_bot_token() -> str:
+    token = os.getenv('TELEGRAM_BOT_TOKEN')
+    if token:
+        return token
+    token = os.getenv('BOT_TOKEN')
+    if token:
+        logging.warning("⚠️ Используется устаревшее имя переменной BOT_TOKEN")
+        return token
+    return ''
+
+def validate_token(token: str) -> bool:
+    return bool(token and len(token) > 30 and ':' in token)
+
+BOT_TOKEN = get_bot_token()
+if not validate_token(BOT_TOKEN):
+    logging.critical("❌ TELEGRAM_BOT_TOKEN не установлен или неверный формат")
+    sys.exit(1)
+
+RENDER = os.getenv('RENDER', 'false').lower() == 'true'
+PORT = int(os.getenv('PORT', 8080))
+WEBHOOK_SECRET = os.getenv('WEBHOOK_SECRET', '')
+if not WEBHOOK_SECRET:
+    WEBHOOK_SECRET = 'mechel_hr_prod_' + hashlib.md5(BOT_TOKEN.encode()).hexdigest()[:16]
+    if RENDER:
+        logging.warning("⚠️ WEBHOOK_SECRET сгенерирован автоматически")
+
+WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET}"
+WEBHOOK_URL = os.getenv('WEBHOOK_URL', '')
+if RENDER and not WEBHOOK_URL:
+    logging.critical("❌ На Render WEBHOOK_URL обязателен")
+    sys.exit(1)
+
+BASE_URL = f"http://localhost:{PORT}" if not RENDER else WEBHOOK_URL.rstrip('/')
+
+ADMIN_IDS = []
+try:
+    admin_str = os.getenv('ADMIN_IDS', '')
+    if admin_str:
+        ADMIN_IDS = [int(x.strip()) for x in admin_str.split(',') if x.strip().isdigit()]
+    logging.info(f"✅ Администраторы: {ADMIN_IDS}")
+except Exception as e:
+    logging.error(f"❌ Ошибка парсинга ADMIN_IDS: {e}")
 
 # ------------------------------------------------------------
 #  СОЗДАНИЕ QUART ПРИЛОЖЕНИЯ
 # ------------------------------------------------------------
 app = Quart(__name__)
+
+# Глобальные объекты
+application: Optional[Application] = None
+search_engine: Optional[Union['BuiltinSearchEngine', 'ExternalSearchEngineAdapter']] = None
+bot_stats: Optional[BotStatistics] = None
 
 # Флаги инициализации
 _bot_initialized = False
@@ -120,8 +142,193 @@ _bot_initializing = False
 _bot_init_lock = asyncio.Lock()
 _routes_registered = False
 
+# Кэш подписок (чтобы не долбить БД на каждый /start)
+user_subscribed_cache = TTLCache(maxsize=10000, ttl=3600)  # 1 час
+
 # ------------------------------------------------------------
-#  ФУНКЦИЯ ЛЕВЕНШТЕЙНА (без изменений)
+#  ЛОГИРОВАНИЕ
+# ------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger(__name__)
+
+# ------------------------------------------------------------
+#  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ------------------------------------------------------------
+async def _reply_or_edit(update: Update, text: str, parse_mode: str = 'HTML', reply_markup=None):
+    if update.message:
+        return await update.message.reply_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
+    elif update.callback_query:
+        await update.callback_query.edit_message_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
+        return None
+    else:
+        logger.error("Не удалось определить тип update для отправки сообщения")
+        return None
+
+# Кэшированная проверка подписки
+async def ensure_subscribed_cached(user_id: int):
+    if user_id in user_subscribed_cache:
+        return
+    await ensure_subscribed(user_id)
+    user_subscribed_cache[user_id] = True
+
+# ------------------------------------------------------------
+#  ВСТРОЕННЫЙ ПОИСКОВЫЙ ДВИЖОК (использует данные из БД)
+# ------------------------------------------------------------
+class BuiltinSearchEngine:
+    def __init__(self, faq_data: List[Dict], max_cache_size: int = 500):
+        """
+        :param faq_data: список словарей с ключами id, question, answer, category и т.д.
+        """
+        self.faq_data = faq_data if faq_data is not None else []
+        self.cache = {}
+        self.suggest_cache = {}  # кэш для предложений
+        self.suggest_cache_ttl = timedelta(minutes=30)
+        self.max_cache_size = max_cache_size
+        logger.info(f"✅ Встроенный поиск инициализирован с {len(self.faq_data)} записями")
+
+    def refresh_data(self, new_faq_data: List[Dict]):
+        self.faq_data = new_faq_data if new_faq_data is not None else []
+        self.cache.clear()
+        self.suggest_cache.clear()
+        logger.info(f"🔄 Данные встроенного поиска обновлены, теперь {len(self.faq_data)} записей")
+
+    def search(self, query: str, category: str = None, top_k: int = 5) -> List[Tuple[int, str, str, float]]:
+        """
+        Простой поиск по ключевым словам в вопросе и ответе.
+        Возвращает список кортежей (id, вопрос, ответ, релевантность).
+        """
+        if not query or not self.faq_data:
+            return []
+        query_lower = query.lower()
+        results = []
+        for item in self.faq_data:
+            if category and item.get('category') != category:
+                continue
+            question = item.get('question', '')
+            answer = item.get('answer', '')
+            faq_id = item.get('id')
+            if not question or not answer or faq_id is None:
+                continue
+            score = 0
+            if query_lower in question.lower():
+                score += 2
+            if query_lower in answer.lower():
+                score += 1
+            if score > 0:
+                results.append((faq_id, question, answer, score))
+        results.sort(key=lambda x: x[3], reverse=True)
+        return results[:top_k]
+
+    def suggest_correction(self, query: str, top_k: int = 3) -> List[str]:
+        """
+        Возвращает похожие вопросы для исправления опечаток.
+        С кэшированием результата на 30 минут.
+        """
+        if not query or not self.faq_data:
+            return []
+
+        # Проверка кэша
+        cache_key = f"{query}_{top_k}"
+        cached = self.suggest_cache.get(cache_key)
+        if cached:
+            ts, value = cached
+            if datetime.now() - ts < self.suggest_cache_ttl:
+                return value
+
+        query_lower = query.lower()
+        suggestions = set()
+        for item in self.faq_data:
+            question = item.get('question', '')
+            if not question:
+                continue
+            if levenshtein_distance(query_lower, question.lower()) <= 3:
+                suggestions.add(question)
+                if len(suggestions) >= top_k:
+                    break
+
+        result = list(suggestions)[:top_k]
+        self.suggest_cache[cache_key] = (datetime.now(), result)
+        return result
+
+
+# Адаптер для внешнего движка
+class ExternalSearchEngineAdapter:
+    def __init__(self, engine):
+        self.engine = engine
+        self.cache = {}
+        self.suggest_cache = {}
+        self.suggest_cache_ttl = timedelta(minutes=30)
+
+    def search(self, query: str, category: str = None, top_k: int = 5) -> List[Tuple[int, str, str, float]]:
+        """
+        Вызывает внешний поисковый движок и приводит результат к единому формату.
+        Ожидается, что внешний движок возвращает список объектов с полями id, question, answer, score
+        (или словарей с такими ключами).
+        """
+        try:
+            raw_results = self.engine.search(query, category=category, top_k=top_k)
+            if not raw_results:
+                return []
+            converted = []
+            for r in raw_results:
+                if isinstance(r, dict):
+                    faq_id = r.get('id', 0)
+                    question = r.get('question', '')
+                    answer = r.get('answer', '')
+                    score = r.get('score', 0.0)
+                else:
+                    # Предполагаем, что у объекта есть атрибуты id, question, answer, score
+                    faq_id = getattr(r, 'id', 0)
+                    question = getattr(r, 'question', '')
+                    answer = getattr(r, 'answer', '')
+                    score = getattr(r, 'score', 0.0)
+                converted.append((faq_id, question, answer, float(score)))
+            return converted
+        except Exception as e:
+            logger.error(f"Ошибка поиска во внешнем движке: {e}")
+            return []
+
+    def suggest_correction(self, query: str, top_k: int = 3) -> List[str]:
+        """Предложения исправлений с кэшированием."""
+        if not query:
+            return []
+
+        cache_key = f"{query}_{top_k}"
+        cached = self.suggest_cache.get(cache_key)
+        if cached:
+            ts, value = cached
+            if datetime.now() - ts < self.suggest_cache_ttl:
+                return value
+
+        try:
+            if hasattr(self.engine, 'suggest_correction'):
+                result = self.engine.suggest_correction(query, top_k=top_k)
+                if not result:
+                    result = []
+                self.suggest_cache[cache_key] = (datetime.now(), result)
+                return result
+        except Exception as e:
+            logger.error(f"Ошибка предложения во внешнем движке: {e}")
+        return []
+
+    def refresh_data(self):
+        if hasattr(self.engine, 'refresh_data'):
+            self.engine.refresh_data()
+        self.cache.clear()
+        self.suggest_cache.clear()
+
+    @property
+    def faq_data(self):
+        if hasattr(self.engine, 'faq_data'):
+            return self.engine.faq_data
+        return []
+
+# ------------------------------------------------------------
+#  ФУНКЦИЯ ЛЕВЕНШТЕЙНА (оставлена для совместимости)
 # ------------------------------------------------------------
 def levenshtein_distance(s1: str, s2: str) -> int:
     if len(s1) < len(s2):
@@ -140,152 +347,15 @@ def levenshtein_distance(s1: str, s2: str) -> int:
     return previous_row[-1]
 
 # ------------------------------------------------------------
-#  КОНФИГУРАЦИЯ ЛОГИРОВАНИЯ (без изменений)
-# ------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
-logger = logging.getLogger(__name__)
-
-# ------------------------------------------------------------
-#  ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ (без изменений)
-# ------------------------------------------------------------
-load_dotenv()
-
-def get_bot_token() -> str:
-    token = os.getenv('TELEGRAM_BOT_TOKEN')
-    if token:
-        return token
-    token = os.getenv('BOT_TOKEN')
-    if token:
-        logger.warning("⚠️ Используется устаревшее имя переменной BOT_TOKEN. Рекомендуется переименовать в TELEGRAM_BOT_TOKEN.")
-        return token
-    return ''
-
-def validate_token(token: str) -> bool:
-    return bool(token and len(token) > 30 and ':' in token)
-
-BOT_TOKEN = get_bot_token()
-if not validate_token(BOT_TOKEN):
-    logger.critical("❌ TELEGRAM_BOT_TOKEN (или BOT_TOKEN) не установлен или неверный формат")
-    sys.exit(1)
-
-RENDER = os.getenv('RENDER', 'false').lower() == 'true'
-PORT = int(os.getenv('PORT', 8080))
-WEBHOOK_SECRET = os.getenv('WEBHOOK_SECRET', '')
-if not WEBHOOK_SECRET:
-    WEBHOOK_SECRET = 'mechel_hr_prod_' + hashlib.md5(BOT_TOKEN.encode()).hexdigest()[:16]
-    if RENDER:
-        logger.warning("⚠️ WEBHOOK_SECRET сгенерирован автоматически. Установите вручную для продакшена.")
-
-WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET}"
-WEBHOOK_URL = os.getenv('WEBHOOK_URL', '')
-if RENDER and not WEBHOOK_URL:
-    logger.critical("❌ На Render WEBHOOK_URL обязателен")
-    sys.exit(1)
-
-BASE_URL = f"http://localhost:{PORT}" if not RENDER else WEBHOOK_URL.rstrip('/')
-
-ADMIN_IDS = []
-try:
-    admin_str = os.getenv('ADMIN_IDS', '')
-    if admin_str:
-        ADMIN_IDS = [int(x.strip()) for x in admin_str.split(',') if x.strip().isdigit()]
-    logger.info(f"✅ Администраторы: {ADMIN_IDS}")
-except Exception as e:
-    logger.error(f"❌ Ошибка парсинга ADMIN_IDS: {e}")
-
-# ------------------------------------------------------------
-#  НЕФАТАЛЬНАЯ ПРОВЕРКА ОПЦИОНАЛЬНЫХ ФАЙЛОВ (без изменений)
-# ------------------------------------------------------------
-def check_optional_files():
-    optional_files = ['search_engine.py']
-    missing = []
-    for file in optional_files:
-        if not os.path.exists(file):
-            missing.append(file)
-    if missing:
-        logger.warning(f"⚠️ Отсутствуют файлы: {', '.join(missing)}")
-        logger.warning("⚠️ Будет использован встроенный функционал")
-    else:
-        logger.info("✅ Все опциональные файлы присутствуют")
-
-check_optional_files()
-
-# ------------------------------------------------------------
-#  ВСТРОЕННЫЙ ПОИСКОВЫЙ ДВИЖОК (без изменений, но использует faq из БД? Пока оставим как есть,
-#  потому что search_engine.py сам загружает faq.json. Позже можно переписать и его.
-# ------------------------------------------------------------
-class BuiltinSearchEngine:
-    # ... (код класса без изменений) ...
-
-# ------------------------------------------------------------
-#  АДАПТЕР ДЛЯ ВНЕШНЕГО SEARCH ENGINE (без изменений)
-# ------------------------------------------------------------
-class ExternalSearchEngineAdapter:
-    # ... (код класса без изменений) ...
-
-# ------------------------------------------------------------
-#  ГЛОБАЛЬНЫЕ ОБЪЕКТЫ
-# ------------------------------------------------------------
-application: Optional[Application] = None
-search_engine: Optional[Union[BuiltinSearchEngine, ExternalSearchEngineAdapter]] = None
-bot_stats: Optional[BotStatistics] = None
-
-# ------------------------------------------------------------
-#  БЛОКИРОВКИ ДЛЯ РАБОТЫ С JSON (УДАЛЕНЫ)
-# ------------------------------------------------------------
-# subscribers_lock, messages_lock, faq_lock больше не нужны.
-
-# ------------------------------------------------------------
-#  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (без изменений)
-# ------------------------------------------------------------
-async def _reply_or_edit(update: Update, text: str, parse_mode: str = 'HTML', reply_markup=None):
-    if update.message:
-        return await update.message.reply_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
-    elif update.callback_query:
-        await update.callback_query.edit_message_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
-        return None
-    else:
-        logger.error("Не удалось определить тип update для отправки сообщения")
-        return None
-
-# ------------------------------------------------------------
-#  ФУНКЦИИ РАБОТЫ С FAQ (ТЕПЕРЬ ИСПОЛЬЗУЮТ БД)
-# ------------------------------------------------------------
-# ВСЕ СТАРЫЕ ФУНКЦИИ load_faq_json, save_faq_json, get_next_faq_id УДАЛЕНЫ.
-# Вместо них используем импортированные из database: load_all_faq, add_faq, update_faq, delete_faq.
-
-# ------------------------------------------------------------
-#  ФОНОВАЯ ОЧИСТКА СТАРЫХ ДАННЫХ (можно оставить для очистки in-memory статистики)
-# ------------------------------------------------------------
-async def periodic_cleanup():
-    """Запускает очистку старых записей статистики раз в сутки."""
-    while True:
-        await asyncio.sleep(86400)  # 24 часа
-        if bot_stats:
-            bot_stats.cleanup_old_data(max_days=180)
-            logger.info("✅ Плановая очистка старых данных статистики выполнена")
-
-# ------------------------------------------------------------
-#  POST_INIT (без изменений)
-# ------------------------------------------------------------
-async def post_init(application: Application):
-    logger.info("✅ Приложение Telegram полностью готово и запущено")
-
-# ------------------------------------------------------------
-#  ОБРАБОТЧИКИ КОМАНД (ИЗМЕНЕНЫ ВЫЗОВЫ)
+#  ОБРАБОТЧИКИ КОМАНД
 # ------------------------------------------------------------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    start_time = time.time()
     user = update.effective_user
-    # ДОБАВЛЯЕМ ПОДПИСЧИКА В БД
-    await ensure_subscribed(user.id)
+    await ensure_subscribed_cached(user.id)
     if bot_stats:
-        bot_stats.log_message(user.id, user.username or "Unknown", 'command', '/start')
-        bot_stats.log_message(user.id, user.username or "Unknown", 'subscribe', '')
-    # ТЕПЕРЬ get_message берётся из БД
+        await bot_stats.log_message(user.id, user.username or "Unknown", 'command', '/start')
+        await bot_stats.log_message(user.id, user.username or "Unknown", 'subscribe', '')
     text = await get_message('welcome', first_name=user.first_name)
     if user.id in ADMIN_IDS:
         text += "\n\n👑 Админ-команды:\n/stats [период] — статистика\n/feedbacks — отзывы (выгрузка)\n/export — Excel\n/статистика, /отзывы, /экспорт\n/subscribe /unsubscribe — подписка\n/broadcast — рассылка\n/save — принудительное сохранение данных"
@@ -299,39 +369,58 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     caption=text,
                     parse_mode='HTML'
                 )
+                elapsed = time.time() - start_time
+                if bot_stats:
+                    bot_stats.track_response_time(elapsed)
                 return
         except Exception as e:
             logger.error(f"Ошибка отправки приветственного фото: {e}")
 
     await _reply_or_edit(update, text, parse_mode='HTML')
+    elapsed = time.time() - start_time
+    if bot_stats:
+        bot_stats.track_response_time(elapsed)
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    start_time = time.time()
     user = update.effective_user
-    await ensure_subscribed(user.id)
+    await ensure_subscribed_cached(user.id)
     if bot_stats:
-        bot_stats.log_message(user.id, user.username or "Unknown", 'command', '/help')
+        await bot_stats.log_message(user.id, user.username or "Unknown", 'command', '/help')
     text = await get_message('help')
     await _reply_or_edit(update, text, parse_mode='HTML')
+    elapsed = time.time() - start_time
+    if bot_stats:
+        bot_stats.track_response_time(elapsed)
 
 async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    start_time = time.time()
     user = update.effective_user
-    # ИСПОЛЬЗУЕМ ФУНКЦИЮ ИЗ БД
     await add_subscriber(user.id)
+    user_subscribed_cache[user.id] = True
     if bot_stats:
-        bot_stats.log_message(user.id, user.username or "Unknown", 'subscribe')
+        await bot_stats.log_message(user.id, user.username or "Unknown", 'subscribe')
     text = await get_message('subscribe_success')
     await _reply_or_edit(update, text, parse_mode='HTML')
+    elapsed = time.time() - start_time
+    if bot_stats:
+        bot_stats.track_response_time(elapsed)
 
 async def unsubscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    start_time = time.time()
     user = update.effective_user
-    # ИСПОЛЬЗУЕМ ФУНКЦИЮ ИЗ БД
     await remove_subscriber(user.id)
+    user_subscribed_cache.pop(user.id, None)
     if bot_stats:
-        bot_stats.log_message(user.id, user.username or "Unknown", 'unsubscribe')
+        await bot_stats.log_message(user.id, user.username or "Unknown", 'unsubscribe')
     text = await get_message('unsubscribe_success')
     await _reply_or_edit(update, text, parse_mode='HTML')
+    elapsed = time.time() - start_time
+    if bot_stats:
+        bot_stats.track_response_time(elapsed)
 
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    start_time = time.time()
     user = update.effective_user
     if user.id not in ADMIN_IDS:
         await _reply_or_edit(update, "⛔ Нет прав.", parse_mode='HTML')
@@ -340,7 +429,6 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _reply_or_edit(update, "ℹ️ Использование: /broadcast <текст сообщения>", parse_mode=None)
         return
     message = ' '.join(context.args)
-    # ПОЛУЧАЕМ ПОДПИСЧИКОВ ИЗ БД
     subscribers = await get_subscribers()
     if not subscribers:
         await _reply_or_edit(update, "📭 Нет подписчиков для рассылки.", parse_mode='HTML')
@@ -360,12 +448,16 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"❌ Ошибка отправки рассылки пользователю {uid}: {e}")
             failed += 1
     await status_msg.edit_text(f"✅ Рассылка завершена.\n📨 Отправлено: {sent}\n❌ Ошибок: {failed}")
+    elapsed = time.time() - start_time
+    if bot_stats:
+        bot_stats.track_response_time(elapsed)
 
 async def categories_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    start_time = time.time()
     user = update.effective_user
-    await ensure_subscribed(user.id)
+    await ensure_subscribed_cached(user.id)
     if bot_stats:
-        bot_stats.log_message(user.id, user.username or "Unknown", 'command', '/categories')
+        await bot_stats.log_message(user.id, user.username or "Unknown", 'command', '/categories')
     if search_engine is None or not search_engine.faq_data:
         await _reply_or_edit(update, "⚠️ Категории временно недоступны.", parse_mode='HTML')
         return
@@ -384,18 +476,26 @@ async def categories_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     reply_markup = InlineKeyboardMarkup(keyboard)
     text = "📂 <b>Выберите категорию:</b>\n\nНажмите на категорию, чтобы увидеть список вопросов."
     await _reply_or_edit(update, text, parse_mode='HTML', reply_markup=reply_markup)
+    elapsed = time.time() - start_time
+    if bot_stats:
+        bot_stats.track_response_time(elapsed)
 
 async def feedback_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    start_time = time.time()
     user = update.effective_user
-    await ensure_subscribed(user.id)
+    await ensure_subscribed_cached(user.id)
     if bot_stats:
-        bot_stats.log_message(user.id, user.username or "Unknown", 'command', '/feedback')
+        await bot_stats.log_message(user.id, user.username or "Unknown", 'command', '/feedback')
     context.user_data['awaiting_feedback'] = True
     await _reply_or_edit(update, "💬 Напишите ваше предложение или пожелание по работе бота.", parse_mode='HTML')
+    elapsed = time.time() - start_time
+    if bot_stats:
+        bot_stats.track_response_time(elapsed)
 
 async def feedbacks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    start_time = time.time()
     user = update.effective_user
-    await ensure_subscribed(user.id)
+    await ensure_subscribed_cached(user.id)
     if user.id not in ADMIN_IDS:
         await _reply_or_edit(update, "⛔ Нет прав.", parse_mode='HTML')
         return
@@ -403,8 +503,6 @@ async def feedbacks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _reply_or_edit(update, "⚠️ Статистика не инициализирована.", parse_mode='HTML')
         return
     try:
-        # generate_feedback_report пока использует bot_stats.in_memory данные.
-        # Можно переписать, чтобы брал из БД, но оставим как есть.
         output = generate_feedback_report(bot_stats)
         filename = f"feedbacks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         await update.message.reply_document(
@@ -416,10 +514,14 @@ async def feedbacks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"❌ Ошибка выгрузки отзывов: {e}")
         await _reply_or_edit(update, f"❌ Ошибка: {str(e)}", parse_mode='HTML')
+    elapsed = time.time() - start_time
+    if bot_stats:
+        bot_stats.track_response_time(elapsed)
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    start_time = time.time()
     user = update.effective_user
-    await ensure_subscribed(user.id)
+    await ensure_subscribed_cached(user.id)
     if user.id not in ADMIN_IDS:
         await _reply_or_edit(update, "⛔ Нет прав.", parse_mode='HTML')
         return
@@ -429,9 +531,8 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     period = 'all'
     if context.args:
         period = parse_period_argument(context.args[0])
-    bot_stats.log_message(user.id, user.username or "Unknown", 'command', f'/stats {period}')
+    await bot_stats.log_message(user.id, user.username or "Unknown", 'command', f'/stats {period}')
     s = bot_stats.get_summary_stats(period)
-    # ПОДПИСЧИКОВ ПОЛУЧАЕМ ИЗ БД
     subscribers = await get_subscribers()
     faq_count = len(search_engine.faq_data) if search_engine else 0
     period_names = {
@@ -488,20 +589,28 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await _reply_or_edit(update, text, parse_mode='HTML', reply_markup=reply_markup)
+    elapsed = time.time() - start_time
+    if bot_stats:
+        bot_stats.track_response_time(elapsed)
 
 async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    start_time = time.time()
     user = update.effective_user
-    await ensure_subscribed(user.id)
+    await ensure_subscribed_cached(user.id)
     if user.id not in ADMIN_IDS:
         await _reply_or_edit(update, "⛔ Нет прав.", parse_mode='HTML')
         return
     await export_to_excel(update, context)
+    elapsed = time.time() - start_time
+    if bot_stats:
+        bot_stats.track_response_time(elapsed)
 
 async def what_can_i_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    start_time = time.time()
     user = update.effective_user
-    await ensure_subscribed(user.id)
+    await ensure_subscribed_cached(user.id)
     if bot_stats:
-        bot_stats.log_message(user.id, user.username or "Unknown", 'command', '/whatcanido')
+        await bot_stats.log_message(user.id, user.username or "Unknown", 'command', '/whatcanido')
     text = (
         "📋 <b>Что я умею:</b>\n"
         "• Отвечать на HR-вопросы (просто напишите)\n"
@@ -512,8 +621,12 @@ async def what_can_i_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "💡 Совет: можно писать «отпуск: как перенести?» — я найду точнее!"
     )
     await _reply_or_edit(update, text, parse_mode='HTML')
+    elapsed = time.time() - start_time
+    if bot_stats:
+        bot_stats.track_response_time(elapsed)
 
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    start_time = time.time()
     user = update.effective_user
     if user.id not in ADMIN_IDS:
         return
@@ -531,17 +644,19 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton("👑 Открыть админ-меню", callback_data="menu_admin")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await _reply_or_edit(update, text, parse_mode='HTML', reply_markup=reply_markup)
+    elapsed = time.time() - start_time
+    if bot_stats:
+        bot_stats.track_response_time(elapsed)
 
 async def export_to_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    start_time = time.time()
     user = update.effective_user
     if bot_stats is None:
         await _reply_or_edit(update, "⚠️ Экспорт временно недоступен (статистика не инициализирована).", parse_mode='HTML')
         return
-    bot_stats.log_message(user.id, user.username or "Unknown", 'command', '/export')
+    await bot_stats.log_message(user.id, user.username or "Unknown", 'command', '/export')
     try:
-        # ПОДПИСЧИКОВ ПОЛУЧАЕМ ИЗ БД
         subscribers = await get_subscribers()
-        # Запускаем тяжёлую синхронную функцию в отдельном потоке
         output = await asyncio.to_thread(generate_excel_report, bot_stats, subscribers, search_engine)
         filename = f"mechel_bot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         await update.message.reply_document(
@@ -553,52 +668,73 @@ async def export_to_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"❌ Ошибка экспорта: {e}", exc_info=True)
         await _reply_or_edit(update, f"❌ Ошибка: {str(e)}", parse_mode='HTML')
+    elapsed = time.time() - start_time
+    if bot_stats:
+        bot_stats.track_response_time(elapsed)
 
-# ------------------------------------------------------------
-#  КОМАНДА /save (теперь не нужна, но можно оставить для совместимости)
-# ------------------------------------------------------------
 async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    start_time = time.time()
     user = update.effective_user
     if user.id not in ADMIN_IDS:
         await _reply_or_edit(update, "⛔ Нет прав.", parse_mode='HTML')
         return
-    # Сохранять больше нечего, данные уже в БД.
     await _reply_or_edit(update, "✅ Данные автоматически сохраняются в Supabase.", parse_mode='HTML')
-    logger.info(f"💾 Запрос /save от пользователя {user.id} (ничего не делает)")
+    logger.info(f"💾 Запрос /save от пользователя {user.id}")
+    elapsed = time.time() - start_time
+    if bot_stats:
+        bot_stats.track_response_time(elapsed)
 
 # ------------------------------------------------------------
-#  ОБРАБОТЧИК ТЕКСТОВЫХ СООБЩЕНИЙ (ИЗМЕНЕНО СОХРАНЕНИЕ ОТЗЫВА)
+#  ОБРАБОТЧИК ТЕКСТОВЫХ СООБЩЕНИЙ
 # ------------------------------------------------------------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    start_time = time.time()
     user = update.effective_user
     text = update.message.text.strip()
-    await ensure_subscribed(user.id)
+    await ensure_subscribed_cached(user.id)
     if bot_stats:
-        bot_stats.log_message(user.id, user.username or "Unknown", 'message')
+        await bot_stats.log_message(user.id, user.username or "Unknown", 'message')
+
     if context.user_data.get('awaiting_feedback'):
         context.user_data['awaiting_feedback'] = False
         if bot_stats:
-            bot_stats.log_message(user.id, user.username or "Unknown", 'feedback', text)
-        # СОХРАНЯЕМ ОТЗЫВ В БД
+            await bot_stats.log_message(user.id, user.username or "Unknown", 'feedback', text)
         await save_feedback(user.id, user.username or "Unknown", text)
         await update.message.reply_text(await get_message('feedback_ack'), parse_mode='HTML')
+        elapsed = time.time() - start_time
+        if bot_stats:
+            bot_stats.track_response_time(elapsed)
         return
+
     if is_greeting(text):
         logger.info(f"Приветствие от {user.id}: '{text}'")
         greeting_text = await get_message('greeting_response')
         await update.message.reply_text(greeting_text, parse_mode='HTML')
+        elapsed = time.time() - start_time
+        if bot_stats:
+            bot_stats.track_response_time(elapsed)
         return
+
     if text.lower() in ['статистика', 'stats'] and user.id in ADMIN_IDS:
         await stats_command(update, context)
+        elapsed = time.time() - start_time
+        if bot_stats:
+            bot_stats.track_response_time(elapsed)
         return
+
     if bot_stats:
-        bot_stats.log_message(user.id, user.username or "Unknown", 'search')
+        await bot_stats.log_message(user.id, user.username or "Unknown", 'search')
+
     if search_engine is None:
         await update.message.reply_text(
             "⚠️ Поиск временно недоступен. Попробуйте позже или используйте /feedback /предложения.",
             parse_mode='HTML'
         )
+        elapsed = time.time() - start_time
+        if bot_stats:
+            bot_stats.track_response_time(elapsed)
         return
+
     category = None
     search_text = text
     if ':' in text:
@@ -610,12 +746,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 category = cat
                 search_text = parts[1].strip()
                 break
+
     try:
         results = search_engine.search(search_text, category, top_k=3)
         logger.info(f"Поиск по запросу '{search_text}', категория {category}, найдено {len(results)} результатов")
     except Exception as e:
         logger.error(f"❌ Ошибка поиска: {e}", exc_info=True)
         results = []
+
     if not results:
         suggestions = []
         if hasattr(search_engine, 'suggest_correction'):
@@ -626,7 +764,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(text_response, parse_mode='HTML')
         else:
             await update.message.reply_text(await get_message('no_results'), parse_mode='HTML')
+        elapsed = time.time() - start_time
+        if bot_stats:
+            bot_stats.track_response_time(elapsed)
         return
+
     for idx, (faq_id, q, a, s) in enumerate(results[:3]):
         response = f"📌 <b>Результат {idx+1}:</b>\n\n• <b>{q}</b>\n{a[:200]}...\n\n"
         keyboard = [
@@ -638,20 +780,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text(response, parse_mode='HTML', reply_markup=reply_markup)
     await update.message.reply_text("🔍 /categories — все темы")
+    elapsed = time.time() - start_time
+    if bot_stats:
+        bot_stats.track_response_time(elapsed)
 
 # ------------------------------------------------------------
-#  ОБРАБОТЧИК INLINE-КНОПОК (ИЗМЕНЕНО СОХРАНЕНИЕ ОЦЕНКИ)
+#  ОБРАБОТЧИК INLINE-КНОПОК
 # ------------------------------------------------------------
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    start_time = time.time()
     query = update.callback_query
     await query.answer()
     data = query.data
+
     if data == 'export_excel':
         if update.effective_user.id in ADMIN_IDS:
             await export_to_excel(update, context)
         else:
             await query.answer("⛔ Нет прав", show_alert=True)
+        elapsed = time.time() - start_time
+        if bot_stats:
+            bot_stats.track_response_time(elapsed)
         return
+
     if data.startswith('stats_'):
         period_map = {
             'stats_day': 'day', 'stats_week': 'week', 'stats_month': 'month',
@@ -660,17 +811,20 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         period = period_map.get(data, 'all')
         context.args = [period]
         await stats_command(update, context)
+        elapsed = time.time() - start_time
+        if bot_stats:
+            bot_stats.track_response_time(elapsed)
         return
+
     if data.startswith('rate_'):
         parts = data.split('_')
         if len(parts) >= 3:
             faq_id = int(parts[1])
             is_helpful = parts[2] == '1'
-            # СОХРАНЯЕМ ОЦЕНКУ В БД
             await save_rating(faq_id, update.effective_user.id, is_helpful)
             if bot_stats:
                 bot_stats.record_rating(faq_id, is_helpful)
-                bot_stats.log_message(
+                await bot_stats.log_message(
                     update.effective_user.id,
                     update.effective_user.username or "Unknown",
                     'rating_helpful' if is_helpful else 'rating_unhelpful',
@@ -678,7 +832,11 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 )
             await query.edit_message_reply_markup(reply_markup=None)
             await query.answer("Спасибо за оценку! 👍", show_alert=False)
+        elapsed = time.time() - start_time
+        if bot_stats:
+            bot_stats.track_response_time(elapsed)
         return
+
     if data.startswith('cat_'):
         category_name = data[4:]
         questions = []
@@ -690,6 +848,9 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 question_ids.append(item.get('id', 0))
         if not questions:
             await query.edit_message_text(f"❓ В категории {category_name} нет вопросов.")
+            elapsed = time.time() - start_time
+            if bot_stats:
+                bot_stats.track_response_time(elapsed)
             return
         keyboard = []
         for qid, q in zip(question_ids, questions[:20]):
@@ -703,9 +864,13 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             parse_mode='HTML',
             reply_markup=reply_markup
         )
-    elif data.startswith('q_'):
+        elapsed = time.time() - start_time
+        if bot_stats:
+            bot_stats.track_response_time(elapsed)
+        return
+
+    if data.startswith('q_'):
         faq_id = int(data[2:])
-        # ТЕПЕРЬ ПОЛУЧАЕМ ИЗ БД (но search_engine всё ещё держит данные в памяти, можно и из него)
         found = None
         for item in search_engine.faq_data:
             if item.get('id') == faq_id:
@@ -721,13 +886,27 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text(response, parse_mode='HTML', reply_markup=reply_markup)
         else:
             await query.edit_message_text("❌ Вопрос не найден.")
-    elif data == "back_to_categories":
+        elapsed = time.time() - start_time
+        if bot_stats:
+            bot_stats.track_response_time(elapsed)
+        return
+
+    if data == "back_to_categories":
         await categories_command(update, context)
-    elif data == "menu_admin" and update.effective_user.id in ADMIN_IDS:
+        elapsed = time.time() - start_time
+        if bot_stats:
+            bot_stats.track_response_time(elapsed)
+        return
+
+    if data == "menu_admin" and update.effective_user.id in ADMIN_IDS:
         await admin_panel(update, context)
+        elapsed = time.time() - start_time
+        if bot_stats:
+            bot_stats.track_response_time(elapsed)
+        return
 
 # ------------------------------------------------------------
-#  ОБРАБОТЧИК ОШИБОК (ИЗМЕНЕНО СОХРАНЕНИЕ В БД)
+#  ОБРАБОТЧИК ОШИБОК
 # ------------------------------------------------------------
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     error = context.error
@@ -735,7 +914,6 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if update and update.effective_user else None
     if bot_stats:
         bot_stats.log_error(type(error).__name__, str(error), user_id)
-    # СОХРАНЯЕМ В БД
     await log_error(type(error).__name__, str(error)[:500], user_id)
     if ADMIN_IDS and application:
         for aid in ADMIN_IDS:
@@ -749,7 +927,7 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
 
 # ------------------------------------------------------------
-#  ИНИЦИАЛИЗАЦИЯ БОТА (ДОБАВЛЕН ВЫЗОВ init_db)
+#  ИНИЦИАЛИЗАЦИЯ БОТА
 # ------------------------------------------------------------
 @app.before_serving
 async def setup_bot():
@@ -761,207 +939,174 @@ async def setup_bot():
             return
 
         _bot_initializing = True
-        logger.info("🚀 Инициализация бота версии 13.0 (с Supabase)...")
+        logger.info("🚀 Инициализация бота версии 13.6 (с Supabase)...")
 
-        # ===== ДОБАВЛЕНО: ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ =====
+        # Инициализация БД и прогрев пула
         try:
             await init_db()
-            logger.info("✅ База данных Supabase инициализирована")
+            await get_pool()
+            logger.info("✅ База данных Supabase инициализирована и пул прогрет")
         except Exception as e:
             logger.critical(f"❌ Критическая ошибка подключения к БД: {e}")
             _bot_initializing = False
             return
-        # ================================================
 
+        # Загружаем FAQ из БД для возможного использования во встроенном движке
+        faq_data = await load_all_faq()
+        logger.info(f"✅ Загружено {len(faq_data)} записей FAQ из БД")
+
+        # Инициализация поискового движка
         try:
-            use_builtin = False
-
-            # Загрузка поискового движка (без изменений)
-            try:
-                from search_engine import EnhancedSearchEngine
+            if EnhancedSearchEngine:
                 ext_engine = EnhancedSearchEngine(max_cache_size=1000)
                 search_engine = ExternalSearchEngineAdapter(ext_engine)
-                test_result = search_engine.search("тест", top_k=1)
-                if test_result is not None:
-                    logger.info("✅ Загружен EnhancedSearchEngine из search_engine.py")
-                else:
-                    raise ImportError("Тест не пройден")
-            except (ImportError, Exception) as e:
-                logger.debug(f"EnhancedSearchEngine не подходит: {e}")
-                try:
-                    from search_engine import SearchEngine as ExternalSearchEngine
-                    ext_engine = ExternalSearchEngine()
-                    search_engine = ExternalSearchEngineAdapter(ext_engine)
-                    test_result = search_engine.search("тест", top_k=1)
-                    if test_result is not None:
-                        logger.info("✅ Загружен SearchEngine из search_engine.py")
-                    else:
-                        raise ImportError("Тест не пройден")
-                except (ImportError, Exception) as e2:
-                    logger.debug(f"Внешний SearchEngine не подходит: {e2}")
-                    use_builtin = True
-
-            if use_builtin:
-                search_engine = BuiltinSearchEngine()
-                logger.info("✅ Используется встроенный BuiltinSearchEngine")
-
-            bot_stats = BotStatistics()  # Пока оставляем in-memory, но можно позже переписать на БД
-            logger.info("✅ Инициализирован модуль статистики")
-
-            builder = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init)
-            application = builder.build()
-
-            if MEME_MODULE_AVAILABLE:
-                await init_meme_handler(application.job_queue, admin_ids=ADMIN_IDS)
-                logger.info("✅ Модуль мемов инициализирован")
+            elif ExternalSearchEngine:
+                ext_engine = ExternalSearchEngine()
+                search_engine = ExternalSearchEngineAdapter(ext_engine)
             else:
-                logger.warning("⚠️ Модуль мемов не загружен")
-
-            # Добавление обработчиков команд (без изменений)
-            application.add_handler(CommandHandler("start", start_command))
-            application.add_handler(CommandHandler("help", help_command))
-            application.add_handler(CommandHandler("categories", categories_command))
-            application.add_handler(CommandHandler("faq", categories_command))
-            application.add_handler(CommandHandler("feedback", feedback_command))
-            application.add_handler(CommandHandler("suggestions", feedback_command))
-            application.add_handler(CommandHandler("feedbacks", feedbacks_command))
-            application.add_handler(CommandHandler("stats", stats_command))
-            application.add_handler(CommandHandler("export", export_command))
-            application.add_handler(CommandHandler("subscribe", subscribe_command))
-            application.add_handler(CommandHandler("unsubscribe", unsubscribe_command))
-            application.add_handler(CommandHandler("broadcast", broadcast_command))
-            application.add_handler(CommandHandler("whatcanido", what_can_i_do))
-            application.add_handler(CommandHandler("save", save_command))
-
-            if MEME_MODULE_AVAILABLE:
-                application.add_handler(CommandHandler("mem", meme_command))
-                application.add_handler(CommandHandler("memsub", meme_subscribe_command))
-                application.add_handler(CommandHandler("memunsub", meme_unsubscribe_command))
-
-            # Обработчик русских команд (без изменений)
-            async def russian_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-                text = update.message.text.lower().strip()
-                if text.startswith('/старт'):
-                    await start_command(update, context)
-                elif text.startswith('/помощь'):
-                    await help_command(update, context)
-                elif text.startswith('/категории'):
-                    await categories_command(update, context)
-                elif text.startswith('/предложения'):
-                    await feedback_command(update, context)
-                elif text.startswith('/отзывы'):
-                    await feedbacks_command(update, context)
-                elif text.startswith('/статистика'):
-                    await stats_command(update, context)
-                elif text.startswith('/экспорт'):
-                    await export_command(update, context)
-                elif text.startswith('/подписаться'):
-                    await subscribe_command(update, context)
-                elif text.startswith('/отписаться'):
-                    await unsubscribe_command(update, context)
-                elif text.startswith('/рассылка'):
-                    await broadcast_command(update, context)
-                elif text.startswith('/сохранить'):
-                    await save_command(update, context)
-                elif text.startswith('/мем'):
-                    if MEME_MODULE_AVAILABLE:
-                        await meme_command(update, context)
-                elif text.startswith('/мемподписка'):
-                    if MEME_MODULE_AVAILABLE:
-                        await meme_subscribe_command(update, context)
-                elif text.startswith('/мемотписка'):
-                    if MEME_MODULE_AVAILABLE:
-                        await meme_unsubscribe_command(update, context)
-                elif text.startswith('/что_могу'):
-                    await what_can_i_do(update, context)
-                elif text.startswith('/админ'):
-                    await admin_panel(update, context)
-
-            application.add_handler(MessageHandler(
-                filters.Regex(r'^/(старт|помощь|категории|предложения|отзывы|статистика|экспорт|подписаться|отписаться|рассылка|сохранить|мем|мемподписка|мемотписка|что_могу|админ)'),
-                russian_command_handler
-            ))
-
-            application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-            application.add_handler(CallbackQueryHandler(handle_callback_query))
-            application.add_error_handler(error_handler)
-
-            # === РЕГИСТРАЦИЯ ВЕБ-МАРШРУТОВ (без изменений) ===
-            if not _routes_registered:
-                register_web_routes(
-                    app,
-                    application=application,
-                    search_engine=search_engine,
-                    bot_stats=bot_stats,
-                    load_faq_json=load_all_faq,  # ТЕПЕРЬ ЭТА ФУНКЦИЯ ИЗ БД
-                    save_faq_json=None,  # Больше не нужно, но register_web_routes требует аргумент. Передадим заглушку.
-                    get_next_faq_id=None, # Заглушка
-                    load_messages=load_all_messages,
-                    save_messages=save_message,
-                    get_subscribers=get_subscribers,
-                    WEBHOOK_SECRET=WEBHOOK_SECRET,
-                    BASE_URL=BASE_URL,
-                    MEME_MODULE_AVAILABLE=MEME_MODULE_AVAILABLE,
-                    get_meme_handler=get_meme_handler,
-                    is_authorized_func=lambda req: req.headers.get('X-Secret-Key') == WEBHOOK_SECRET,  # Упростим
-                    admin_ids=ADMIN_IDS
-                )
-                _routes_registered = True
-                logger.info("✅ Веб-маршруты зарегистрированы один раз")
-            else:
-                logger.info("ℹ️ Веб-маршруты уже зарегистрированы, пропускаем повторную регистрацию")
-
-            await application.initialize()
-            await application.start()
-
-            if RENDER:
-                webhook_url = WEBHOOK_URL + WEBHOOK_PATH
-                logger.info(f"🔄 Установка вебхука на {webhook_url}...")
-                result = await application.bot.set_webhook(
-                    url=webhook_url,
-                    secret_token=WEBHOOK_SECRET,
-                    drop_pending_updates=True,
-                    max_connections=40
-                )
-                if result:
-                    logger.info(f"✅ Вебхук успешно установлен на {webhook_url}")
-                    info = await application.bot.get_webhook_info()
-                    if info.url == webhook_url:
-                        logger.info("✅ Вебхук подтверждён")
-                    else:
-                        logger.error(f"❌ Вебхук не совпадает: {info.url}")
-                else:
-                    logger.error("❌ Не удалось установить вебхук")
-            else:
-                await application.bot.delete_webhook(drop_pending_updates=True)
-                logger.info("✅ Режим поллинга (локальная разработка)")
-
-            # Запуск периодических задач (оставляем только cleanup)
-            # periodic_subscriber_save больше не нужен.
-            asyncio.create_task(periodic_cleanup())
-
-            _bot_initialized = True
-            _bot_initializing = False
-            logger.info("✅✅✅ Бот полностью инициализирован и готов к работе ✅✅✅")
-
+                # Используем встроенный движок с данными из БД
+                search_engine = BuiltinSearchEngine(faq_data)
+            logger.info("✅ Поисковый движок инициализирован")
         except Exception as e:
-            _bot_initializing = False
-            logger.critical(f"❌❌❌ КРИТИЧЕСКАЯ ОШИБКА ИНИЦИАЛИЗАЦИИ: {e}", exc_info=True)
+            logger.warning(f"⚠️ Ошибка инициализации поискового движка: {e}, используем встроенный")
+            search_engine = BuiltinSearchEngine(faq_data)
+
+        bot_stats = BotStatistics()
+        logger.info("✅ Модуль статистики инициализирован")
+
+        builder = ApplicationBuilder().token(BOT_TOKEN).post_init(lambda app: logger.info("✅ Приложение Telegram готово"))
+        application = builder.build()
+
+        if MEME_MODULE_AVAILABLE:
+            await init_meme_handler(application.job_queue, admin_ids=ADMIN_IDS)
+            logger.info("✅ Модуль мемов инициализирован")
+
+        # --- Регистрация обработчиков команд ---
+        application.add_handler(CommandHandler("start", start_command))
+        application.add_handler(CommandHandler("help", help_command))
+        application.add_handler(CommandHandler("categories", categories_command))
+        application.add_handler(CommandHandler("faq", categories_command))
+        application.add_handler(CommandHandler("feedback", feedback_command))
+        application.add_handler(CommandHandler("suggestions", feedback_command))
+        application.add_handler(CommandHandler("feedbacks", feedbacks_command))
+        application.add_handler(CommandHandler("stats", stats_command))
+        application.add_handler(CommandHandler("export", export_command))
+        application.add_handler(CommandHandler("subscribe", subscribe_command))
+        application.add_handler(CommandHandler("unsubscribe", unsubscribe_command))
+        application.add_handler(CommandHandler("broadcast", broadcast_command))
+        application.add_handler(CommandHandler("whatcanido", what_can_i_do))
+        application.add_handler(CommandHandler("save", save_command))
+
+        if MEME_MODULE_AVAILABLE:
+            application.add_handler(CommandHandler("mem", meme_command))
+            application.add_handler(CommandHandler("memsub", meme_subscribe_command))
+            application.add_handler(CommandHandler("memunsub", meme_unsubscribe_command))
+
+        # --- Русские команды через MessageHandler ---
+        async def russian_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            text = update.message.text.lower().strip()
+            if text.startswith('/старт'):
+                await start_command(update, context)
+            elif text.startswith('/помощь'):
+                await help_command(update, context)
+            elif text.startswith('/категории'):
+                await categories_command(update, context)
+            elif text.startswith('/предложения'):
+                await feedback_command(update, context)
+            elif text.startswith('/отзывы'):
+                await feedbacks_command(update, context)
+            elif text.startswith('/статистика'):
+                await stats_command(update, context)
+            elif text.startswith('/экспорт'):
+                await export_command(update, context)
+            elif text.startswith('/подписаться'):
+                await subscribe_command(update, context)
+            elif text.startswith('/отписаться'):
+                await unsubscribe_command(update, context)
+            elif text.startswith('/рассылка'):
+                await broadcast_command(update, context)
+            elif text.startswith('/сохранить'):
+                await save_command(update, context)
+            elif text.startswith('/мем'):
+                if MEME_MODULE_AVAILABLE:
+                    await meme_command(update, context)
+            elif text.startswith('/мемподписка'):
+                if MEME_MODULE_AVAILABLE:
+                    await meme_subscribe_command(update, context)
+            elif text.startswith('/мемотписка'):
+                if MEME_MODULE_AVAILABLE:
+                    await meme_unsubscribe_command(update, context)
+            elif text.startswith('/что_могу'):
+                await what_can_i_do(update, context)
+            elif text.startswith('/админ'):
+                await admin_panel(update, context)
+
+        application.add_handler(MessageHandler(
+            filters.Regex(r'^/(старт|помощь|категории|предложения|отзывы|статистика|экспорт|подписаться|отписаться|рассылка|сохранить|мем|мемподписка|мемотписка|что_могу|админ)'),
+            russian_command_handler
+        ))
+
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+        application.add_handler(CallbackQueryHandler(handle_callback_query))
+        application.add_error_handler(error_handler)
+
+        # --- Регистрация веб-маршрутов ---
+        if not _routes_registered:
+            register_web_routes(
+                app,
+                application=application,
+                search_engine=search_engine,
+                bot_stats=bot_stats,
+                load_faq_json=load_all_faq,
+                save_faq_json=None,
+                get_next_faq_id=None,
+                load_messages=load_all_messages,
+                save_messages=save_message,
+                get_subscribers=get_subscribers,
+                WEBHOOK_SECRET=WEBHOOK_SECRET,
+                BASE_URL=BASE_URL,
+                MEME_MODULE_AVAILABLE=MEME_MODULE_AVAILABLE,
+                get_meme_handler=get_meme_handler,
+                is_authorized_func=lambda req: req.headers.get('X-Secret-Key') == WEBHOOK_SECRET,
+                admin_ids=ADMIN_IDS
+            )
+            _routes_registered = True
+            logger.info("✅ Веб-маршруты зарегистрированы")
+
+        await application.initialize()
+        await application.start()
+
+        if RENDER:
+            webhook_url = WEBHOOK_URL + WEBHOOK_PATH
+            logger.info(f"🔄 Установка вебхука на {webhook_url}...")
+            result = await application.bot.set_webhook(
+                url=webhook_url,
+                secret_token=WEBHOOK_SECRET,
+                drop_pending_updates=True,
+                max_connections=40
+            )
+            if result:
+                logger.info(f"✅ Вебхук успешно установлен")
+                info = await application.bot.get_webhook_info()
+                if info.url == webhook_url:
+                    logger.info("✅ Вебхук подтверждён")
+                else:
+                    logger.error(f"❌ Вебхук не совпадает: {info.url}")
+            else:
+                logger.error("❌ Не удалось установить вебхук")
+        else:
+            await application.bot.delete_webhook(drop_pending_updates=True)
+            logger.info("✅ Режим поллинга")
+
+        _bot_initialized = True
+        _bot_initializing = False
+        logger.info("✅✅✅ Бот полностью инициализирован и готов к работе ✅✅✅")
 
 # ------------------------------------------------------------
-#  AFTER_SERVING (без изменений)
+#  AFTER_SERVING
 # ------------------------------------------------------------
 @app.after_serving
 async def cleanup():
-    global _bot_initialized
-    _bot_initialized = False
-    logger.info("💤 Сервер останавливается, бот засыпает")
-
-# ------------------------------------------------------------
-#  ФУНКЦИЯ ЗАВЕРШЕНИЯ РАБОТЫ (без изменений, но сохранение в БД не нужно)
-# ------------------------------------------------------------
-async def shutdown():
-    logger.info("🛑 Завершение работы...")
     global _bot_initialized
     _bot_initialized = False
     if MEME_MODULE_AVAILABLE:
@@ -969,11 +1114,13 @@ async def shutdown():
     if application:
         await application.stop()
         await application.shutdown()
-    # Сохранять данные в JSON больше не нужно.
+    if bot_stats:
+        await bot_stats.shutdown()
+    await shutdown_db()
     logger.info("✅ Завершено.")
 
 # ------------------------------------------------------------
-#  ЭНДПОИНТ /WAKE (без изменений)
+#  ЭНДПОИНТЫ
 # ------------------------------------------------------------
 @app.route('/wake', methods=['GET', 'POST'])
 async def wake():
@@ -983,20 +1130,13 @@ async def wake():
         return jsonify({'status': 'waking_up'}), 202
     return jsonify({'status': 'ok', 'awake': True}), 200
 
-# ------------------------------------------------------------
-#  ЭНДПОИНТ /SAVE (теперь просто заглушка)
-# ------------------------------------------------------------
 @app.route('/save', methods=['POST'])
 async def force_save():
     if not request.headers.get('X-Secret-Key') == WEBHOOK_SECRET:
         return jsonify({'error': 'Forbidden'}), 403
-    # Ничего не делаем
     logger.info("💾 Запрос /save (ничего не делает)")
     return jsonify({'status': 'saved'}), 200
 
-# ------------------------------------------------------------
-#  ОБРАБОТЧИК ВЕБХУКА (без изменений)
-# ------------------------------------------------------------
 @app.route(WEBHOOK_PATH, methods=['POST'])
 async def telegram_webhook():
     global _bot_initialized, _bot_initializing
@@ -1023,13 +1163,13 @@ async def telegram_webhook():
         return jsonify({'error': str(e)}), 500
 
 # ------------------------------------------------------------
-#  MAIN (без изменений)
+#  MAIN
 # ------------------------------------------------------------
 async def main():
     logger.info("🔄 Локальный запуск...")
     await setup_bot()
     if not RENDER:
-        polling_task = asyncio.create_task(application.start_polling(allowed_updates=Update.ALL_TYPES))
+        asyncio.create_task(application.start_polling(allowed_updates=Update.ALL_TYPES))
     config = Config()
     config.bind = [f"0.0.0.0:{PORT}"]
     await serve(app, config)
@@ -1037,7 +1177,7 @@ async def main():
 def shutdown_signal(sig):
     logger.info(f"Получен сигнал {sig}, инициируем завершение...")
     loop = asyncio.get_event_loop()
-    loop.create_task(shutdown())
+    loop.create_task(cleanup())
 
 if __name__ == '__main__':
     loop = asyncio.get_event_loop()

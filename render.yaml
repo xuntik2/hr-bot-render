@@ -6,7 +6,7 @@ services:
     region: frankfurt
     plan: free
     branch: main
-    buildCommand: pip install -r requirements.txt
+    buildCommand: python migrate_to_supabase.py && pip install -r requirements.txt
     startCommand: hypercorn --bind 0.0.0.0:$PORT --worker-class asyncio --workers 1 --access-logfile - --error-logfile - bot:app
     healthCheckPath: /health
     healthCheckTimeout: 30
@@ -24,3 +24,4 @@ services:
         value: "true"
       - key: DELETE_WEBHOOK_ON_EXIT
         value: "false"
+

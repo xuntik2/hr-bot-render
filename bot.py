@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram-бот для HR-отдела компании "Мечел"
-Версия 13.7 – передача faq_data в поисковый движок при инициализации
+Версия 13.8 – финальная с улучшенной сетевой устойчивостью
 """
 import os
 import sys
@@ -291,6 +291,7 @@ class ExternalSearchEngineAdapter:
             return []
 
     def suggest_correction(self, query: str, top_k: int = 3) -> List[str]:
+        """Предложения исправлений с кэшированием."""
         if not query:
             return []
         cache_key = f"{query}_{top_k}"
@@ -436,7 +437,7 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=uid, text=message, parse_mode='HTML')
             sent += 1
             if i % 10 == 9:
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(2.0)
             else:
                 await asyncio.sleep(0.1)
         except Exception as e:
@@ -922,7 +923,7 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
 
 # ------------------------------------------------------------
-#  ИНИЦИАЛИЗАЦИЯ БОТА
+#  ИНИЦИАЛИЗАЦИЯ БОТА (с задержкой сети)
 # ------------------------------------------------------------
 @app.before_serving
 async def setup_bot():
@@ -934,7 +935,11 @@ async def setup_bot():
             return
 
         _bot_initializing = True
-        logger.info("🚀 Инициализация бота версии 13.7 (с Supabase)...")
+        logger.info("🚀 Инициализация бота версии 13.8 (с задержкой сети)...")
+
+        # Дополнительная задержка для стабилизации сети на Render Free
+        logger.info("🔄 Ожидание инициализации сети...")
+        await asyncio.sleep(1.0)
 
         # Инициализация БД и прогрев пула
         try:
@@ -953,15 +958,12 @@ async def setup_bot():
         # Инициализация поискового движка
         try:
             if EnhancedSearchEngine:
-                # Внешний улучшенный движок (наш класс SearchEngine) с переданными данными
                 ext_engine = EnhancedSearchEngine(max_cache_size=1000, faq_data=faq_data)
                 search_engine = ExternalSearchEngineAdapter(ext_engine)
             elif ExternalSearchEngine:
-                # Другой внешний движок (если есть) – тоже пробуем передать faq_data, если поддерживает
                 ext_engine = ExternalSearchEngine(faq_data=faq_data)
                 search_engine = ExternalSearchEngineAdapter(ext_engine)
             else:
-                # Встроенный движок
                 search_engine = BuiltinSearchEngine(faq_data)
             logger.info("✅ Поисковый движок инициализирован")
         except Exception as e:

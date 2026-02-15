@@ -417,7 +417,7 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=uid, text=message, parse_mode='HTML')
             sent += 1
             if i % 10 == 9:
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(3.0)
             else:
                 await asyncio.sleep(0.1)
         except Exception as e:

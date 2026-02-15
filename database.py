@@ -1,7 +1,7 @@
 # database.py
 """
 Модуль для работы с базой данных Supabase (PostgreSQL)
-Версия 2.5 – увеличенное число попыток и экспоненциальная задержка
+Версия 2.6 – максимальная сетевая устойчивость для бесплатного тарифа Render
 """
 import os
 import asyncio
@@ -41,7 +41,11 @@ async def get_pool() -> asyncpg.Pool:
     if _pool is None:
         async with _pool_lock:
             if _pool is None:
-                max_retries = 7  # Увеличено для бесплатного тарифа
+                # Дополнительная задержка перед первой попыткой (критично для Render)
+                logger.info("🔄 Ожидание полной инициализации сети Render (3 сек)...")
+                await asyncio.sleep(3.0)
+
+                max_retries = 12  # увеличено для бесплатного тарифа
                 for attempt in range(max_retries):
                     try:
                         logger.info(f"🔄 Попытка {attempt+1}/{max_retries} создания пула соединений...")
@@ -56,24 +60,28 @@ async def get_pool() -> asyncpg.Pool:
                         logger.info(f"✅ Пул соединений создан (min={POOL_MIN_SIZE}, max={POOL_MAX_SIZE})")
                         break
                     except (OSError, asyncpg.exceptions.PostgresError, asyncio.TimeoutError) as e:
-                        # Специальная обработка ошибок сети
                         error_msg = str(e)
                         if "Network is unreachable" in error_msg or "Temporary failure in name resolution" in error_msg:
                             logger.warning(f"⚠️ Сеть ещё не готова: {error_msg}")
                         else:
                             logger.warning(f"⚠️ Ошибка создания пула: {error_msg}")
-                        
+
                         if attempt == max_retries - 1:
-                            logger.critical(f"❌ Не удалось создать пул после {max_retries} попыток: {error_msg}")
+                            logger.critical(
+                                f"❌ Не удалось создать пул после {max_retries} попыток. "
+                                f"Проверьте: 1) DATABASE_URL в переменных окружения, "
+                                f"2) Доступность Supabase, 3) Лимиты бесплатного тарифа."
+                            )
                             raise
-                        
-                        # Экспоненциальная задержка с ограничением 10 секунд
-                        wait = min(10.0, 0.5 * (2 ** attempt))  # 0.5, 1.0, 2.0, 4.0, 8.0, 10.0, 10.0
+
+                        # Экспоненциальная задержка с ограничением 15 секунд
+                        wait = min(15.0, 0.5 * (2 ** attempt))  # 0.5, 1.0, 2.0, 4.0, 8.0, 15.0...
                         logger.warning(f"⏳ Повтор через {wait:.1f}с...")
                         await asyncio.sleep(wait)
     return _pool
 
 async def close_pool():
+    """Закрывает пул соединений (вызывается при завершении)."""
     global _pool
     if _pool:
         await _pool.close()
@@ -84,6 +92,10 @@ async def close_pool():
 #  УНИВЕРСАЛЬНАЯ ФУНКЦИЯ ДЛЯ ВЫПОЛНЕНИЯ ЗАПРОСОВ С ПОВТОРАМИ
 # ------------------------------------------------------------
 async def _execute_with_retry(coro, max_retries=3, timeout=5.0):
+    """
+    Выполняет корутину с повторными попытками при временных ошибках.
+    При TooManyConnectionsError – не повторяет, сразу падает.
+    """
     for attempt in range(max_retries):
         try:
             return await asyncio.wait_for(coro, timeout=timeout)
@@ -108,6 +120,7 @@ async def _execute_with_retry(coro, max_retries=3, timeout=5.0):
 #  ИНИЦИАЛИЗАЦИЯ ТАБЛИЦ
 # ------------------------------------------------------------
 async def init_db():
+    """Создаёт все необходимые таблицы, если их ещё нет."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         await _execute_with_retry(conn.execute('''

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram-бот для HR-отдела компании "Мечел"
-Версия 13.6 – финальная с кэшированием предложений и улучшенной обработкой ошибок
+Версия 13.7 – передача faq_data в поисковый движок при инициализации
 """
 import os
 import sys
@@ -185,7 +185,7 @@ class BuiltinSearchEngine:
         """
         self.faq_data = faq_data if faq_data is not None else []
         self.cache = {}
-        self.suggest_cache = {}  # кэш для предложений
+        self.suggest_cache = {}
         self.suggest_cache_ttl = timedelta(minutes=30)
         self.max_cache_size = max_cache_size
         logger.info(f"✅ Встроенный поиск инициализирован с {len(self.faq_data)} записями")
@@ -231,7 +231,6 @@ class BuiltinSearchEngine:
         if not query or not self.faq_data:
             return []
 
-        # Проверка кэша
         cache_key = f"{query}_{top_k}"
         cached = self.suggest_cache.get(cache_key)
         if cached:
@@ -281,7 +280,6 @@ class ExternalSearchEngineAdapter:
                     answer = r.get('answer', '')
                     score = r.get('score', 0.0)
                 else:
-                    # Предполагаем, что у объекта есть атрибуты id, question, answer, score
                     faq_id = getattr(r, 'id', 0)
                     question = getattr(r, 'question', '')
                     answer = getattr(r, 'answer', '')
@@ -293,17 +291,14 @@ class ExternalSearchEngineAdapter:
             return []
 
     def suggest_correction(self, query: str, top_k: int = 3) -> List[str]:
-        """Предложения исправлений с кэшированием."""
         if not query:
             return []
-
         cache_key = f"{query}_{top_k}"
         cached = self.suggest_cache.get(cache_key)
         if cached:
             ts, value = cached
             if datetime.now() - ts < self.suggest_cache_ttl:
                 return value
-
         try:
             if hasattr(self.engine, 'suggest_correction'):
                 result = self.engine.suggest_correction(query, top_k=top_k)
@@ -939,7 +934,7 @@ async def setup_bot():
             return
 
         _bot_initializing = True
-        logger.info("🚀 Инициализация бота версии 13.6 (с Supabase)...")
+        logger.info("🚀 Инициализация бота версии 13.7 (с Supabase)...")
 
         # Инициализация БД и прогрев пула
         try:
@@ -951,20 +946,22 @@ async def setup_bot():
             _bot_initializing = False
             return
 
-        # Загружаем FAQ из БД для возможного использования во встроенном движке
+        # Загружаем FAQ из БД
         faq_data = await load_all_faq()
         logger.info(f"✅ Загружено {len(faq_data)} записей FAQ из БД")
 
         # Инициализация поискового движка
         try:
             if EnhancedSearchEngine:
-                ext_engine = EnhancedSearchEngine(max_cache_size=1000)
+                # Внешний улучшенный движок (наш класс SearchEngine) с переданными данными
+                ext_engine = EnhancedSearchEngine(max_cache_size=1000, faq_data=faq_data)
                 search_engine = ExternalSearchEngineAdapter(ext_engine)
             elif ExternalSearchEngine:
-                ext_engine = ExternalSearchEngine()
+                # Другой внешний движок (если есть) – тоже пробуем передать faq_data, если поддерживает
+                ext_engine = ExternalSearchEngine(faq_data=faq_data)
                 search_engine = ExternalSearchEngineAdapter(ext_engine)
             else:
-                # Используем встроенный движок с данными из БД
+                # Встроенный движок
                 search_engine = BuiltinSearchEngine(faq_data)
             logger.info("✅ Поисковый движок инициализирован")
         except Exception as e:

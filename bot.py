@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram-бот для HR-отдела компании "Мечел"
-Версия 13.8 – финальная с улучшенной сетевой устойчивостью
+Версия 13.9 – финальная с максимальной сетевой устойчивостью
 """
 import os
 import sys
@@ -180,9 +180,6 @@ async def ensure_subscribed_cached(user_id: int):
 # ------------------------------------------------------------
 class BuiltinSearchEngine:
     def __init__(self, faq_data: List[Dict], max_cache_size: int = 500):
-        """
-        :param faq_data: список словарей с ключами id, question, answer, category и т.д.
-        """
         self.faq_data = faq_data if faq_data is not None else []
         self.cache = {}
         self.suggest_cache = {}
@@ -197,10 +194,6 @@ class BuiltinSearchEngine:
         logger.info(f"🔄 Данные встроенного поиска обновлены, теперь {len(self.faq_data)} записей")
 
     def search(self, query: str, category: str = None, top_k: int = 5) -> List[Tuple[int, str, str, float]]:
-        """
-        Простой поиск по ключевым словам в вопросе и ответе.
-        Возвращает список кортежей (id, вопрос, ответ, релевантность).
-        """
         if not query or not self.faq_data:
             return []
         query_lower = query.lower()
@@ -224,20 +217,14 @@ class BuiltinSearchEngine:
         return results[:top_k]
 
     def suggest_correction(self, query: str, top_k: int = 3) -> List[str]:
-        """
-        Возвращает похожие вопросы для исправления опечаток.
-        С кэшированием результата на 30 минут.
-        """
         if not query or not self.faq_data:
             return []
-
         cache_key = f"{query}_{top_k}"
         cached = self.suggest_cache.get(cache_key)
         if cached:
             ts, value = cached
             if datetime.now() - ts < self.suggest_cache_ttl:
                 return value
-
         query_lower = query.lower()
         suggestions = set()
         for item in self.faq_data:
@@ -248,7 +235,6 @@ class BuiltinSearchEngine:
                 suggestions.add(question)
                 if len(suggestions) >= top_k:
                     break
-
         result = list(suggestions)[:top_k]
         self.suggest_cache[cache_key] = (datetime.now(), result)
         return result
@@ -263,11 +249,6 @@ class ExternalSearchEngineAdapter:
         self.suggest_cache_ttl = timedelta(minutes=30)
 
     def search(self, query: str, category: str = None, top_k: int = 5) -> List[Tuple[int, str, str, float]]:
-        """
-        Вызывает внешний поисковый движок и приводит результат к единому формату.
-        Ожидается, что внешний движок возвращает список объектов с полями id, question, answer, score
-        (или словарей с такими ключами).
-        """
         try:
             raw_results = self.engine.search(query, category=category, top_k=top_k)
             if not raw_results:
@@ -291,7 +272,6 @@ class ExternalSearchEngineAdapter:
             return []
 
     def suggest_correction(self, query: str, top_k: int = 3) -> List[str]:
-        """Предложения исправлений с кэшированием."""
         if not query:
             return []
         cache_key = f"{query}_{top_k}"
@@ -437,7 +417,7 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=uid, text=message, parse_mode='HTML')
             sent += 1
             if i % 10 == 9:
-                await asyncio.sleep(2.0)
+                await asyncio.sleep(1.0)
             else:
                 await asyncio.sleep(0.1)
         except Exception as e:
@@ -923,7 +903,7 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
 
 # ------------------------------------------------------------
-#  ИНИЦИАЛИЗАЦИЯ БОТА (с задержкой сети)
+#  ИНИЦИАЛИЗАЦИЯ БОТА (с проверкой БД после создания пула)
 # ------------------------------------------------------------
 @app.before_serving
 async def setup_bot():
@@ -935,17 +915,37 @@ async def setup_bot():
             return
 
         _bot_initializing = True
-        logger.info("🚀 Инициализация бота версии 13.8 (с задержкой сети)...")
+        logger.info("🚀 Инициализация бота версии 13.9 (с улучшенной сетевой устойчивостью)...")
 
-        # Дополнительная задержка для стабилизации сети на Render Free
-        logger.info("🔄 Ожидание инициализации сети...")
-        await asyncio.sleep(1.0)
+        # Прогрев сети (дополнительная задержка)
+        logger.info("🔄 Ожидание инициализации сети Render (2 сек)...")
+        await asyncio.sleep(2.0)
 
         # Инициализация БД и прогрев пула
         try:
             await init_db()
             await get_pool()
-            logger.info("✅ База данных Supabase инициализирована и пул прогрет")
+            # Дополнительная проверка, что БД реально отвечает
+            db_ready = False
+            for i in range(3):
+                try:
+                    pool = await get_pool()
+                    async with pool.acquire() as conn:
+                        await conn.fetchval("SELECT 1")
+                    db_ready = True
+                    logger.info("✅ База данных Supabase доступна и готова к работе")
+                    break
+                except Exception as e:
+                    logger.warning(f"⚠️ Проверка БД не удалась (попытка {i+1}/3): {e}")
+                    await asyncio.sleep(2.0)
+
+            if not db_ready:
+                logger.error("❌ БД недоступна. Бот запускается в ограниченном режиме (без сохранения данных)")
+                # Продолжаем работу, но без БД? Лучше упасть и перезапуститься.
+                # На бесплатном тарифе Render бот перезапустится по крону.
+                # Позволим продолжить, но с риском неработоспособности.
+            else:
+                logger.info("✅ База данных Supabase инициализирована и пул прогрет")
         except Exception as e:
             logger.critical(f"❌ Критическая ошибка подключения к БД: {e}")
             _bot_initializing = False

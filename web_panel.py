@@ -1,7 +1,7 @@
 # web_panel.py
 """
 Веб-панель для HR-бота Мечел
-Версия 2.11 — исправлен конструктор класса WebServer
+Версия 2.12 — адаптирована для работы с Supabase
 """
 from quart import Quart, request, jsonify, render_template_string, make_response
 import asyncio
@@ -393,9 +393,9 @@ class WebServer:
         application,
         search_engine,
         bot_stats,
-        load_faq_json: Callable,
-        save_faq_json: Callable,
-        get_next_faq_id: Callable,
+        load_faq_json: Callable,      # теперь указывает на load_all_faq из database
+        save_faq_json: Callable,       # больше не используется (можно передать None)
+        get_next_faq_id: Callable,     # больше не используется (можно передать None)
         load_messages: Callable,
         save_messages: Callable,
         get_subscribers: Callable,
@@ -411,8 +411,8 @@ class WebServer:
         self.search_engine = search_engine
         self.bot_stats = bot_stats
         self.load_faq_json = load_faq_json
-        self.save_faq_json = save_faq_json
-        self.get_next_faq_id = get_next_faq_id
+        self.save_faq_json = save_faq_json          # заглушка
+        self.get_next_faq_id = get_next_faq_id      # заглушка
         self.load_messages = load_messages
         self.save_messages = save_messages
         self.get_subscribers = get_subscribers
@@ -475,14 +475,14 @@ class WebServer:
             messages = await self.load_messages()
             if key not in messages:
                 return jsonify({'error': 'Message key not found'}), 404
-            messages[key]['text'] = new_text
-            await self.save_messages(messages)
+            # Обновляем через БД
+            await self.save_messages(key, new_text, messages[key].get('title', ''))
             return jsonify({'success': True, 'key': key, 'text': new_text})
         except Exception as e:
             logger.error(f"Ошибка обновления сообщения {key}: {e}")
             return jsonify({'error': str(e)}), 500
 
-    # --- API для FAQ с пагинацией ---
+    # --- API для FAQ с пагинацией (используем функции из БД) ---
     async def _faq_api_list(self):
         if not await self._check_token(request):
             return jsonify({'error': 'Forbidden'}), 403
@@ -496,7 +496,7 @@ class WebServer:
             page = 1
         if per_page < 1 or per_page > 200:
             per_page = 50
-        data = await self.load_faq_json()
+        data = await self.load_faq_json()   # load_all_faq из database
         total = len(data)
         start = (page - 1) * per_page
         end = start + per_page
@@ -513,8 +513,8 @@ class WebServer:
         if not await self._check_token(request):
             return jsonify({'error': 'Forbidden'}), 403
         self.log_admin_action(request, f"Просмотр записи FAQ ID {faq_id}")
-        data = await self.load_faq_json()
-        item = next((i for i in data if i.get('id') == faq_id), None)
+        from database import get_faq_by_id
+        item = await get_faq_by_id(faq_id)
         if item:
             return jsonify(item)
         return jsonify({'error': 'Not found'}), 404
@@ -527,8 +527,14 @@ class WebServer:
             item = await request.get_json()
             if not item.get('question') or not item.get('answer') or not item.get('category'):
                 return jsonify({'error': 'Missing required fields'}), 400
-            data = await self.load_faq_json()
-            new_id = await self.get_next_faq_id()
+            from database import add_faq
+            new_id = await add_faq(
+                question=item['question'].strip(),
+                answer=item['answer'].strip(),
+                category=item['category'].strip(),
+                keywords=item.get('keywords', '').strip(),
+                priority=0
+            )
             new_item = {
                 'id': new_id,
                 'question': item['question'].strip(),
@@ -536,8 +542,6 @@ class WebServer:
                 'category': item['category'].strip(),
                 'keywords': item.get('keywords', '').strip()
             }
-            data.append(new_item)
-            await self.save_faq_json(data)
             return jsonify(new_item), 201
         except Exception as e:
             logger.error(f"Ошибка добавления FAQ: {e}")
@@ -551,19 +555,16 @@ class WebServer:
             item = await request.get_json()
             if not item.get('question') or not item.get('answer') or not item.get('category'):
                 return jsonify({'error': 'Missing required fields'}), 400
-            data = await self.load_faq_json()
-            for i, d in enumerate(data):
-                if d.get('id') == faq_id:
-                    data[i] = {
-                        'id': faq_id,
-                        'question': item['question'].strip(),
-                        'answer': item['answer'].strip(),
-                        'category': item['category'].strip(),
-                        'keywords': item.get('keywords', '').strip()
-                    }
-                    await self.save_faq_json(data)
-                    return jsonify(data[i])
-            return jsonify({'error': 'Not found'}), 404
+            from database import update_faq
+            await update_faq(
+                faq_id=faq_id,
+                question=item['question'].strip(),
+                answer=item['answer'].strip(),
+                category=item['category'].strip(),
+                keywords=item.get('keywords', '').strip(),
+                priority=0
+            )
+            return jsonify({'success': True}), 200
         except Exception as e:
             logger.error(f"Ошибка обновления FAQ: {e}")
             return jsonify({'error': str(e)}), 500
@@ -572,11 +573,8 @@ class WebServer:
         if not await self._check_token(request):
             return jsonify({'error': 'Forbidden'}), 403
         self.log_admin_action(request, f"Удаление записи FAQ ID {faq_id}")
-        data = await self.load_faq_json()
-        new_data = [i for i in data if i.get('id') != faq_id]
-        if len(new_data) == len(data):
-            return jsonify({'error': 'Not found'}), 404
-        await self.save_faq_json(new_data)
+        from database import delete_faq
+        await delete_faq(faq_id)
         return jsonify({'success': True}), 200
 
     async def _subscribers_api_list(self):
@@ -809,7 +807,7 @@ class WebServer:
 <body>
     <div class="container">
         <h1>🤖 HR Бот «Мечел»</h1>
-        <div class="subtitle">Версия 2.11 · Расширенная веб-панель (безопасные формы)</div>
+        <div class="subtitle">Версия 2.12 · Расширенная веб-панель (безопасные формы)</div>
 
         <div class="grid">
             <div class="card">

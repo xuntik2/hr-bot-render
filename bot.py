@@ -568,6 +568,441 @@ async def post_init(application: Application):
     logger.info("✅ Приложение Telegram полностью готово и запущено")
 
 # ------------------------------------------------------------
+#  ОБРАБОТЧИКИ КОМАНД
+# ------------------------------------------------------------
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    await ensure_subscribed(user.id)
+    if bot_stats:
+        bot_stats.log_message(user.id, user.username or "Unknown", 'command', '/start')
+        bot_stats.log_message(user.id, user.username or "Unknown", 'subscribe', '')
+    text = await get_message('welcome', first_name=user.first_name)
+    if user.id in ADMIN_IDS:
+        text += "\n\n👑 Админ-команды:\n/stats [период] — статистика\n/feedbacks — отзывы (выгрузка)\n/export — Excel\n/статистика, /отзывы, /экспорт\n/subscribe /unsubscribe — подписка\n/broadcast — рассылка"
+    await _reply_or_edit(update, text, parse_mode='HTML')
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    await ensure_subscribed(user.id)
+    if bot_stats:
+        bot_stats.log_message(user.id, user.username or "Unknown", 'command', '/help')
+    text = await get_message('help')
+    await _reply_or_edit(update, text, parse_mode='HTML')
+
+async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    added = await add_subscriber(user.id)
+    if bot_stats:
+        bot_stats.log_message(user.id, user.username or "Unknown", 'subscribe' if added else 'message')
+    if added:
+        text = await get_message('subscribe_success')
+    else:
+        text = await get_message('already_subscribed')
+    await _reply_or_edit(update, text, parse_mode='HTML')
+
+async def unsubscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    removed = await remove_subscriber(user.id)
+    if bot_stats:
+        bot_stats.log_message(user.id, user.username or "Unknown", 'unsubscribe' if removed else 'message')
+    if removed:
+        text = await get_message('unsubscribe_success')
+    else:
+        text = await get_message('not_subscribed')
+    await _reply_or_edit(update, text, parse_mode='HTML')
+
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.id not in ADMIN_IDS:
+        await _reply_or_edit(update, "⛔ Нет прав.", parse_mode='HTML')
+        return
+    if not context.args:
+        await _reply_or_edit(update, "ℹ️ Использование: /broadcast <текст сообщения>", parse_mode=None)
+        return
+    message = ' '.join(context.args)
+    subscribers = await get_subscribers()
+    if not subscribers:
+        await _reply_or_edit(update, "📭 Нет подписчиков для рассылки.", parse_mode='HTML')
+        return
+    sent = 0
+    failed = 0
+    status_msg = await _reply_or_edit(update, f"📨 Отправка {len(subscribers)} подписчикам...", parse_mode='HTML')
+    for i, uid in enumerate(subscribers):
+        try:
+            await context.bot.send_message(chat_id=uid, text=message, parse_mode='HTML')
+            sent += 1
+            if i % 10 == 9:
+                await asyncio.sleep(1.0)
+            else:
+                await asyncio.sleep(0.1)
+        except Exception as e:
+            logger.error(f"❌ Ошибка отправки рассылки пользователю {uid}: {e}")
+            failed += 1
+    await status_msg.edit_text(f"✅ Рассылка завершена.\n📨 Отправлено: {sent}\n❌ Ошибок: {failed}")
+
+async def categories_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    await ensure_subscribed(user.id)
+    if bot_stats:
+        bot_stats.log_message(user.id, user.username or "Unknown", 'command', '/categories')
+    if search_engine is None or not search_engine.faq_data:
+        await _reply_or_edit(update, "⚠️ Категории временно недоступны.", parse_mode='HTML')
+        return
+    categories = {}
+    for item in search_engine.faq_data:
+        cat = item.get('category', 'Без категории')
+        categories[cat] = categories.get(cat, 0) + 1
+    if not categories:
+        await _reply_or_edit(update, "📂 Категории не найдены.", parse_mode='HTML')
+        return
+    keyboard = []
+    for cat in sorted(categories.keys()):
+        count = categories[cat]
+        button = InlineKeyboardButton(text=f"{cat} ({count})", callback_data=f"cat_{cat}")
+        keyboard.append([button])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    text = "📂 <b>Выберите категорию:</b>\n\nНажмите на категорию, чтобы увидеть список вопросов."
+    await _reply_or_edit(update, text, parse_mode='HTML', reply_markup=reply_markup)
+
+async def feedback_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    await ensure_subscribed(user.id)
+    if bot_stats:
+        bot_stats.log_message(user.id, user.username or "Unknown", 'command', '/feedback')
+    context.user_data['awaiting_feedback'] = True
+    await _reply_or_edit(update, "💬 Напишите ваше предложение или пожелание по работе бота.", parse_mode='HTML')
+
+async def feedbacks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    await ensure_subscribed(user.id)
+    if user.id not in ADMIN_IDS:
+        await _reply_or_edit(update, "⛔ Нет прав.", parse_mode='HTML')
+        return
+    if bot_stats is None:
+        await _reply_or_edit(update, "⚠️ Статистика не инициализирована.", parse_mode='HTML')
+        return
+    try:
+        output = generate_feedback_report(bot_stats)
+        filename = f"feedbacks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        await update.message.reply_document(
+            document=output.getvalue(),
+            filename=filename,
+            caption=f"📋 Отзывы и предложения от {datetime.now().strftime('%d.%m.%Y %H:%M')}"
+        )
+        logger.info(f"✅ Отзывы выгружены пользователем {user.id}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка выгрузки отзывов: {e}")
+        await _reply_or_edit(update, f"❌ Ошибка: {str(e)}", parse_mode='HTML')
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    await ensure_subscribed(user.id)
+    if user.id not in ADMIN_IDS:
+        await _reply_or_edit(update, "⛔ Нет прав.", parse_mode='HTML')
+        return
+    if bot_stats is None:
+        await _reply_or_edit(update, "⚠️ Статистика временно недоступна.", parse_mode='HTML')
+        return
+    period = 'all'
+    if context.args:
+        period = parse_period_argument(context.args[0])
+    bot_stats.log_message(user.id, user.username or "Unknown", 'command', f'/stats {period}')
+    s = bot_stats.get_summary_stats(period)
+    subscribers = await get_subscribers()
+    faq_count = len(search_engine.faq_data) if search_engine else 0
+    period_names = {
+        'all': 'всё время',
+        'day': 'день',
+        'week': 'неделя',
+        'month': 'месяц',
+        'quarter': 'квартал',
+        'halfyear': 'полгода',
+        'year': 'год'
+    }
+    period_text = period_names.get(period, period)
+    text = (
+        f"📊 <b>Статистика за {period_text}</b>\n"
+        f"👥 Пользователей: {s['total_users']}\n"
+    )
+    if period == 'all':
+        text += f"👤 Активных (24ч): {s['active_users_24h']}\n"
+    text += (
+        f"📨 Сообщений: {s['total_messages']}\n"
+        f"🛠 Команд: {s['total_commands']}\n"
+        f"🔍 Поисков: {s['total_searches']}\n"
+        f"📝 Отзывов/предложений: {s['total_feedback']}\n"
+        f"👍 Полезных ответов: {s['total_ratings_helpful']}\n"
+        f"👎 Бесполезных: {s['total_ratings_unhelpful']}\n"
+        f"⭐ Удовлетворённость: "
+    )
+    if s['total_ratings'] > 0:
+        satisfaction = s['total_ratings_helpful'] / s['total_ratings'] * 100
+        text += f"{satisfaction:.1f}%\n"
+    else:
+        text += "нет оценок\n"
+    text += (
+        f"📦 Кэш поиска: {s['cache_size']}\n"
+        f"⏱ Uptime: {s['uptime']}\n"
+        f"👥 Подписчиков на рассылку: {len(subscribers)}\n"
+        f"📚 Вопросов в базе знаний: {faq_count}\n"
+    )
+    keyboard = [
+        [
+            InlineKeyboardButton("День", callback_data="stats_day"),
+            InlineKeyboardButton("Неделя", callback_data="stats_week"),
+            InlineKeyboardButton("Месяц", callback_data="stats_month")
+        ],
+        [
+            InlineKeyboardButton("Квартал", callback_data="stats_quarter"),
+            InlineKeyboardButton("Полгода", callback_data="stats_halfyear"),
+            InlineKeyboardButton("Год", callback_data="stats_year")
+        ],
+        [
+            InlineKeyboardButton("📊 Веб-статистика", url=BASE_URL),
+            InlineKeyboardButton("📁 Excel", callback_data="export_excel")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await _reply_or_edit(update, text, parse_mode='HTML', reply_markup=reply_markup)
+
+async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    await ensure_subscribed(user.id)
+    if user.id not in ADMIN_IDS:
+        await _reply_or_edit(update, "⛔ Нет прав.", parse_mode='HTML')
+        return
+    await export_to_excel(update, context)
+
+async def what_can_i_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    await ensure_subscribed(user.id)
+    if bot_stats:
+        bot_stats.log_message(user.id, user.username or "Unknown", 'command', '/whatcanido')
+    text = (
+        "📋 <b>Что я умею:</b>\n"
+        "• Отвечать на HR-вопросы (просто напишите)\n"
+        "• Показывать категории: /categories\n"
+        "• Принимать предложения: /feedback\n"
+        "• Присылать мемы: /мем или /mem\n"
+        "• Подписаться на рассылку: /subscribe\n"
+        "💡 Совет: можно писать «отпуск: как перенести?» — я найду точнее!"
+    )
+    await _reply_or_edit(update, text, parse_mode='HTML')
+
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.id not in ADMIN_IDS:
+        return
+    text = (
+        "👑 <b>Админ-панель</b>\n"
+        "• Статистика: /stats [day|week|month]\n"
+        "• Управление FAQ: /faq → веб-панель\n"
+        "• Рассылка: /broadcast или /рассылка\n"
+        "• Экспорт: /export\n"
+        "• Отзывы: /feedbacks\n"
+        "• Мемы: /memsub, /memunsub\n"
+        f"• Веб-интерфейс: {BASE_URL}"
+    )
+    keyboard = [[InlineKeyboardButton("👑 Открыть админ-меню", callback_data="menu_admin")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await _reply_or_edit(update, text, parse_mode='HTML', reply_markup=reply_markup)
+
+async def export_to_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if bot_stats is None:
+        await _reply_or_edit(update, "⚠️ Экспорт временно недоступен (статистика не инициализирована).", parse_mode='HTML')
+        return
+    bot_stats.log_message(user.id, user.username or "Unknown", 'command', '/export')
+    try:
+        output = await generate_excel_report(bot_stats, await get_subscribers(), search_engine)
+        filename = f"mechel_bot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        await update.message.reply_document(
+            document=output.getvalue(),
+            filename=filename,
+            caption=f"📊 Экспорт от {datetime.now().strftime('%d.%m.%Y %H:%M')}"
+        )
+        logger.info(f"✅ Экспорт выполнен пользователем {user.id}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка экспорта: {e}", exc_info=True)
+        await _reply_or_edit(update, f"❌ Ошибка: {str(e)}", parse_mode='HTML')
+
+# ------------------------------------------------------------
+#  ОБРАБОТЧИК ТЕКСТОВЫХ СООБЩЕНИЙ
+# ------------------------------------------------------------
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    text = update.message.text.strip()
+    await ensure_subscribed(user.id)
+    if bot_stats:
+        bot_stats.log_message(user.id, user.username or "Unknown", 'message')
+    if context.user_data.get('awaiting_feedback'):
+        context.user_data['awaiting_feedback'] = False
+        if bot_stats:
+            bot_stats.log_message(user.id, user.username or "Unknown", 'feedback', text)
+        await update.message.reply_text(await get_message('feedback_ack'), parse_mode='HTML')
+        return
+    if is_greeting(text):
+        logger.info(f"Приветствие от {user.id}: '{text}'")
+        greeting_text = await get_message('greeting_response')
+        await update.message.reply_text(greeting_text, parse_mode='HTML')
+        return
+    if text.lower() in ['статистика', 'stats'] and user.id in ADMIN_IDS:
+        await stats_command(update, context)
+        return
+    if bot_stats:
+        bot_stats.log_message(user.id, user.username or "Unknown", 'search')
+    if search_engine is None:
+        await update.message.reply_text(
+            "⚠️ Поиск временно недоступен. Попробуйте позже или используйте /feedback /предложения.",
+            parse_mode='HTML'
+        )
+        return
+    category = None
+    search_text = text
+    if ':' in text:
+        parts = text.split(':', 1)
+        cat_candidate = parts[0].strip().lower()
+        for item in search_engine.faq_data:
+            cat = item.get('category')
+            if cat and cat_candidate in cat.lower():
+                category = cat
+                search_text = parts[1].strip()
+                break
+    try:
+        results = search_engine.search(search_text, category, top_k=3)
+        logger.info(f"Поиск по запросу '{search_text}', категория {category}, найдено {len(results)} результатов")
+    except Exception as e:
+        logger.error(f"❌ Ошибка поиска: {e}", exc_info=True)
+        results = []
+    if not results:
+        suggestions = []
+        if hasattr(search_engine, 'suggest_correction'):
+            suggestions = search_engine.suggest_correction(search_text, top_k=3)
+        if suggestions:
+            suggestions_text = '\n'.join([f'• {s}' for s in suggestions])
+            text_response = await get_message('suggestions', query=search_text, suggestions=suggestions_text)
+            await update.message.reply_text(text_response, parse_mode='HTML')
+        else:
+            await update.message.reply_text(await get_message('no_results'), parse_mode='HTML')
+        return
+    for idx, (faq_id, q, a, s) in enumerate(results[:3]):
+        response = f"📌 <b>Результат {idx+1}:</b>\n\n• <b>{q}</b>\n{a[:200]}...\n\n"
+        keyboard = [
+            [
+                InlineKeyboardButton("👍 Помог", callback_data=f"rate_{faq_id}_1"),
+                InlineKeyboardButton("👎 Нет", callback_data=f"rate_{faq_id}_0")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(response, parse_mode='HTML', reply_markup=reply_markup)
+    await update.message.reply_text("🔍 /categories — все темы")
+
+# ------------------------------------------------------------
+#  ОБРАБОТЧИК INLINE-КНОПОК
+# ------------------------------------------------------------
+async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    if data == 'export_excel':
+        if update.effective_user.id in ADMIN_IDS:
+            await export_to_excel(update, context)
+        else:
+            await query.answer("⛔ Нет прав", show_alert=True)
+        return
+    if data.startswith('stats_'):
+        period_map = {
+            'stats_day': 'day', 'stats_week': 'week', 'stats_month': 'month',
+            'stats_quarter': 'quarter', 'stats_halfyear': 'halfyear', 'stats_year': 'year'
+        }
+        period = period_map.get(data, 'all')
+        context.args = [period]
+        await stats_command(update, context)
+        return
+    if data.startswith('rate_'):
+        parts = data.split('_')
+        if len(parts) >= 3:
+            faq_id = int(parts[1])
+            is_helpful = parts[2] == '1'
+            if bot_stats:
+                bot_stats.record_rating(faq_id, is_helpful)
+                bot_stats.log_message(
+                    update.effective_user.id,
+                    update.effective_user.username or "Unknown",
+                    'rating_helpful' if is_helpful else 'rating_unhelpful',
+                    ''
+                )
+            await query.edit_message_reply_markup(reply_markup=None)
+            await query.answer("Спасибо за оценку! 👍", show_alert=False)
+        return
+    if data.startswith('cat_'):
+        category_name = data[4:]
+        questions = []
+        question_ids = []
+        for item in search_engine.faq_data:
+            cat = item.get('category')
+            if cat == category_name:
+                questions.append(item.get('question', ''))
+                question_ids.append(item.get('id', 0))
+        if not questions:
+            await query.edit_message_text(f"❓ В категории {category_name} нет вопросов.")
+            return
+        keyboard = []
+        for qid, q in zip(question_ids, questions[:20]):
+            short_q = truncate_question(q, 50)
+            button = InlineKeyboardButton(text=short_q, callback_data=f"q_{qid}")
+            keyboard.append([button])
+        keyboard.append([InlineKeyboardButton("◀ Назад к категориям", callback_data="back_to_categories")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            f"📁 <b>{category_name}</b>\n\nВсего вопросов: {len(questions)}\nВыберите вопрос:",
+            parse_mode='HTML',
+            reply_markup=reply_markup
+        )
+    elif data.startswith('q_'):
+        faq_id = int(data[2:])
+        found = None
+        for item in search_engine.faq_data:
+            if item.get('id') == faq_id:
+                found = item
+                break
+        if found:
+            question = found.get('question', '')
+            answer = found.get('answer', '')
+            category = found.get('category', '')
+            response = f"❓ <b>{question}</b>\n\n📌 <b>Ответ:</b>\n{answer}\n\n📁 Категория: {category}"
+            keyboard = [[InlineKeyboardButton("◀ Назад к категории", callback_data=f"cat_{category}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(response, parse_mode='HTML', reply_markup=reply_markup)
+        else:
+            await query.edit_message_text("❌ Вопрос не найден.")
+    elif data == "back_to_categories":
+        await categories_command(update, context)
+    elif data == "menu_admin" and update.effective_user.id in ADMIN_IDS:
+        await admin_panel(update, context)
+    # Добавьте другие обработчики меню при необходимости
+
+# ------------------------------------------------------------
+#  ОБРАБОТЧИК ОШИБОК
+# ------------------------------------------------------------
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    error = context.error
+    logger.error(f"❌ Ошибка: {type(error).__name__}: {error}", exc_info=True)
+    if bot_stats:
+        user_id = update.effective_user.id if update and update.effective_user else None
+        bot_stats.log_error(type(error).__name__, str(error), user_id)
+    if ADMIN_IDS and application:
+        for aid in ADMIN_IDS:
+            try:
+                await application.bot.send_message(
+                    aid,
+                    f"⚠️ <b>Ошибка</b>\n{type(error).__name__}: {str(error)[:200]}",
+                    parse_mode='HTML'
+                )
+            except:
+                pass
+
+# ------------------------------------------------------------
 #  ИНИЦИАЛИЗАЦИЯ БОТА (ВЫЗЫВАЕТСЯ ЧЕРЕЗ @app.before_serving)
 # ------------------------------------------------------------
 @app.before_serving
@@ -709,8 +1144,8 @@ async def setup_bot():
                     BASE_URL=BASE_URL,
                     MEME_MODULE_AVAILABLE=MEME_MODULE_AVAILABLE,
                     get_meme_handler=get_meme_handler,
-                    is_authorized_func=is_authorized,   # передаём функцию авторизации
-                    admin_ids=ADMIN_IDS                  # передаём список админов
+                    is_authorized_func=is_authorized,
+                    admin_ids=ADMIN_IDS
                 )
                 _routes_registered = True
                 logger.info("✅ Веб-маршруты зарегистрированы один раз")
@@ -744,7 +1179,7 @@ async def setup_bot():
 
             # Запуск периодических задач
             asyncio.create_task(periodic_subscriber_save())
-            asyncio.create_task(periodic_cleanup())  # фоновая очистка
+            asyncio.create_task(periodic_cleanup())
 
             _bot_initialized = True
             _bot_initializing = False
@@ -803,13 +1238,7 @@ async def telegram_webhook():
         return jsonify({'error': str(e)}), 500
 
 # ------------------------------------------------------------
-#  МАРШРУТ / (больше не нужен, так как определён в web_panel.py)
-#  УДАЛЁН
-# ------------------------------------------------------------
-
-# ------------------------------------------------------------
-#  МАРШРУТ /health (больше не нужен, так как определён в web_panel.py)
-#  УДАЛЁН
+#  МАРШРУТЫ / и /health УДАЛЕНЫ (определены в web_panel.py)
 # ------------------------------------------------------------
 
 # ------------------------------------------------------------

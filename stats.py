@@ -4,14 +4,14 @@ import logging
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Tuple, Optional
-from openpyxl import Workbook  # ✅ Единственный импорт
+from openpyxl import Workbook
 from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
 
 logger = logging.getLogger(__name__)
 
 class BotStatistics:
-    def __init__(self, max_history_days: int = 90):
+    def __init__(self):
         self.start_time = datetime.now()
         self.user_stats = defaultdict(lambda: {
             'messages': 0,
@@ -31,14 +31,29 @@ class BotStatistics:
             'searches': 0,
             'users': set(),
             'feedback': 0,
-            'response_times': [],
+            'response_times': [],      # список float
             'ratings': {'helpful': 0, 'unhelpful': 0}
         })
         self.feedback_list = []
         self.max_feedback = 10000
         self.error_log = deque(maxlen=1000)
-        self.response_times = deque(maxlen=100)
+        self.response_times = deque(maxlen=100)   # список словарей с timestamp и response_time
         self.faq_ratings = defaultdict(lambda: {'helpful': 0, 'unhelpful': 0})
+        self._weekly_html_cache = ""
+        self._weekly_cache_ts = datetime.min
+
+    # --- Новый метод очистки старых данных ---
+    def cleanup_old_data(self, max_days: int = 180):
+        """
+        Удаляет записи из daily_stats, которые старше max_days дней.
+        Рекомендуется вызывать периодически (например, раз в сутки).
+        """
+        cutoff = (datetime.now() - timedelta(days=max_days)).strftime("%Y-%m-%d")
+        old_keys = [k for k in self.daily_stats.keys() if k < cutoff]
+        for key in old_keys:
+            del self.daily_stats[key]
+        if old_keys:
+            logger.info(f"Очищено {len(old_keys)} устаревших дней из статистики")
 
     def track_response_time(self, response_time: float):
         self.response_times.append({
@@ -195,7 +210,7 @@ class BotStatistics:
             'avg_response_time': avg_response_time,
             'response_time_status': status,
             'response_time_color': color,
-            'cache_size': cache_size,  # ✅ Теперь точный!
+            'cache_size': cache_size,
             'error_count': len(self.error_log)
         }
 
@@ -208,7 +223,37 @@ class BotStatistics:
     def get_feedback_list(self, limit: int = 1000) -> List[Dict]:
         return sorted(self.feedback_list, key=lambda x: x['timestamp'], reverse=True)[:limit]
 
-def generate_feedback_report(bot_stats) -> io.BytesIO:
+    def get_weekly_stats_html(self, ttl_seconds: int = 60) -> str:
+        now = datetime.now()
+        if (now - self._weekly_cache_ts).total_seconds() < ttl_seconds:
+            return self._weekly_html_cache
+
+        rows = []
+        for date, ds in sorted(self.daily_stats.items(), reverse=True)[:7]:
+            avg_resp = sum(ds['response_times']) / len(ds['response_times']) if ds['response_times'] else 0
+            helpful = ds['ratings']['helpful']
+            unhelpful = ds['ratings']['unhelpful']
+            rows.append(f"""
+                <tr>
+                    <td>{date}</td>
+                    <td>{len(ds['users'])}</td>
+                    <td>{ds['messages']}</td>
+                    <td>{ds['commands']}</td>
+                    <td>{ds['searches']}</td>
+                    <td>{avg_resp:.2f}с</td>
+                    <td>{helpful}</td>
+                    <td>{unhelpful}</td>
+                </tr>
+            """)
+
+        self._weekly_html_cache = ''.join(rows)
+        self._weekly_cache_ts = now
+        return self._weekly_html_cache
+
+
+# ---------- Генераторы отчётов (синхронные) ----------
+
+def generate_feedback_report(bot_stats: BotStatistics) -> io.BytesIO:
     output = io.BytesIO()
     wb = Workbook()
     ws = wb.active
@@ -238,16 +283,17 @@ def generate_feedback_report(bot_stats) -> io.BytesIO:
     output.seek(0)
     return output
 
-async def generate_excel_report(bot_stats, subscribers: List[int]) -> io.BytesIO:
+
+def generate_excel_report(bot_stats: BotStatistics, subscribers: List[int], search_engine=None) -> io.BytesIO:
     """
-    Исправлено: search_engine больше не передаётся.
-    Исправлено: удалён лишний импорт Workbook.
+    Полный экспорт в Excel: общая статистика, время ответа, база FAQ, пользователи, оценки.
     """
     output = io.BytesIO()
-    wb = Workbook()  # ✅ Используется глобальный импорт
-    stats = bot_stats.get_summary_stats(cache_size=0)  # cache_size не нужен здесь
+    wb = Workbook()
+    stats = bot_stats.get_summary_stats() if bot_stats else {}
     rating_stats = bot_stats.get_rating_stats() if bot_stats else {}
 
+    # Лист 1: Общая статистика
     ws1 = wb.active
     ws1.title = "Общая статистика"
     ws1['A1'] = "Статистика HR-бота Мечел"
@@ -278,7 +324,94 @@ async def generate_excel_report(bot_stats, subscribers: List[int]) -> io.BytesIO
     for i, (k, v) in enumerate(rows, 4):
         ws1[f'A{i}'] = k; ws1[f'B{i}'] = v
 
-    for ws in [ws1]:
+    # Лист 2: Время ответа (история)
+    ws2 = wb.create_sheet("Время ответа")
+    ws2['A1'] = "История времени ответа (последние 100)"
+    ws2['A1'].font = Font(bold=True, size=14)
+    ws2.merge_cells('A1:C1')
+    ws2['A3'] = "Время"; ws2['B3'] = "Ответ (сек)"; ws2['C3'] = "Статус"
+    for c in ['A3','B3','C3']: ws2[c].font = Font(bold=True)
+    if bot_stats:
+        for i, rt in enumerate(bot_stats.response_times, 4):
+            ws2[f'A{i}'] = rt['timestamp'].strftime("%Y-%m-%d %H:%M:%S")
+            ws2[f'B{i}'] = rt['response_time']
+            t = rt['response_time']
+            ws2[f'C{i}'] = "Хорошо" if t < 1 else "Нормально" if t < 3 else "Медленно"
+
+    # Лист 3: База знаний FAQ
+    ws3 = wb.create_sheet("FAQ База")
+    ws3['A1'] = "База знаний FAQ"
+    ws3['A1'].font = Font(bold=True, size=14)
+    ws3.merge_cells('A1:E1')
+    headers = ["ID", "Категория", "Вопрос", "Ответ", "Ключевые слова"]
+    for col, h in enumerate(headers, 1):
+        cell = ws3.cell(row=3, column=col); cell.value = h; cell.font = Font(bold=True)
+
+    if search_engine and hasattr(search_engine, 'faq_data') and search_engine.faq_data:
+        row = 4
+        for item in search_engine.faq_data:
+            item_id = item.get('id', '')
+            cat = item.get('category', 'Без категории')
+            q = item.get('question', '')
+            a = item.get('answer', '')
+            kw = ', '.join(item.get('keywords', [])) if isinstance(item.get('keywords'), list) else str(item.get('keywords', ''))
+            ws3.cell(row=row, column=1, value=item_id)
+            ws3.cell(row=row, column=2, value=cat)
+            ws3.cell(row=row, column=3, value=q)
+            ws3.cell(row=row, column=4, value=a)
+            ws3.cell(row=row, column=5, value=kw)
+            row += 1
+    else:
+        ws3.cell(row=4, column=1, value="Поисковый движок недоступен или база знаний пуста")
+
+    # Лист 4: Пользователи
+    ws4 = wb.create_sheet("Пользователи")
+    ws4['A1'] = "Статистика пользователей"
+    ws4['A1'].font = Font(bold=True, size=14)
+    ws4.merge_cells('A1:I1')
+    headers2 = ["ID", "Сообщ", "Команд", "Поиск", "Отзывы", "Оценок", "Полезно", "Бесполезно", "Посл. активность", "Подписка"]
+    for col, h in enumerate(headers2, 1):
+        cell = ws4.cell(row=3, column=col); cell.value = h; cell.font = Font(bold=True)
+    if bot_stats:
+        subs_set = set(subscribers)
+        for i, (uid, udata) in enumerate(bot_stats.user_stats.items(), 4):
+            ws4.cell(row=i, column=1, value=uid)
+            ws4.cell(row=i, column=2, value=udata['messages'])
+            ws4.cell(row=i, column=3, value=udata['commands'])
+            ws4.cell(row=i, column=4, value=udata['searches'])
+            ws4.cell(row=i, column=5, value=udata['feedback_count'])
+            ws4.cell(row=i, column=6, value=udata['ratings_given'])
+            ws4.cell(row=i, column=7, value=udata['ratings_helpful'])
+            ws4.cell(row=i, column=8, value=udata['ratings_unhelpful'])
+            last = udata['last_active']
+            ws4.cell(row=i, column=9, value=last.strftime("%Y-%m-%d %H:%M:%S") if last else '')
+            ws4.cell(row=i, column=10, value="Да" if uid in subs_set else "Нет")
+
+    # Лист 5: Оценки FAQ
+    ws5 = wb.create_sheet("Оценки FAQ")
+    ws5['A1'] = "Статистика оценок по вопросам"
+    ws5['A1'].font = Font(bold=True, size=14)
+    ws5.merge_cells('A1:D1')
+    headers3 = ["ID вопроса", "Вопрос", "👍 Помог", "👎 Нет", "Всего оценок"]
+    for col, h in enumerate(headers3, 1):
+        cell = ws5.cell(row=3, column=col); cell.value = h; cell.font = Font(bold=True)
+    if bot_stats:
+        row = 4
+        question_map = {}
+        if search_engine and hasattr(search_engine, 'faq_data'):
+            for item in search_engine.faq_data:
+                qid = item.get('id')
+                if qid:
+                    question_map[qid] = item.get('question', '')
+        for faq_id, ratings in bot_stats.faq_ratings.items():
+            ws5.cell(row=row, column=1, value=faq_id)
+            ws5.cell(row=row, column=2, value=question_map.get(faq_id, 'Неизвестный вопрос'))
+            ws5.cell(row=row, column=3, value=ratings['helpful'])
+            ws5.cell(row=row, column=4, value=ratings['unhelpful'])
+            ws5.cell(row=row, column=5, value=ratings['helpful'] + ratings['unhelpful'])
+            row += 1
+
+    for ws in [ws1, ws2, ws3, ws4, ws5]:
         for col in ws.columns:
             max_len = 0
             col_letter = get_column_letter(col[0].column)

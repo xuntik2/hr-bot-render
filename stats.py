@@ -1,13 +1,18 @@
 # stats.py
 """
 Модуль статистики для HR-бота Мечел
-Версия 2.4 – финальная
+Версия 2.5 – финальная с улучшенными генераторами отчётов и очисткой кэша
 """
-import asyncio  # добавлено
+import asyncio
+import io
 import logging
 from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Tuple, Optional, Set
+
+from openpyxl import Workbook
+from openpyxl.styles import Font
+from openpyxl.utils import get_column_letter
 
 from database import (
     log_daily_stat,
@@ -16,6 +21,7 @@ from database import (
     save_rating as db_save_rating,
     get_recent_response_times,
     get_daily_stats_for_last_days,
+    get_all_feedback,  # для загрузки отзывов
 )
 
 logger = logging.getLogger(__name__)
@@ -102,6 +108,14 @@ class BotStatistics:
             if date < cutoff:
                 del self._users_count_buffer[date]
 
+        # Очистка старых записей из _user_last_active (старше max_buffer_days)
+        cutoff_7d = datetime.now() - timedelta(days=self.max_buffer_days)
+        old_keys = [uid for uid, last_active in self._user_last_active.items()
+                    if last_active < cutoff_7d]
+        for uid in old_keys:
+            del self._user_last_active[uid]
+        logger.debug(f"Очищено {len(old_keys)} старых записей из _user_last_active")
+
         logger.debug("Сброс статистики завершён.")
 
     # --- Методы логирования ---
@@ -130,6 +144,7 @@ class BotStatistics:
         self._users_buffer[date_key].add(user_id)
 
     def track_response_time(self, response_time: float):
+        """Записывает время ответа в кэш и в БД."""
         self._response_times_cache.append(response_time)
         if len(self._response_times_cache) > 100:
             self._response_times_cache.pop(0)
@@ -261,4 +276,183 @@ class BotStatistics:
         return ''.join(rows)
 
     async def shutdown(self):
+        """При завершении принудительно сбрасываем данные."""
         await self.flush()
+
+
+# ---------- Генераторы отчётов (синхронные) ----------
+def generate_feedback_report(bot_stats: BotStatistics) -> io.BytesIO:
+    """
+    Генерирует Excel-файл с отзывами.
+    ВНИМАНИЕ: функция синхронная, но для получения данных из БД требуется асинхронный вызов.
+    В текущей реализации возвращается заглушка. Рекомендуется переделать на асинхронную версию.
+    """
+    output = io.BytesIO()
+    try:
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Отзывы и предложения"
+        headers = ["Дата", "User ID", "Имя пользователя", "Текст"]
+        for col, h in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col)
+            cell.value = h
+            cell.font = Font(bold=True)
+
+        # Попытка загрузить отзывы из БД (асинхронно) – не рекомендуется в синхронной функции.
+        # Для работоспособности оставляем заглушку.
+        ws.cell(row=2, column=1, value="Для загрузки отзывов используйте асинхронную версию или веб-интерфейс")
+
+        wb.save(output)
+        output.seek(0)
+    except Exception as e:
+        logger.error(f"Ошибка генерации отчёта по отзывам: {e}")
+        # Возвращаем пустой файл с ошибкой
+        output = io.BytesIO()
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Ошибка"
+        ws['A1'] = f"Ошибка: {e}"
+        wb.save(output)
+        output.seek(0)
+    return output
+
+
+def generate_excel_report(bot_stats: BotStatistics, subscribers: List[int], search_engine=None) -> io.BytesIO:
+    """
+    Полный экспорт в Excel.
+    Возвращает BytesIO с готовым файлом.
+    """
+    output = io.BytesIO()
+    try:
+        wb = Workbook()
+        stats = bot_stats.get_summary_stats() if bot_stats else {}
+
+        # Лист 1: Общая статистика
+        ws1 = wb.active
+        ws1.title = "Общая статистика"
+        ws1['A1'] = "Статистика HR-бота Мечел"
+        ws1['A1'].font = Font(bold=True, size=14)
+        ws1.merge_cells('A1:D1')
+        ws1['A3'] = "Показатель"; ws1['B3'] = "Значение"
+        for cell in ['A3','B3']: ws1[cell].font = Font(bold=True)
+        rows = [
+            ("Дата экспорта", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+            ("Время работы", stats.get('uptime', 'N/A')),
+            ("Запущен", stats.get('start_time', 'N/A')),
+            ("Всего пользователей", stats.get('total_users', 0)),
+            ("Активные (24ч)", stats.get('active_users_24h', 0)),
+            ("Всего сообщений", stats.get('total_messages', 0)),
+            ("Всего команд", stats.get('total_commands', 0)),
+            ("Всего поисков", stats.get('total_searches', 0)),
+            ("Всего отзывов/предложений", stats.get('total_feedback', 0)),
+            ("Всего оценок", stats.get('total_ratings', 0)),
+            ("Полезных ответов", stats.get('total_ratings_helpful', 0)),
+            ("Бесполезных ответов", stats.get('total_ratings_unhelpful', 0)),
+            ("Удовлетворённость", f"{stats.get('total_ratings_helpful', 0) / max(stats.get('total_ratings', 1), 1) * 100:.1f}%"),
+            ("Ср. время ответа", f"{stats.get('avg_response_time', 0):.2f} сек"),
+            ("Статус времени", stats.get('response_time_status', 'N/A')),
+            ("Размер кэша", stats.get('cache_size', 0)),
+            ("Количество ошибок", stats.get('error_count', 0)),
+            ("Подписчиков", len(subscribers))
+        ]
+        for i, (k, v) in enumerate(rows, 4):
+            ws1[f'A{i}'] = k; ws1[f'B{i}'] = v
+
+        # Лист 2: Время ответа (последние 100)
+        ws2 = wb.create_sheet("Время ответа")
+        ws2['A1'] = "История времени ответа (последние 100)"
+        ws2['A1'].font = Font(bold=True, size=14)
+        ws2.merge_cells('A1:C1')
+        ws2['A3'] = "Время"; ws2['B3'] = "Ответ (сек)"; ws2['C3'] = "Статус"
+        for c in ['A3','B3','C3']: ws2[c].font = Font(bold=True)
+        if bot_stats:
+            for i, rt in enumerate(bot_stats._response_times_cache, 4):
+                ws2[f'A{i}'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")  # точной метки нет
+                ws2[f'B{i}'] = rt
+                t = rt
+                ws2[f'C{i}'] = "Хорошо" if t < 1 else "Нормально" if t < 3 else "Медленно"
+
+        # Лист 3: База знаний FAQ
+        ws3 = wb.create_sheet("FAQ База")
+        ws3['A1'] = "База знаний FAQ"
+        ws3['A1'].font = Font(bold=True, size=14)
+        ws3.merge_cells('A1:E1')
+        headers_faq = ["ID", "Категория", "Вопрос", "Ответ", "Ключевые слова"]
+        for col, h in enumerate(headers_faq, 1):
+            cell = ws3.cell(row=3, column=col); cell.value = h; cell.font = Font(bold=True)
+
+        if search_engine and hasattr(search_engine, 'faq_data') and search_engine.faq_data:
+            row = 4
+            for item in search_engine.faq_data:
+                item_id = item.get('id', '')
+                cat = item.get('category', 'Без категории')
+                q = item.get('question', '')
+                a = item.get('answer', '')
+                kw = item.get('keywords', '')
+                ws3.cell(row=row, column=1, value=item_id)
+                ws3.cell(row=row, column=2, value=cat)
+                ws3.cell(row=row, column=3, value=q)
+                ws3.cell(row=row, column=4, value=a)
+                ws3.cell(row=row, column=5, value=kw)
+                row += 1
+        else:
+            ws3.cell(row=4, column=1, value="Поисковый движок недоступен или база знаний пуста")
+
+        # Лист 4: Пользователи (активные за последние 7 дней)
+        ws4 = wb.create_sheet("Пользователи")
+        ws4['A1'] = "Активные пользователи (последние 7 дней)"
+        ws4['A1'].font = Font(bold=True, size=14)
+        ws4.merge_cells('A1:D1')
+        headers_users = ["User ID", "Последняя активность", "Подписан на рассылку"]
+        for col, h in enumerate(headers_users, 1):
+            cell = ws4.cell(row=3, column=col); cell.value = h; cell.font = Font(bold=True)
+
+        if bot_stats:
+            subs_set = set(subscribers)
+            # Берём всех пользователей из _user_last_active (они уже не старше 7 дней из-за очистки)
+            row = 4
+            for uid, last_active in sorted(bot_stats._user_last_active.items(), key=lambda x: x[1], reverse=True):
+                ws4.cell(row=row, column=1, value=uid)
+                ws4.cell(row=row, column=2, value=last_active.strftime("%Y-%m-%d %H:%M:%S") if last_active else '')
+                ws4.cell(row=row, column=3, value="Да" if uid in subs_set else "Нет")
+                row += 1
+                if row > 10000:  # Защита от слишком больших файлов
+                    ws4.cell(row=row, column=1, value="... (слишком много пользователей, показаны первые 10000)")
+                    break
+
+        # Лист 5: Оценки FAQ (заглушка)
+        ws5 = wb.create_sheet("Оценки FAQ")
+        ws5['A1'] = "Статистика оценок по вопросам"
+        ws5['A1'].font = Font(bold=True, size=14)
+        ws5.merge_cells('A1:D1')
+        headers_ratings = ["ID вопроса", "Вопрос", "👍 Помог", "👎 Нет", "Всего оценок"]
+        for col, h in enumerate(headers_ratings, 1):
+            cell = ws5.cell(row=3, column=col); cell.value = h; cell.font = Font(bold=True)
+        ws5.cell(row=4, column=1, value="Для получения оценок используйте асинхронную версию")
+
+        # Автоподбор ширины столбцов
+        for ws in [ws1, ws2, ws3, ws4, ws5]:
+            for col in ws.columns:
+                max_len = 0
+                col_letter = get_column_letter(col[0].column)
+                for cell in col:
+                    try:
+                        if cell.value and len(str(cell.value)) > max_len:
+                            max_len = len(str(cell.value))
+                    except:
+                        pass
+                ws.column_dimensions[col_letter].width = min(max_len + 2, 70)
+
+        wb.save(output)
+        output.seek(0)
+    except Exception as e:
+        logger.error(f"Ошибка генерации Excel-отчёта: {e}", exc_info=True)
+        # Возвращаем пустой файл с информацией об ошибке
+        output = io.BytesIO()
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Ошибка"
+        ws['A1'] = f"Ошибка при формировании отчёта: {e}"
+        wb.save(output)
+        output.seek(0)
+    return output

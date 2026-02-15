@@ -1,7 +1,7 @@
 # database.py
 """
 Модуль для работы с базой данных Supabase (PostgreSQL)
-Версия 2.3 – финальная
+Версия 2.5 – увеличенное число попыток и экспоненциальная задержка
 """
 import os
 import asyncio
@@ -12,10 +12,12 @@ from typing import List, Dict, Optional, Any, Tuple, Set
 
 logger = logging.getLogger(__name__)
 
+# Строка подключения к базе данных
 DATABASE_URL = os.getenv('DATABASE_URL')
 if not DATABASE_URL:
     raise RuntimeError("❌ DATABASE_URL не установлен! Проверьте переменные окружения на Render.")
 
+# Пул соединений (глобальный)
 _pool: Optional[asyncpg.Pool] = None
 _pool_lock: Optional[asyncio.Lock] = None
 POOL_MIN_SIZE = 2
@@ -32,25 +34,43 @@ VALID_DAILY_FIELDS = {
 #  УПРАВЛЕНИЕ ПУЛОМ
 # ------------------------------------------------------------
 async def get_pool() -> asyncpg.Pool:
+    """Возвращает глобальный пул соединений (создаёт при первом вызове)."""
     global _pool, _pool_lock
     if _pool_lock is None:
         _pool_lock = asyncio.Lock()
     if _pool is None:
         async with _pool_lock:
             if _pool is None:
-                try:
-                    _pool = await asyncpg.create_pool(
-                        DATABASE_URL,
-                        min_size=POOL_MIN_SIZE,
-                        max_size=POOL_MAX_SIZE,
-                        command_timeout=POOL_TIMEOUT,
-                        max_queries=50000,
-                        max_inactive_connection_lifetime=300
-                    )
-                    logger.info(f"✅ Пул соединений создан (min={POOL_MIN_SIZE}, max={POOL_MAX_SIZE})")
-                except Exception as e:
-                    logger.critical(f"❌ Не удалось создать пул: {e}")
-                    raise
+                max_retries = 7  # Увеличено для бесплатного тарифа
+                for attempt in range(max_retries):
+                    try:
+                        logger.info(f"🔄 Попытка {attempt+1}/{max_retries} создания пула соединений...")
+                        _pool = await asyncpg.create_pool(
+                            DATABASE_URL,
+                            min_size=POOL_MIN_SIZE,
+                            max_size=POOL_MAX_SIZE,
+                            command_timeout=POOL_TIMEOUT,
+                            max_queries=50000,
+                            max_inactive_connection_lifetime=300
+                        )
+                        logger.info(f"✅ Пул соединений создан (min={POOL_MIN_SIZE}, max={POOL_MAX_SIZE})")
+                        break
+                    except (OSError, asyncpg.exceptions.PostgresError, asyncio.TimeoutError) as e:
+                        # Специальная обработка ошибок сети
+                        error_msg = str(e)
+                        if "Network is unreachable" in error_msg or "Temporary failure in name resolution" in error_msg:
+                            logger.warning(f"⚠️ Сеть ещё не готова: {error_msg}")
+                        else:
+                            logger.warning(f"⚠️ Ошибка создания пула: {error_msg}")
+                        
+                        if attempt == max_retries - 1:
+                            logger.critical(f"❌ Не удалось создать пул после {max_retries} попыток: {error_msg}")
+                            raise
+                        
+                        # Экспоненциальная задержка с ограничением 10 секунд
+                        wait = min(10.0, 0.5 * (2 ** attempt))  # 0.5, 1.0, 2.0, 4.0, 8.0, 10.0, 10.0
+                        logger.warning(f"⏳ Повтор через {wait:.1f}с...")
+                        await asyncio.sleep(wait)
     return _pool
 
 async def close_pool():
@@ -263,7 +283,7 @@ async def is_meme_subscribed(user_id: int) -> bool:
         return row is not None
 
 # ------------------------------------------------------------
-#  СИСТЕМНЫЕ СООБЩЕНИЯ (исправлен help)
+#  СИСТЕМНЫЕ СООБЩЕНИЯ
 # ------------------------------------------------------------
 DEFAULT_MESSAGES = {
     "welcome": (
@@ -508,7 +528,6 @@ async def get_daily_stats_for_last_days(days: int = 7) -> Dict[str, Dict]:
         ''', days))
         result = {}
         for r in rows:
-            # Исправлено: r['date'] уже объект date, преобразуем в строку
             date_str = r['date'].strftime("%Y-%m-%d")
             result[date_str] = {
                 'messages': r['messages'],

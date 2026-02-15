@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram-бот для HR-отдела компании "Мечел"
-Версия 12.63 — финальная, с улучшенной веб-панелью 2.8 и фоновой очисткой данных
+Версия 12.67 — добавлена функция shutdown() для корректного завершения
 """
 import os
 import sys
@@ -29,7 +29,7 @@ def check_critical_dependencies():
         except ImportError:
             print("❌ Не удалось импортировать importlib.metadata", file=sys.stderr)
             sys.exit(1)
-    critical_packages = ['quart', 'python-telegram-bot', 'hypercorn', 'pandas']
+    critical_packages = ['quart', 'python-telegram-bot', 'hypercorn', 'pandas', 'openpyxl']
     missing = []
     for pkg in critical_packages:
         try:
@@ -127,15 +127,12 @@ def levenshtein_distance(s1: str, s2: str) -> int:
     return previous_row[-1]
 
 # ------------------------------------------------------------
-#  КОНФИГУРАЦИЯ ЛОГИРОВАНИЯ
+#  КОНФИГУРАЦИЯ ЛОГИРОВАНИЯ (только stdout)
 # ------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler('bot.log', encoding='utf-8')
-    ]
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
 
@@ -423,12 +420,10 @@ async def periodic_subscriber_save():
 def is_authorized(request, WEBHOOK_SECRET: str) -> bool:
     """Проверяет авторизацию по заголовку X-Secret-Key, параметру key или Bearer токену."""
     secret = WEBHOOK_SECRET
-    # Старые методы
     if request.headers.get('X-Secret-Key') == secret:
         return True
     if request.args.get('key') == secret:
         return True
-    # Bearer токен
     auth_header = request.headers.get('Authorization', '')
     if auth_header.startswith('Bearer '):
         token = auth_header[7:]
@@ -578,7 +573,21 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bot_stats.log_message(user.id, user.username or "Unknown", 'subscribe', '')
     text = await get_message('welcome', first_name=user.first_name)
     if user.id in ADMIN_IDS:
-        text += "\n\n👑 Админ-команды:\n/stats [период] — статистика\n/feedbacks — отзывы (выгрузка)\n/export — Excel\n/статистика, /отзывы, /экспорт\n/subscribe /unsubscribe — подписка\n/broadcast — рассылка"
+        text += "\n\n👑 Админ-команды:\n/stats [период] — статистика\n/feedbacks — отзывы (выгрузка)\n/export — Excel\n/статистика, /отзывы, /экспорт\n/subscribe /unsubscribe — подписка\n/broadcast — рассылка\n/save — принудительное сохранение данных"
+
+    photo_path = os.path.join(os.path.dirname(__file__), 'mechel_start.png')
+    if os.path.exists(photo_path):
+        try:
+            with open(photo_path, 'rb') as photo:
+                await update.message.reply_photo(
+                    photo=photo,
+                    caption=text,
+                    parse_mode='HTML'
+                )
+                return
+        except Exception as e:
+            logger.error(f"Ошибка отправки приветственного фото: {e}")
+
     await _reply_or_edit(update, text, parse_mode='HTML')
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -801,6 +810,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Экспорт: /export\n"
         "• Отзывы: /feedbacks\n"
         "• Мемы: /memsub, /memunsub\n"
+        "• Сохранить данные: /save или /сохранить\n"
         f"• Веб-интерфейс: {BASE_URL}"
     )
     keyboard = [[InlineKeyboardButton("👑 Открыть админ-меню", callback_data="menu_admin")]]
@@ -814,7 +824,9 @@ async def export_to_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     bot_stats.log_message(user.id, user.username or "Unknown", 'command', '/export')
     try:
-        output = await generate_excel_report(bot_stats, await get_subscribers(), search_engine)
+        subscribers = await get_subscribers()
+        # Запускаем тяжёлую синхронную функцию в отдельном потоке
+        output = await asyncio.to_thread(generate_excel_report, bot_stats, subscribers, search_engine)
         filename = f"mechel_bot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         await update.message.reply_document(
             document=output.getvalue(),
@@ -825,6 +837,28 @@ async def export_to_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"❌ Ошибка экспорта: {e}", exc_info=True)
         await _reply_or_edit(update, f"❌ Ошибка: {str(e)}", parse_mode='HTML')
+
+# ------------------------------------------------------------
+#  КОМАНДА /save (принудительное сохранение данных)
+# ------------------------------------------------------------
+async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.id not in ADMIN_IDS:
+        await _reply_or_edit(update, "⛔ Нет прав.", parse_mode='HTML')
+        return
+    try:
+        # Сохраняем подписчиков
+        await save_subscribers(await get_subscribers())
+        # Сохраняем сообщения
+        await save_messages(await load_messages())
+        # Сохраняем faq.json (перезаписываем текущими данными)
+        faq_data = await load_faq_json()
+        await save_faq_json(faq_data)
+        await _reply_or_edit(update, "✅ Все данные успешно сохранены.", parse_mode='HTML')
+        logger.info(f"💾 Данные сохранены пользователем {user.id}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка при сохранении: {e}")
+        await _reply_or_edit(update, f"❌ Ошибка при сохранении: {str(e)}", parse_mode='HTML')
 
 # ------------------------------------------------------------
 #  ОБРАБОТЧИК ТЕКСТОВЫХ СООБЩЕНИЙ
@@ -980,7 +1014,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await categories_command(update, context)
     elif data == "menu_admin" and update.effective_user.id in ADMIN_IDS:
         await admin_panel(update, context)
-    # Добавьте другие обработчики меню при необходимости
 
 # ------------------------------------------------------------
 #  ОБРАБОТЧИК ОШИБОК
@@ -1015,7 +1048,7 @@ async def setup_bot():
             return
 
         _bot_initializing = True
-        logger.info("🚀 Инициализация бота версии 12.63...")
+        logger.info("🚀 Инициализация бота версии 12.67...")
 
         try:
             use_builtin = False
@@ -1075,6 +1108,7 @@ async def setup_bot():
             application.add_handler(CommandHandler("unsubscribe", unsubscribe_command))
             application.add_handler(CommandHandler("broadcast", broadcast_command))
             application.add_handler(CommandHandler("whatcanido", what_can_i_do))
+            application.add_handler(CommandHandler("save", save_command))
 
             if MEME_MODULE_AVAILABLE:
                 application.add_handler(CommandHandler("mem", meme_command))
@@ -1104,6 +1138,8 @@ async def setup_bot():
                     await unsubscribe_command(update, context)
                 elif text.startswith('/рассылка'):
                     await broadcast_command(update, context)
+                elif text.startswith('/сохранить'):
+                    await save_command(update, context)
                 elif text.startswith('/мем'):
                     if MEME_MODULE_AVAILABLE:
                         await meme_command(update, context)
@@ -1119,7 +1155,7 @@ async def setup_bot():
                     await admin_panel(update, context)
 
             application.add_handler(MessageHandler(
-                filters.Regex(r'^/(старт|помощь|категории|предложения|отзывы|статистика|экспорт|подписаться|отписаться|рассылка|мем|мемподписка|мемотписка|что_могу|админ)'),
+                filters.Regex(r'^/(старт|помощь|категории|предложения|отзывы|статистика|экспорт|подписаться|отписаться|рассылка|сохранить|мем|мемподписка|мемотписка|что_могу|админ)'),
                 russian_command_handler
             ))
 
@@ -1199,6 +1235,22 @@ async def cleanup():
     logger.info("💤 Сервер останавливается, бот засыпает")
 
 # ------------------------------------------------------------
+#  ФУНКЦИЯ ЗАВЕРШЕНИЯ РАБОТЫ (ВЫЗЫВАЕТСЯ ПО СИГНАЛУ)
+# ------------------------------------------------------------
+async def shutdown():
+    logger.info("🛑 Завершение работы...")
+    global _bot_initialized
+    _bot_initialized = False
+    if MEME_MODULE_AVAILABLE:
+        await close_meme_handler()
+    if application:
+        await application.stop()
+        await application.shutdown()
+    await save_subscribers(await get_subscribers())
+    await save_messages(await load_messages())
+    logger.info("✅ Завершено.")
+
+# ------------------------------------------------------------
 #  ЭНДПОИНТ /WAKE
 # ------------------------------------------------------------
 @app.route('/wake', methods=['GET', 'POST'])
@@ -1208,6 +1260,18 @@ async def wake():
         asyncio.create_task(setup_bot())
         return jsonify({'status': 'waking_up'}), 202
     return jsonify({'status': 'ok', 'awake': True}), 200
+
+# ------------------------------------------------------------
+#  ЭНДПОИНТ /SAVE (принудительное сохранение)
+# ------------------------------------------------------------
+@app.route('/save', methods=['POST'])
+async def force_save():
+    if not is_authorized(request, WEBHOOK_SECRET):
+        return jsonify({'error': 'Forbidden'}), 403
+    await save_subscribers(await get_subscribers())
+    await save_messages(await load_messages())
+    logger.info("💾 Принудительное сохранение выполнено")
+    return jsonify({'status': 'saved'}), 200
 
 # ------------------------------------------------------------
 #  ОБРАБОТЧИК ВЕБХУКА

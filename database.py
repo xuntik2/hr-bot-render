@@ -1,7 +1,7 @@
 # database.py
 """
 Модуль для работы с базой данных Supabase (PostgreSQL)
-Версия 2.7 – добавлены функции очистки старых данных
+Версия 2.9 – добавлен подсчёт строк и улучшен возврат результата очистки
 """
 import os
 import asyncio
@@ -41,11 +41,10 @@ async def get_pool() -> asyncpg.Pool:
     if _pool is None:
         async with _pool_lock:
             if _pool is None:
-                # Дополнительная задержка перед первой попыткой (важно для Render Free)
                 logger.info("🔄 Ожидание полной инициализации сети Render (3 сек)...")
                 await asyncio.sleep(3.0)
 
-                max_retries = 12  # Увеличено для бесплатного тарифа
+                max_retries = 12
                 for attempt in range(max_retries):
                     try:
                         logger.info(f"🔄 Попытка {attempt+1}/{max_retries} создания пула соединений...")
@@ -72,8 +71,7 @@ async def get_pool() -> asyncpg.Pool:
                                           f"2) Доступность Supabase, 3) Лимиты бесплатного тарифа.")
                             raise
 
-                        # Экспоненциальная задержка с ограничением 15 секунд
-                        wait = min(15.0, 0.5 * (2 ** attempt))  # 0.5, 1.0, 2.0, 4.0, 8.0, 15.0...
+                        wait = min(15.0, 0.5 * (2 ** attempt))
                         logger.warning(f"⏳ Повтор через {wait:.1f}с...")
                         await asyncio.sleep(wait)
     return _pool
@@ -549,27 +547,63 @@ async def get_daily_stats_for_last_days(days: int = 7) -> Dict[str, Dict]:
         return result
 
 # ------------------------------------------------------------
-#  ФУНКЦИИ ОЧИСТКИ СТАРЫХ ДАННЫХ
+#  ФУНКЦИИ ОЧИСТКИ СТАРЫХ ДАННЫХ (возвращают количество удалённых строк)
 # ------------------------------------------------------------
-async def cleanup_old_errors(days: int = 30):
-    """Удаляет записи из error_log старше указанного количества дней."""
+async def cleanup_old_errors(days: int = 30) -> int:
+    """Удаляет записи из error_log старше указанного количества дней и возвращает количество удалённых строк."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         result = await _execute_with_retry(conn.execute('''
             DELETE FROM error_log
             WHERE timestamp < NOW() - INTERVAL '1 day' * $1
         ''', days))
-        logger.info(f"✅ Очищено {result} старых записей из error_log")
+        # asyncpg возвращает строку типа "DELETE X", извлекаем число
+        cleaned = 0
+        if isinstance(result, str):
+            try:
+                cleaned = int(result.split()[1])
+            except:
+                pass
+        logger.info(f"✅ Очищено {cleaned} старых записей из error_log")
+        return cleaned
 
-async def cleanup_old_feedback(days: int = 90):
-    """Удаляет записи из feedback старше указанного количества дней."""
+async def cleanup_old_feedback(days: int = 90) -> int:
+    """Удаляет записи из feedback старше указанного количества дней и возвращает количество удалённых строк."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         result = await _execute_with_retry(conn.execute('''
             DELETE FROM feedback
             WHERE created_at < NOW() - INTERVAL '1 day' * $1
         ''', days))
-        logger.info(f"✅ Очищено {result} старых записей из feedback")
+        cleaned = 0
+        if isinstance(result, str):
+            try:
+                cleaned = int(result.split()[1])
+            except:
+                pass
+        logger.info(f"✅ Очищено {cleaned} старых записей из feedback")
+        return cleaned
+
+# ------------------------------------------------------------
+#  ПОДСЧЁТ ОБЩЕГО КОЛИЧЕСТВА СТРОК (ДЛЯ МОНИТОРИНГА ЛИМИТА)
+# ------------------------------------------------------------
+async def get_total_rows_count() -> int:
+    """Возвращает общее количество строк в основных таблицах (для мониторинга лимита Supabase)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        tables = [
+            'subscribers', 'messages', 'faq', 'meme_history',
+            'meme_subscribers', 'feedback', 'faq_ratings',
+            'daily_stats', 'response_times', 'error_log'
+        ]
+        total = 0
+        for table in tables:
+            try:
+                count = await _execute_with_retry(conn.fetchval(f'SELECT COUNT(*) FROM {table}'))
+                total += count if count else 0
+            except Exception as e:
+                logger.warning(f"Не удалось подсчитать строки в {table}: {e}")
+        return total
 
 # ------------------------------------------------------------
 #  ЗАВЕРШЕНИЕ РАБОТЫ

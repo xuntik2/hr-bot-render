@@ -1,7 +1,7 @@
 # stats.py
 """
 Модуль статистики для HR-бота Мечел
-Версия 2.5 – финальная с улучшенными генераторами отчётов и очисткой кэша
+Версия 2.5 – добавлено свойство daily_stats для совместимости с web_panel
 """
 import asyncio
 import io
@@ -21,7 +21,6 @@ from database import (
     save_rating as db_save_rating,
     get_recent_response_times,
     get_daily_stats_for_last_days,
-    get_all_feedback,  # для загрузки отзывов
 )
 
 logger = logging.getLogger(__name__)
@@ -59,6 +58,11 @@ class BotStatistics:
         # Задача для периодического сброса
         self._flush_task: Optional[asyncio.Task] = None
         asyncio.create_task(self._start_flush_loop())
+
+    @property
+    def daily_stats(self):
+        """Свойство для доступа к _daily_buffer (используется в web_panel)"""
+        return self._daily_buffer
 
     async def _load_recent_stats(self):
         """Загружает статистику за последние 7 дней из БД."""

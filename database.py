@@ -1,13 +1,13 @@
 # database.py
 """
 Модуль для работы с базой данных Supabase (PostgreSQL)
-Версия 2.9 – добавлен подсчёт строк и улучшен возврат результата очистки
+Версия 2.20 – добавлено преобразование строки в дату в log_daily_stat
 """
 import os
 import asyncio
 import asyncpg
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from typing import List, Dict, Optional, Any, Tuple, Set
 
 logger = logging.getLogger(__name__)
@@ -41,6 +41,7 @@ async def get_pool() -> asyncpg.Pool:
     if _pool is None:
         async with _pool_lock:
             if _pool is None:
+                # Дополнительная задержка перед первой попыткой (важно для Render Free)
                 logger.info("🔄 Ожидание полной инициализации сети Render (3 сек)...")
                 await asyncio.sleep(3.0)
 
@@ -463,8 +464,23 @@ async def get_rating_stats() -> Dict[str, Any]:
 #  СТАТИСТИКА (daily_stats, response_times, error_log)
 # ------------------------------------------------------------
 async def log_daily_stat(date: str, field: str, increment: int = 1):
+    """
+    Увеличивает счётчик в daily_stats.
+    Параметр date может быть строкой 'YYYY-MM-DD' или объектом date.
+    """
     if field not in VALID_DAILY_FIELDS:
         raise ValueError(f"Invalid field for daily_stats: {field}")
+
+    # Преобразуем строку в объект date, если необходимо
+    try:
+        if isinstance(date, str):
+            date_obj = datetime.strptime(date, '%Y-%m-%d').date()
+        else:
+            date_obj = date  # уже date object
+    except ValueError:
+        logger.warning(f"⚠️ Неверный формат даты: {date}, используется текущая дата")
+        date_obj = datetime.now().date()
+
     pool = await get_pool()
     async with pool.acquire() as conn:
         query = f'''
@@ -473,7 +489,7 @@ async def log_daily_stat(date: str, field: str, increment: int = 1):
             ON CONFLICT (date)
             DO UPDATE SET {field} = daily_stats.{field} + EXCLUDED.{field}
         '''
-        await _execute_with_retry(conn.execute(query, date, increment))
+        await _execute_with_retry(conn.execute(query, date_obj, increment))
 
 async def add_response_time(response_time: float):
     pool = await get_pool()
@@ -483,7 +499,7 @@ async def add_response_time(response_time: float):
             DELETE FROM response_times
             WHERE id <= (SELECT id FROM response_times ORDER BY id DESC LIMIT 1 OFFSET 100)
         '''))
-        today = datetime.now().strftime('%Y-%m-%d')
+        today = datetime.now().date()
         row = await _execute_with_retry(conn.fetchrow('''
             SELECT total_response_time, response_count FROM daily_stats WHERE date = $1
         ''', today))
@@ -547,40 +563,36 @@ async def get_daily_stats_for_last_days(days: int = 7) -> Dict[str, Dict]:
         return result
 
 # ------------------------------------------------------------
-#  ФУНКЦИИ ОЧИСТКИ СТАРЫХ ДАННЫХ (возвращают количество удалённых строк)
+#  ФУНКЦИИ ОЧИСТКИ СТАРЫХ ДАННЫХ
 # ------------------------------------------------------------
 async def cleanup_old_errors(days: int = 30) -> int:
-    """Удаляет записи из error_log старше указанного количества дней и возвращает количество удалённых строк."""
+    """Удаляет записи из error_log старше указанного количества дней. Возвращает количество удалённых строк."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         result = await _execute_with_retry(conn.execute('''
             DELETE FROM error_log
             WHERE timestamp < NOW() - INTERVAL '1 day' * $1
         ''', days))
-        # asyncpg возвращает строку типа "DELETE X", извлекаем число
-        cleaned = 0
-        if isinstance(result, str):
-            try:
-                cleaned = int(result.split()[1])
-            except:
-                pass
+        # result имеет вид 'DELETE 123'
+        try:
+            cleaned = int(result.split()[1]) if 'DELETE' in result else 0
+        except:
+            cleaned = 0
         logger.info(f"✅ Очищено {cleaned} старых записей из error_log")
         return cleaned
 
 async def cleanup_old_feedback(days: int = 90) -> int:
-    """Удаляет записи из feedback старше указанного количества дней и возвращает количество удалённых строк."""
+    """Удаляет записи из feedback старше указанного количества дней. Возвращает количество удалённых строк."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         result = await _execute_with_retry(conn.execute('''
             DELETE FROM feedback
             WHERE created_at < NOW() - INTERVAL '1 day' * $1
         ''', days))
-        cleaned = 0
-        if isinstance(result, str):
-            try:
-                cleaned = int(result.split()[1])
-            except:
-                pass
+        try:
+            cleaned = int(result.split()[1]) if 'DELETE' in result else 0
+        except:
+            cleaned = 0
         logger.info(f"✅ Очищено {cleaned} старых записей из feedback")
         return cleaned
 
@@ -600,7 +612,7 @@ async def get_total_rows_count() -> int:
         for table in tables:
             try:
                 count = await _execute_with_retry(conn.fetchval(f'SELECT COUNT(*) FROM {table}'))
-                total += count if count else 0
+                total += count
             except Exception as e:
                 logger.warning(f"Не удалось подсчитать строки в {table}: {e}")
         return total

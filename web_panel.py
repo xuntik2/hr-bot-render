@@ -1,7 +1,7 @@
 # web_panel.py
 """
 Веб-панель для HR-бота Мечел
-Версия 2.17 – рейт-лимитинг очистки, улучшенный refreshStats, эндпоинт /stats/rows
+Версия 2.18 – добавлено логирование IP при очистке, индикация загрузки в refreshStats
 """
 import json
 import asyncio
@@ -804,6 +804,7 @@ class WebServer:
             padding: 1.5rem;
             box-shadow: 0 8px 24px rgba(0,0,0,0.3);
             border: 1px solid #2A4C5E;
+            transition: opacity 0.3s;
         }}
         .stat-value {{
             font-size: 2.8rem;
@@ -870,7 +871,7 @@ class WebServer:
 <body>
     <div class="container">
         <h1>🤖 HR Бот «Мечел»</h1>
-        <div class="subtitle">Версия 2.17 · Расширенная веб-панель с мониторингом лимита</div>
+        <div class="subtitle">Версия 2.18 · Расширенная веб-панель с мониторингом лимита</div>
 
         <div class="grid">
             <div class="card">
@@ -936,6 +937,8 @@ class WebServer:
 
     <script>
     function refreshStats() {{
+        const card = document.getElementById('limit-card');
+        card.style.opacity = '0.5';
         fetch('/stats/rows')
             .then(response => response.json())
             .then(data => {{
@@ -944,7 +947,10 @@ class WebServer:
                 statusSpan.textContent = data.status_text;
                 statusSpan.className = 'metric-badge ' + data.status_class;
             }})
-            .catch(error => console.error('Ошибка обновления:', error));
+            .catch(error => console.error('Ошибка обновления:', error))
+            .finally(() => {{
+                card.style.opacity = '1';
+            }});
     }}
     </script>
 </body>
@@ -988,7 +994,7 @@ class WebServer:
             })
         except Exception as e:
             logger.error(f"Ошибка в /stats/rows: {e}")
-            return jsonify({'error': str(e)}), 500
+            return jsonify({'error': 'Не удалось получить статистику'}), 500
 
     # --- Обработчики экспорта и статистики ---
     async def _export_excel(self):
@@ -1131,7 +1137,10 @@ class WebServer:
             return jsonify({'error': 'Очистка доступна не чаще 1 раза в 5 минут'}), 429
         self._last_cleanup_time = time.time()
 
-        logger.info("🧹 Запуск очистки старых данных через веб-эндпоинт...")
+        # Логируем действие с IP
+        client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
+        logger.info(f"🧹 Запуск очистки через веб (админ {client_ip})")
+
         try:
             errors_cleaned = await cleanup_old_errors(days=30)
             feedback_cleaned = await cleanup_old_feedback(days=90)
@@ -1175,7 +1184,7 @@ class WebServer:
         app.add_url_rule('/broadcast/api', view_func=self._broadcast_api, methods=['POST'])
 
         app.add_url_rule('/', view_func=self._index)
-        app.add_url_rule('/stats/rows', view_func=self._stats_rows, methods=['GET'])  # новый эндпоинт
+        app.add_url_rule('/stats/rows', view_func=self._stats_rows, methods=['GET'])
         app.add_url_rule('/search/stats', view_func=self._search_stats, methods=['GET', 'POST'])
         app.add_url_rule('/feedback/export', view_func=self._feedback_export, methods=['GET', 'POST'])
         app.add_url_rule('/rate/stats', view_func=self._rate_stats, methods=['GET', 'POST'])

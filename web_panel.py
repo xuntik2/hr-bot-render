@@ -1,16 +1,24 @@
 # web_panel.py
 """
 Веб-панель для HR-бота Мечел
-Версия 2.12 — адаптирована для работы с Supabase
+Версия 2.14 – добавлен мониторинг лимита строк Supabase и улучшенная очистка
 """
-from quart import Quart, request, jsonify, render_template_string, make_response
+import json
 import asyncio
 import logging
 import time
 from datetime import datetime
 from typing import List, Dict, Any, Callable, Optional
 
+from quart import Quart, request, jsonify, render_template_string, make_response
+
 from stats import generate_feedback_report, generate_excel_report
+from database import (
+    get_faq_by_id, add_faq, update_faq, delete_faq,
+    cleanup_old_errors, cleanup_old_feedback,
+    load_all_faq,
+    get_total_rows_count  # ← новая функция
+)
 
 logger = logging.getLogger(__name__)
 
@@ -393,9 +401,9 @@ class WebServer:
         application,
         search_engine,
         bot_stats,
-        load_faq_json: Callable,      # теперь указывает на load_all_faq из database
-        save_faq_json: Callable,       # больше не используется (можно передать None)
-        get_next_faq_id: Callable,     # больше не используется (можно передать None)
+        load_faq_json: Callable,
+        save_faq_json: Callable,
+        get_next_faq_id: Callable,
         load_messages: Callable,
         save_messages: Callable,
         get_subscribers: Callable,
@@ -411,8 +419,8 @@ class WebServer:
         self.search_engine = search_engine
         self.bot_stats = bot_stats
         self.load_faq_json = load_faq_json
-        self.save_faq_json = save_faq_json          # заглушка
-        self.get_next_faq_id = get_next_faq_id      # заглушка
+        self.save_faq_json = save_faq_json
+        self.get_next_faq_id = get_next_faq_id
         self.load_messages = load_messages
         self.save_messages = save_messages
         self.get_subscribers = get_subscribers
@@ -430,23 +438,19 @@ class WebServer:
         else:
             logger.info(f"Админ-доступ: {request.method} {request.path} от {client_ip}")
 
-    # ---------- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ ПРОВЕРКИ ТОКЕНА ----------
     async def _check_token(self, request) -> bool:
-        """Проверяет токен в заголовке, параметрах URL или в POST-форме."""
-        # Заголовок
         if request.headers.get('X-Secret-Key') == self.WEBHOOK_SECRET:
             return True
-        # GET-параметр key
         if request.args.get('key') == self.WEBHOOK_SECRET:
             return True
-        # POST-форма (token)
         if request.method == 'POST':
             form = await request.form
             if form.get('token') == self.WEBHOOK_SECRET:
                 return True
         return False
 
-    # ---------- Обработчики ----------
+    # ======================== Обработчики ========================
+
     async def _faq_manager(self):
         return await render_template_string(FAQ_MANAGER_HTML)
 
@@ -475,14 +479,13 @@ class WebServer:
             messages = await self.load_messages()
             if key not in messages:
                 return jsonify({'error': 'Message key not found'}), 404
-            # Обновляем через БД
             await self.save_messages(key, new_text, messages[key].get('title', ''))
             return jsonify({'success': True, 'key': key, 'text': new_text})
         except Exception as e:
             logger.error(f"Ошибка обновления сообщения {key}: {e}")
             return jsonify({'error': str(e)}), 500
 
-    # --- API для FAQ с пагинацией (используем функции из БД) ---
+    # --- API FAQ ---
     async def _faq_api_list(self):
         if not await self._check_token(request):
             return jsonify({'error': 'Forbidden'}), 403
@@ -496,7 +499,7 @@ class WebServer:
             page = 1
         if per_page < 1 or per_page > 200:
             per_page = 50
-        data = await self.load_faq_json()   # load_all_faq из database
+        data = await self.load_faq_json()
         total = len(data)
         start = (page - 1) * per_page
         end = start + per_page
@@ -513,7 +516,6 @@ class WebServer:
         if not await self._check_token(request):
             return jsonify({'error': 'Forbidden'}), 403
         self.log_admin_action(request, f"Просмотр записи FAQ ID {faq_id}")
-        from database import get_faq_by_id
         item = await get_faq_by_id(faq_id)
         if item:
             return jsonify(item)
@@ -527,7 +529,6 @@ class WebServer:
             item = await request.get_json()
             if not item.get('question') or not item.get('answer') or not item.get('category'):
                 return jsonify({'error': 'Missing required fields'}), 400
-            from database import add_faq
             new_id = await add_faq(
                 question=item['question'].strip(),
                 answer=item['answer'].strip(),
@@ -542,6 +543,10 @@ class WebServer:
                 'category': item['category'].strip(),
                 'keywords': item.get('keywords', '').strip()
             }
+
+            # После успешного добавления обновляем локальную резервную копию
+            await self._update_faq_backup()
+
             return jsonify(new_item), 201
         except Exception as e:
             logger.error(f"Ошибка добавления FAQ: {e}")
@@ -555,7 +560,6 @@ class WebServer:
             item = await request.get_json()
             if not item.get('question') or not item.get('answer') or not item.get('category'):
                 return jsonify({'error': 'Missing required fields'}), 400
-            from database import update_faq
             await update_faq(
                 faq_id=faq_id,
                 question=item['question'].strip(),
@@ -564,6 +568,10 @@ class WebServer:
                 keywords=item.get('keywords', '').strip(),
                 priority=0
             )
+
+            # После успешного обновления обновляем локальную резервную копию
+            await self._update_faq_backup()
+
             return jsonify({'success': True}), 200
         except Exception as e:
             logger.error(f"Ошибка обновления FAQ: {e}")
@@ -573,10 +581,24 @@ class WebServer:
         if not await self._check_token(request):
             return jsonify({'error': 'Forbidden'}), 403
         self.log_admin_action(request, f"Удаление записи FAQ ID {faq_id}")
-        from database import delete_faq
         await delete_faq(faq_id)
+
+        # После успешного удаления обновляем локальную резервную копию
+        await self._update_faq_backup()
+
         return jsonify({'success': True}), 200
 
+    async def _update_faq_backup(self):
+        """Обновляет локальный файл faq_backup.json актуальными данными из БД."""
+        try:
+            faq_data = await load_all_faq()
+            with open('faq_backup.json', 'w', encoding='utf-8') as f:
+                json.dump(faq_data, f, ensure_ascii=False, indent=2)
+            logger.info("💾 Резервная копия FAQ обновлена после изменения")
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось обновить резервную копию FAQ: {e}")
+
+    # --- API подписчиков и рассылки ---
     async def _subscribers_api_list(self):
         if not await self._check_token(request):
             return jsonify({'error': 'Forbidden'}), 403
@@ -584,7 +606,6 @@ class WebServer:
         subs = await self.get_subscribers()
         return jsonify({'subscribers': subs, 'count': len(subs)})
 
-    # --- Рассылка с проверкой длины ---
     async def _broadcast_api(self):
         if not await self._check_token(request):
             return jsonify({'error': 'Forbidden'}), 403
@@ -622,7 +643,7 @@ class WebServer:
                 failed += 1
         logger.info(f"✅ Фоновая рассылка завершена: отправлено {sent}, ошибок {failed}")
 
-    # --- Главная страница с формами вместо ссылок ---
+    # --- Главная страница ---
     async def _index(self):
         self.log_admin_action(request, "Просмотр главной панели")
         start_time = time.time()
@@ -659,7 +680,27 @@ class WebServer:
         faq_count = len(self.search_engine.faq_data) if self.search_engine and hasattr(self.search_engine, 'faq_data') else 0
         daily_rows = self.bot_stats.get_weekly_stats_html() if self.bot_stats else ""
 
-        # Формируем блок с кнопками-формами
+        # ===== НОВЫЙ БЛОК: мониторинг лимита Supabase =====
+        try:
+            total_rows = await get_total_rows_count()
+            limit_usage = f"{total_rows}/20000"
+            if total_rows > 18000:
+                limit_class = "metric-bad"
+                limit_status = "КРИТИЧНО"
+            elif total_rows > 15000:
+                limit_class = "metric-warning"
+                limit_status = "Внимание"
+            else:
+                limit_class = "metric-good"
+                limit_status = "Норма"
+        except Exception as e:
+            logger.warning(f"Не удалось получить количество строк: {e}")
+            limit_usage = "N/A"
+            limit_class = ""
+            limit_status = "N/A"
+            total_rows = 0
+        # ==================================================
+
         buttons_html = f"""
         <div style="display: flex; gap: 1rem; margin-bottom: 2rem; flex-wrap: wrap;">
             <form method="POST" action="/export/excel" style="display: inline;">
@@ -679,6 +720,10 @@ class WebServer:
                 <input type="hidden" name="token" value="{self.WEBHOOK_SECRET}">
                 <button type="submit" class="btn" style="background: #FF9800;">⭐ Оценки</button>
             </form>
+            <form method="POST" action="/cleanup" style="display: inline;">
+                <input type="hidden" name="token" value="{self.WEBHOOK_SECRET}">
+                <button type="submit" class="btn" style="background: #6f42c1;">🧹 Очистить старые данные</button>
+            </form>
             <a href="/faq" class="btn" style="background: #17a2b8;">📚 Редактор FAQ</a>
             <a href="/messages" class="btn" style="background: #28a745;">💬 Редактор сообщений</a>
             <a href="/subscribers/api?key={self.WEBHOOK_SECRET}" class="btn" style="background: #6f42c1;">📬 Подписчики (JSON)</a>
@@ -690,6 +735,7 @@ class WebServer:
         </div>
         """
 
+        # Главная страница с четырьмя карточками (добавлена карточка лимита)
         html = f"""<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -807,7 +853,7 @@ class WebServer:
 <body>
     <div class="container">
         <h1>🤖 HR Бот «Мечел»</h1>
-        <div class="subtitle">Версия 2.12 · Расширенная веб-панель (безопасные формы)</div>
+        <div class="subtitle">Версия 2.14 · Мониторинг лимита Supabase</div>
 
         <div class="grid">
             <div class="card">
@@ -835,6 +881,12 @@ class WebServer:
                 </div>
                 <p>Администраторы: {admin_count}</p>
                 <p>Память: {memory_usage:.1f} МБ</p>
+            </div>
+            <div class="card">
+                <h3>📊 Лимит Supabase</h3>
+                <div class="stat-value">{limit_usage}</div>
+                <p>Строк использовано <span class="metric-badge {limit_class}">{limit_status}</span></p>
+                <p>Рекомендуется очистка при >18000 строк</p>
             </div>
         </div>
 
@@ -867,7 +919,7 @@ class WebServer:
 </html>"""
         return html
 
-    # --- Обработчики, которые теперь принимают POST (с проверкой токена из формы) ---
+    # --- Обработчики экспорта и статистики ---
     async def _export_excel(self):
         if not await self._check_token(request):
             return jsonify({'error': 'Forbidden'}), 403
@@ -997,6 +1049,27 @@ class WebServer:
             'faq_count': len(self.search_engine.faq_data) if self.search_engine and hasattr(self.search_engine, 'faq_data') else 0
         })
 
+    # ===== ЭНДПОИНТ ДЛЯ ОЧИСТКИ =====
+    async def _cleanup_endpoint(self):
+        """Эндпоинт для принудительной очистки старых данных (для экономии ресурсов Supabase)"""
+        if not await self._check_token(request):
+            return jsonify({'error': 'Forbidden'}), 403
+
+        logger.info("🧹 Запуск очистки старых данных через веб-эндпоинт...")
+        try:
+            errors_cleaned = await cleanup_old_errors(days=30)
+            feedback_cleaned = await cleanup_old_feedback(days=90)
+            logger.info(f"✅ Очистка завершена: удалено {errors_cleaned} записей ошибок и {feedback_cleaned} отзывов")
+            return jsonify({
+                'status': 'cleaned',
+                'errors_cleaned': errors_cleaned,
+                'feedback_cleaned': feedback_cleaned,
+                'message': 'Очистка старых данных выполнена успешно'
+            }), 200
+        except Exception as e:
+            logger.error(f"❌ Ошибка при очистке: {e}")
+            return jsonify({'error': str(e)}), 500
+
     def register_routes(self):
         app = self.app
         app.add_url_rule('/faq', view_func=self._faq_manager)
@@ -1023,6 +1096,7 @@ class WebServer:
         app.add_url_rule('/export/excel', view_func=self._export_excel, methods=['GET', 'POST'])
         app.add_url_rule('/setwebhook', view_func=self._set_webhook, methods=['GET', 'POST'])
         app.add_url_rule('/health', view_func=self._health, methods=['GET'])
+        app.add_url_rule('/cleanup', view_func=self._cleanup_endpoint, methods=['POST'])
 
         logger.info("✅ Все веб-маршруты зарегистрированы через WebServer")
 

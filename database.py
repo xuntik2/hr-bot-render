@@ -1,7 +1,7 @@
 # database.py
 """
 Модуль для работы с базой данных Supabase (PostgreSQL)
-Версия 2.20 – добавлено преобразование строки в дату в log_daily_stat
+Версия 2.21 – добавлен statement_cache_size=0 для совместимости с pgbouncer
 """
 import os
 import asyncio
@@ -55,7 +55,8 @@ async def get_pool() -> asyncpg.Pool:
                             max_size=POOL_MAX_SIZE,
                             command_timeout=POOL_TIMEOUT,
                             max_queries=50000,
-                            max_inactive_connection_lifetime=300
+                            max_inactive_connection_lifetime=300,
+                            statement_cache_size=0  # ← отключаем кэш prepared statements для pgbouncer
                         )
                         logger.info(f"✅ Пул соединений создан (min={POOL_MIN_SIZE}, max={POOL_MAX_SIZE})")
                         break

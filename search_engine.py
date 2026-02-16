@@ -1,7 +1,7 @@
 # search_engine.py
 """
 ПОИСКОВЫЙ ДВИЖОК ДЛЯ HR-БОТА МЕЧЕЛ
-Версия 5.4 — добавлена возможность инициализации из списка данных (для интеграции с БД)
+Версия 5.5 – исправлена проблема хеширования для pgbouncer (индекс хранит ID, а не объекты)
 - Инвертированный индекс (O(1) доступ к кандидатам)
 - TF‑IDF ранжирование
 - Быстрый Левенштейн с порогом
@@ -88,6 +88,7 @@ class SearchEngine:
     """
     Оптимизированный поисковый движок с инвертированным индексом,
     TF‑IDF, пороговым Левенштейном и расширенными синонимами.
+    Инвертированный индекс хранит ID записей, а не сами объекты.
     """
 
     # --------------------------------------------------------
@@ -436,7 +437,7 @@ class SearchEngine:
         self.cache_ttl = {}
         self.faq_data: List[FAQEntry] = []
         self._category_index: Dict[str, List[FAQEntry]] = defaultdict(list)
-        self._inverted_index: Dict[str, Set[FAQEntry]] = defaultdict(set)
+        self._inverted_index: Dict[str, Set[int]] = defaultdict(set)  # слово -> множество ID
         self._doc_count: int = 0
         self._idf_cache: Dict[str, float] = {}
         self.categories_norm: List[Tuple[str, str]] = []   # (оригинал, нормализованная)
@@ -456,7 +457,7 @@ class SearchEngine:
             self._load_faq()
 
         self._build_indexes()
-        logger.info(f"✅ SearchEngine v5.4: загружено {len(self.faq_data)} записей, "
+        logger.info(f"✅ SearchEngine v5.5: загружено {len(self.faq_data)} записей, "
                     f"инвертированный индекс: {len(self._inverted_index)} уникальных слов, "
                     f"источник: {self.stats['loaded_from']}")
 
@@ -627,19 +628,19 @@ class SearchEngine:
             self._category_index[cat_lower].append(faq)
             categories_raw.add(faq.category)
 
-            # Инвертированный индекс
+            # Инвертированный индекс – храним ID, а не объекты
             words = set()
             if faq.norm_question:
                 words.update(faq.norm_question.split())
             if faq.norm_keywords:
                 words.update(faq.norm_keywords.split())
             for word in words:
-                self._inverted_index[word].add(faq)
+                self._inverted_index[word].add(faq.id)
 
         # Предварительный расчёт IDF
         self._idf_cache.clear()
-        for word, doc_set in self._inverted_index.items():
-            df = len(doc_set)
+        for word, doc_ids in self._inverted_index.items():
+            df = len(doc_ids)
             self._idf_cache[word] = math.log((self._doc_count + 1) / (df + 1)) + 1  # +1 для сглаживания
 
         # Нормализованные названия категорий для поиска по категории
@@ -710,7 +711,9 @@ class SearchEngine:
     #  ПОЛУЧЕНИЕ КАНДИДАТОВ ЧЕРЕЗ ИНВЕРТИРОВАННЫЙ ИНДЕКС
     # ------------------------------------------------------------
     def _get_candidates(self, norm_query: str, max_candidates: int = 20) -> List[FAQEntry]:
-        """Возвращает список кандидатов, отсортированных по TF (вес вопроса > вес ключей)."""
+        """
+        Возвращает список кандидатов (объекты FAQEntry), отсортированных по TF.
+        """
         if not norm_query:
             return []
 
@@ -718,18 +721,22 @@ class SearchEngine:
         if not words:
             return []
 
-        # Собираем все документы, содержащие хотя бы одно слово из запроса
-        candidate_set = set()
+        # Собираем все ID документов, содержащих хотя бы одно слово из запроса
+        candidate_ids = set()
         for w in words:
-            candidate_set.update(self._inverted_index.get(w, []))
+            candidate_ids.update(self._inverted_index.get(w, []))
 
-        if not candidate_set:
+        if not candidate_ids:
             # Если индекс пуст, берём первые N записей как fallback
             return self.faq_data[:max_candidates]
 
+        # Преобразуем ID в объекты (для дальнейшей оценки)
+        id_to_faq = {faq.id: faq for faq in self.faq_data}
+        candidates = [id_to_faq[faq_id] for faq_id in candidate_ids if faq_id in id_to_faq]
+
         # Оцениваем TF с весами
         scored = []
-        for faq in candidate_set:
+        for faq in candidates:
             score = 0.0
             # Вес для вопроса выше
             if faq.norm_question:
@@ -825,6 +832,10 @@ class SearchEngine:
     #  ОСНОВНОЙ ПОИСК
     # ------------------------------------------------------------
     def search(self, query: str, category: Optional[str] = None, top_k: int = 5) -> List[Tuple[str, str, float]]:
+        """
+        Поиск по запросу.
+        Возвращает список кортежей (вопрос, ответ, релевантность).
+        """
         if not query or len(query.strip()) < 2:
             return []
         if not self.faq_data:

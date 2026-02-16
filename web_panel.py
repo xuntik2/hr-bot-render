@@ -1,7 +1,7 @@
 # web_panel.py
 """
 Веб-панель для HR-бота Мечел
-Версия 2.14 – добавлен мониторинг лимита строк Supabase и улучшенная очистка
+Версия 2.17 – рейт-лимитинг очистки, улучшенный refreshStats, эндпоинт /stats/rows
 """
 import json
 import asyncio
@@ -17,7 +17,7 @@ from database import (
     get_faq_by_id, add_faq, update_faq, delete_faq,
     cleanup_old_errors, cleanup_old_feedback,
     load_all_faq,
-    get_total_rows_count  # ← новая функция
+    get_total_rows_count
 )
 
 logger = logging.getLogger(__name__)
@@ -431,6 +431,13 @@ class WebServer:
         self.is_authorized = is_authorized_func
         self.admin_ids = admin_ids
 
+        # Кэш для подсчёта строк (чтобы не дёргать БД слишком часто)
+        self._last_rows_check = 0
+        self._cached_rows_count = None
+
+        # Для рейт-лимитинга очистки
+        self._last_cleanup_time = 0
+
     def log_admin_action(self, request, action: Optional[str] = None):
         client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
         if action:
@@ -439,6 +446,7 @@ class WebServer:
             logger.info(f"Админ-доступ: {request.method} {request.path} от {client_ip}")
 
     async def _check_token(self, request) -> bool:
+        """Проверяет токен в заголовке, параметрах URL или в POST-форме."""
         if request.headers.get('X-Secret-Key') == self.WEBHOOK_SECRET:
             return True
         if request.args.get('key') == self.WEBHOOK_SECRET:
@@ -451,6 +459,7 @@ class WebServer:
 
     # ======================== Обработчики ========================
 
+    # --- Страницы ---
     async def _faq_manager(self):
         return await render_template_string(FAQ_MANAGER_HTML)
 
@@ -460,6 +469,7 @@ class WebServer:
     async def _broadcast_page(self):
         return await render_template_string(BROADCAST_PAGE_HTML)
 
+    # --- API сообщений ---
     async def _messages_api_list(self):
         if not await self._check_token(request):
             return jsonify({'error': 'Forbidden'}), 403
@@ -680,9 +690,20 @@ class WebServer:
         faq_count = len(self.search_engine.faq_data) if self.search_engine and hasattr(self.search_engine, 'faq_data') else 0
         daily_rows = self.bot_stats.get_weekly_stats_html() if self.bot_stats else ""
 
-        # ===== НОВЫЙ БЛОК: мониторинг лимита Supabase =====
+        # Получаем информацию о занятых строках в БД с кэшированием на 60 секунд и обработкой ошибок
         try:
-            total_rows = await get_total_rows_count()
+            current_time = time.time()
+            if current_time - self._last_rows_check < 60 and self._cached_rows_count is not None:
+                total_rows = self._cached_rows_count
+            else:
+                total_rows = await get_total_rows_count()
+                self._cached_rows_count = total_rows
+                self._last_rows_check = current_time
+        except Exception as e:
+            logger.error(f"Ошибка подсчёта строк: {e}")
+            total_rows = None  # Не падаем, показываем N/A
+
+        if total_rows is not None:
             limit_usage = f"{total_rows}/20000"
             if total_rows > 18000:
                 limit_class = "metric-bad"
@@ -693,13 +714,10 @@ class WebServer:
             else:
                 limit_class = "metric-good"
                 limit_status = "Норма"
-        except Exception as e:
-            logger.warning(f"Не удалось получить количество строк: {e}")
+        else:
             limit_usage = "N/A"
             limit_class = ""
-            limit_status = "N/A"
-            total_rows = 0
-        # ==================================================
+            limit_status = ""
 
         buttons_html = f"""
         <div style="display: flex; gap: 1rem; margin-bottom: 2rem; flex-wrap: wrap;">
@@ -735,7 +753,6 @@ class WebServer:
         </div>
         """
 
-        # Главная страница с четырьмя карточками (добавлена карточка лимита)
         html = f"""<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -853,12 +870,12 @@ class WebServer:
 <body>
     <div class="container">
         <h1>🤖 HR Бот «Мечел»</h1>
-        <div class="subtitle">Версия 2.14 · Мониторинг лимита Supabase</div>
+        <div class="subtitle">Версия 2.17 · Расширенная веб-панель с мониторингом лимита</div>
 
         <div class="grid">
             <div class="card">
                 <h3>⚙️ Производительность</h3>
-                <div class="stat-value">{avg:.2f}с</div>
+                <div class="stat-value" id="stat-avg">{avg:.2f}с</div>
                 <p>Ср. время ответа (100 запросов)
                     <span class="metric-badge {perf_color}">{perf_text}</span>
                 </p>
@@ -874,19 +891,20 @@ class WebServer:
                 <p>📬 Подписчиков: {len(subscribers)}</p>
                 <p>📚 Вопросов в базе: {faq_count}</p>
             </div>
+            <div class="card" id="limit-card">
+                <h3>📊 Лимит Supabase</h3>
+                <div class="stat-value" id="limit-usage">{limit_usage}</div>
+                <p>Строк использовано <span class="metric-badge {limit_class}" id="limit-status">{limit_status}</span></p>
+                <p>Рекомендуется очистка при >18000 строк</p>
+                <button onclick="refreshStats()" class="btn" style="background:#6f42c1; margin-top:10px;">🔄 Обновить</button>
+            </div>
             <div class="card">
                 <h3>🔌 Система</h3>
                 <div class="stat-value">
-                    <span class="status-{bot_status_class}">{bot_status}</span>
+                    <span class="status-{bot_status_class}" id="bot-status">{bot_status}</span>
                 </div>
                 <p>Администраторы: {admin_count}</p>
                 <p>Память: {memory_usage:.1f} МБ</p>
-            </div>
-            <div class="card">
-                <h3>📊 Лимит Supabase</h3>
-                <div class="stat-value">{limit_usage}</div>
-                <p>Строк использовано <span class="metric-badge {limit_class}">{limit_status}</span></p>
-                <p>Рекомендуется очистка при >18000 строк</p>
             </div>
         </div>
 
@@ -915,9 +933,62 @@ class WebServer:
             {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}
         </div>
     </div>
+
+    <script>
+    function refreshStats() {{
+        fetch('/stats/rows')
+            .then(response => response.json())
+            .then(data => {{
+                document.getElementById('limit-usage').textContent = data.usage;
+                const statusSpan = document.getElementById('limit-status');
+                statusSpan.textContent = data.status_text;
+                statusSpan.className = 'metric-badge ' + data.status_class;
+            }})
+            .catch(error => console.error('Ошибка обновления:', error));
+    }}
+    </script>
 </body>
 </html>"""
         return html
+
+    # --- Новый эндпоинт для получения статистики строк ---
+    async def _stats_rows(self):
+        """Возвращает JSON с информацией о занятых строках в БД."""
+        try:
+            # Используем кэш, чтобы не грузить БД при каждом обновлении
+            current_time = time.time()
+            if current_time - self._last_rows_check < 60 and self._cached_rows_count is not None:
+                total_rows = self._cached_rows_count
+            else:
+                total_rows = await get_total_rows_count()
+                self._cached_rows_count = total_rows
+                self._last_rows_check = current_time
+
+            if total_rows is not None:
+                usage = f"{total_rows}/20000"
+                if total_rows > 18000:
+                    status_class = "metric-bad"
+                    status_text = "КРИТИЧНО"
+                elif total_rows > 15000:
+                    status_class = "metric-warning"
+                    status_text = "Внимание"
+                else:
+                    status_class = "metric-good"
+                    status_text = "Норма"
+            else:
+                usage = "N/A"
+                status_class = ""
+                status_text = ""
+
+            return jsonify({
+                'usage': usage,
+                'status_class': status_class,
+                'status_text': status_text,
+                'rows': total_rows
+            })
+        except Exception as e:
+            logger.error(f"Ошибка в /stats/rows: {e}")
+            return jsonify({'error': str(e)}), 500
 
     # --- Обработчики экспорта и статистики ---
     async def _export_excel(self):
@@ -1055,16 +1126,31 @@ class WebServer:
         if not await self._check_token(request):
             return jsonify({'error': 'Forbidden'}), 403
 
+        # Рейт-лимитинг: не чаще 1 раза в 5 минут
+        if time.time() - self._last_cleanup_time < 300:
+            return jsonify({'error': 'Очистка доступна не чаще 1 раза в 5 минут'}), 429
+        self._last_cleanup_time = time.time()
+
         logger.info("🧹 Запуск очистки старых данных через веб-эндпоинт...")
         try:
             errors_cleaned = await cleanup_old_errors(days=30)
             feedback_cleaned = await cleanup_old_feedback(days=90)
-            logger.info(f"✅ Очистка завершена: удалено {errors_cleaned} записей ошибок и {feedback_cleaned} отзывов")
+
+            # Проверка типов на случай, если функции вернули не int
+            if not isinstance(errors_cleaned, int):
+                errors_cleaned = 0
+            if not isinstance(feedback_cleaned, int):
+                feedback_cleaned = 0
+
+            # Сбрасываем кэш, чтобы статистика обновилась
+            self._cached_rows_count = None
+
+            logger.info(f"✅ Очистка завершена: удалено {errors_cleaned} ошибок и {feedback_cleaned} отзывов")
             return jsonify({
                 'status': 'cleaned',
                 'errors_cleaned': errors_cleaned,
                 'feedback_cleaned': feedback_cleaned,
-                'message': 'Очистка старых данных выполнена успешно'
+                'message': f'Удалено: ошибок {errors_cleaned}, отзывов {feedback_cleaned}'
             }), 200
         except Exception as e:
             logger.error(f"❌ Ошибка при очистке: {e}")
@@ -1089,6 +1175,7 @@ class WebServer:
         app.add_url_rule('/broadcast/api', view_func=self._broadcast_api, methods=['POST'])
 
         app.add_url_rule('/', view_func=self._index)
+        app.add_url_rule('/stats/rows', view_func=self._stats_rows, methods=['GET'])  # новый эндпоинт
         app.add_url_rule('/search/stats', view_func=self._search_stats, methods=['GET', 'POST'])
         app.add_url_rule('/feedback/export', view_func=self._feedback_export, methods=['GET', 'POST'])
         app.add_url_rule('/rate/stats', view_func=self._rate_stats, methods=['GET', 'POST'])

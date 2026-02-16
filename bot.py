@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram-бот для HR-отдела компании "Мечел"
-Версия 14.2 – резервный режим при недоступности БД, защита команд, резервный FAQ
+Версия 14.4 – исправлен UnboundLocalError, добавлена команда /status, уведомления админам
 """
 import os
 import sys
@@ -44,7 +44,8 @@ from database import (
     save_rating,
     log_error,
     cleanup_old_errors,
-    cleanup_old_feedback
+    cleanup_old_feedback,
+    get_total_rows_count
 )
 from stats import BotStatistics, generate_excel_report
 from utils import is_greeting, truncate_question, parse_period_argument
@@ -168,7 +169,7 @@ _bot_initialized = False
 _bot_initializing = False
 _bot_init_lock = asyncio.Lock()
 _routes_registered = False
-_bot_initialization_task: Optional[asyncio.Task] = None
+_bot_initialization_task: Optional[asyncio.Task] = None  # объявлена глобально
 
 # Кэш подписок (чтобы не долбить БД на каждый /start)
 user_subscribed_cache = TTLCache(maxsize=10000, ttl=3600)  # 1 час
@@ -409,7 +410,7 @@ async def periodic_cleanup_tasks():
             logger.error(f"❌ Ошибка при очистке старых данных: {e}")
 
 # ------------------------------------------------------------
-#  ОБРАБОТЧИКИ КОМАНД (с декоратором db_required)
+#  ОБРАБОТЧИКИ КОМАНД
 # ------------------------------------------------------------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     start_time = time.time()
@@ -437,7 +438,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     if user.id in ADMIN_IDS:
-        text += "\n\n👑 Админ-команды:\n/stats [период] — статистика\n/feedbacks — отзывы (выгрузка)\n/export — Excel\n/статистика, /отзывы, /экспорт\n/subscribe /unsubscribe — подписка\n/broadcast — рассылка\n/save — принудительное сохранение данных"
+        text += "\n\n👑 Админ-команды:\n/stats [период] — статистика\n/feedbacks — отзывы (выгрузка)\n/export — Excel\n/статистика, /отзывы, /экспорт\n/subscribe /unsubscribe — подписка\n/broadcast — рассылка\n/save — принудительное сохранение данных\n/status — состояние системы"
 
     photo_path = os.path.join(os.path.dirname(__file__), 'mechel_start.png')
     if os.path.exists(photo_path):
@@ -630,7 +631,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         period = parse_period_argument(context.args[0])
     await bot_stats.log_message(user.id, user.username or "Unknown", 'command', f'/stats {period}')
     s = bot_stats.get_summary_stats(period)
-    subscribers = await get_subscribers() if not fallback_mode else []  # если fallback, подписчиков нет
+    subscribers = await get_subscribers() if not fallback_mode else []
     faq_count = len(search_engine.faq_data) if search_engine else 0
     period_names = {
         'all': 'всё время',
@@ -739,6 +740,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Отзывы: /feedbacks\n"
         "• Мемы: /memsub, /memunsub\n"
         "• Сохранить данные: /save или /сохранить\n"
+        "• Состояние системы: /status\n"
         f"• Веб-интерфейс: {BASE_URL}"
     )
     keyboard = [[InlineKeyboardButton("👑 Открыть админ-меню", callback_data="menu_admin")]]
@@ -784,6 +786,32 @@ async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elapsed = time.time() - start_time
     if bot_stats:
         bot_stats.track_response_time(elapsed)
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда для просмотра состояния системы (доступна админам)"""
+    if update.effective_user.id not in ADMIN_IDS:
+        await _reply_or_edit(update, "⛔ Нет прав.", parse_mode='HTML')
+        return
+
+    if fallback_mode:
+        text = "⚠️ <b>Режим работы:</b> РЕЗЕРВНЫЙ (БД недоступна)\n\n"
+        text += "📚 Используется встроенный FAQ (15 вопросов)\n"
+        text += "⏸️ Функции, требующие БД, отключены.\n"
+    else:
+        text = "✅ <b>Режим работы:</b> ПОЛНЫЙ (БД подключена)\n\n"
+        try:
+            total_rows = await get_total_rows_count()
+            text += f"📊 Использовано строк в БД: {total_rows}/20000\n"
+            if total_rows > 18000:
+                text += "⚠️ <b>Критично! Близок лимит бесплатного тарифа Supabase!</b>\n"
+            elif total_rows > 15000:
+                text += "⚠️ Внимание: скоро достигнут лимит.\n"
+            else:
+                text += "✅ Лимит не превышен.\n"
+        except Exception as e:
+            text += f"❌ Не удалось получить статистику: {e}\n"
+
+    await _reply_or_edit(update, text, parse_mode='HTML')
 
 # ------------------------------------------------------------
 #  ОБРАБОТЧИК ТЕКСТОВЫХ СООБЩЕНИЙ
@@ -1171,6 +1199,7 @@ async def setup_bot_background():
     application.add_handler(CommandHandler("broadcast", broadcast_command))
     application.add_handler(CommandHandler("whatcanido", what_can_i_do))
     application.add_handler(CommandHandler("save", save_command))
+    application.add_handler(CommandHandler("status", status_command))  # новая команда
 
     if MEME_MODULE_AVAILABLE:
         application.add_handler(CommandHandler("mem", meme_command))
@@ -1215,9 +1244,11 @@ async def setup_bot_background():
             await what_can_i_do(update, context)
         elif text.startswith('/админ'):
             await admin_panel(update, context)
+        elif text.startswith('/статус'):
+            await status_command(update, context)
 
     application.add_handler(MessageHandler(
-        filters.Regex(r'^/(старт|помощь|категории|предложения|отзывы|статистика|экспорт|подписаться|отписаться|рассылка|сохранить|мем|мемподписка|мемотписка|что_могу|админ)'),
+        filters.Regex(r'^/(старт|помощь|категории|предложения|отзывы|статистика|экспорт|подписаться|отписаться|рассылка|сохранить|мем|мемподписка|мемотписка|что_могу|админ|статус)'),
         russian_command_handler
     ))
 
@@ -1258,6 +1289,19 @@ async def setup_bot_background():
         logger.info("✅ Запущена периодическая очистка старых данных")
     else:
         logger.warning("⏸️ Периодическая очистка отключена (режим резервной работоспособности)")
+
+    # Отправляем уведомление админам о переходе в резервный режим
+    if fallback_mode and ADMIN_IDS:
+        for aid in ADMIN_IDS:
+            try:
+                await application.bot.send_message(
+                    aid,
+                    "⚠️ <b>Бот перешёл в резервный режим</b>\n"
+                    "Supabase недоступна. Работает с резервным FAQ (15 вопросов).",
+                    parse_mode='HTML'
+                )
+            except Exception as e:
+                logger.error(f"Не удалось отправить уведомление админу {aid}: {e}")
 
     # Устанавливаем вебхук всегда (даже в резервном режиме), чтобы бот получал обновления
     if RENDER:
@@ -1317,6 +1361,7 @@ async def cleanup():
 # ------------------------------------------------------------
 @app.route('/wake', methods=['GET', 'POST'])
 async def wake():
+    global _bot_initialization_task  # обязательно global!
     if not _bot_initialized:
         logger.info("🔄 Пробуждение: запуск инициализации")
         if not _bot_initialization_task or _bot_initialization_task.done():

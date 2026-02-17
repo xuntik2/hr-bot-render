@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram-бот для HR-отдела компании "Мечел"
-Версия 15.1 – исправлена работа с объектами FAQEntry, адаптация под разные форматы результатов поиска
+Версия 15.4 – синхронизация статуса БД с database.py, убрано дублирование админ-команд
 """
 import os
 import sys
@@ -45,7 +45,8 @@ from database import (
     log_error,
     cleanup_old_errors,
     cleanup_old_feedback,
-    get_total_rows_count
+    get_total_rows_count,
+    set_db_available   # <-- добавлено для синхронизации статуса
 )
 from stats import BotStatistics, generate_excel_report
 from utils import is_greeting, truncate_question, parse_period_argument
@@ -147,7 +148,9 @@ try:
     admin_str = os.getenv('ADMIN_IDS', '')
     if admin_str:
         ADMIN_IDS = [int(x.strip()) for x in admin_str.split(',') if x.strip().isdigit()]
-    logging.info(f"✅ Администраторы: {ADMIN_IDS}")
+        logging.info(f"✅ Администраторы: {ADMIN_IDS}")
+    else:
+        logging.warning("⚠️ ADMIN_IDS не настроен – админ-функции будут недоступны")
 except Exception as e:
     logging.error(f"❌ Ошибка парсинга ADMIN_IDS: {e}")
 
@@ -171,8 +174,8 @@ _bot_init_lock = asyncio.Lock()
 _routes_registered = False
 _bot_initialization_task: Optional[asyncio.Task] = None
 
-# Кэш подписок (чтобы не долбить БД на каждый /start)
-user_subscribed_cache = TTLCache(maxsize=10000, ttl=3600)  # 1 час
+# Кэш подписок (чтобы не долбить БД на каждый /start) – увеличен TTL до 2 часов
+user_subscribed_cache = TTLCache(maxsize=10000, ttl=7200)  # 2 часа
 
 # Глобальный флаг резервного режима
 fallback_mode = False  # True = БД недоступна, работаем с резервным FAQ
@@ -264,7 +267,6 @@ class BuiltinSearchEngine:
         logger.info(f"🔄 Данные встроенного поиска обновлены, теперь {len(self.faq_data)} записей")
 
     def search(self, query: str, category: str = None, top_k: int = 5) -> List[Tuple[int, str, str, float]]:
-        """Поиск, возвращающий кортеж (id, вопрос, ответ, релевантность)."""
         if not query or not self.faq_data:
             return []
         query_lower = query.lower()
@@ -320,7 +322,6 @@ class ExternalSearchEngineAdapter:
         self.suggest_cache_ttl = timedelta(minutes=30)
 
     def search(self, query: str, category: str = None, top_k: int = 5) -> List[Tuple[int, str, str, float]]:
-        """Возвращает результаты в формате (id, вопрос, ответ, релевантность)."""
         try:
             raw_results = self.engine.search(query, category=category, top_k=top_k)
             if not raw_results:
@@ -332,13 +333,6 @@ class ExternalSearchEngineAdapter:
                     question = r.get('question', '')
                     answer = r.get('answer', '')
                     score = r.get('score', 0.0)
-                elif isinstance(r, tuple):
-                    if len(r) == 4:
-                        faq_id, question, answer, score = r
-                    else:
-                        # Если внешний движок вернул (question, answer, score), генерируем id
-                        question, answer, score = r
-                        faq_id = hash(question) % 1000000  # временный ID
                 else:
                     faq_id = getattr(r, 'id', 0)
                     question = getattr(r, 'question', '')
@@ -422,20 +416,27 @@ async def periodic_cleanup_tasks():
 #  ОБРАБОТЧИКИ КОМАНД
 # ------------------------------------------------------------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start с разным контентом для админов и обычных пользователей."""
     start_time = time.time()
     user = update.effective_user
 
-    # Пытаемся подписать и записать статистику, но если БД недоступна — не ломаем приветствие
+    # Пытаемся подписать и записать статистику
     try:
         await ensure_subscribed_cached(user.id)
         if bot_stats:
             await bot_stats.log_message(user.id, user.username or "Unknown", 'command', '/start')
             await bot_stats.log_message(user.id, user.username or "Unknown", 'subscribe', '')
     except Exception as e:
-        logger.error(f"⚠️ Ошибка записи в БД при /start (БД может быть недоступна): {e}")
-        # Продолжаем работу
+        logger.error(f"⚠️ Ошибка записи в БД при /start: {e}")
 
-    text = await get_message('welcome', first_name=user.first_name)
+    # Определяем, является ли пользователь администратором
+    is_admin = user.id in ADMIN_IDS
+
+    # Получаем соответствующее приветствие (админ-команды уже внутри welcome_admin)
+    if is_admin:
+        text = await get_message('welcome_admin', first_name=user.first_name, base_url=BASE_URL)
+    else:
+        text = await get_message('welcome', first_name=user.first_name)
 
     # Если мы в резервном режиме, добавляем предупреждение
     if fallback_mode:
@@ -446,9 +447,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🔄 Система автоматически восстановится после возвращения базы данных"
         )
 
-    if user.id in ADMIN_IDS:
-        text += "\n\n👑 Админ-команды:\n/stats [период] — статистика\n/feedbacks — отзывы (выгрузка)\n/export — Excel\n/статистика, /отзывы, /экспорт\n/subscribe /unsubscribe — подписка\n/broadcast — рассылка\n/save — принудительное сохранение данных\n/status — состояние системы\n/cleanup — очистка старых данных"
+    # Создаём inline-кнопку "СТАРТ"
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("СТАРТ", callback_data="restart")]])
 
+    # Пытаемся отправить фото с приветствием
     photo_path = os.path.join(os.path.dirname(__file__), 'mechel_start.png')
     if os.path.exists(photo_path):
         try:
@@ -456,7 +458,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_photo(
                     photo=photo,
                     caption=text,
-                    parse_mode='HTML'
+                    parse_mode='HTML',
+                    reply_markup=keyboard
                 )
                 elapsed = time.time() - start_time
                 if bot_stats:
@@ -465,7 +468,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Ошибка отправки приветственного фото: {e}")
 
-    await _reply_or_edit(update, text, parse_mode='HTML')
+    # Если фото нет, отправляем текст с кнопкой
+    await _reply_or_edit(update, text, parse_mode='HTML', reply_markup=keyboard)
     elapsed = time.time() - start_time
     if bot_stats:
         bot_stats.track_response_time(elapsed)
@@ -478,7 +482,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if bot_stats:
             await bot_stats.log_message(user.id, user.username or "Unknown", 'command', '/help')
     except Exception:
-        pass  # не критично
+        pass
 
     text = await get_message('help')
     await _reply_or_edit(update, text, parse_mode='HTML')
@@ -569,7 +573,6 @@ async def categories_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     categories = {}
     for item in search_engine.faq_data:
-        # item может быть словарём или объектом FAQEntry
         if hasattr(item, 'category'):
             cat = item.category
         else:
@@ -645,11 +648,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await bot_stats.log_message(user.id, user.username or "Unknown", 'command', f'/stats {period}')
     s = bot_stats.get_summary_stats(period)
     subscribers = await get_subscribers() if not fallback_mode else []
-    # Безопасное получение количества записей FAQ
-    if search_engine and hasattr(search_engine, 'faq_data'):
-        faq_count = len(search_engine.faq_data)
-    else:
-        faq_count = 0
+    faq_count = len(search_engine.faq_data) if search_engine else 0
     period_names = {
         'all': 'всё время',
         'day': 'день',
@@ -758,7 +757,6 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Мемы: /memsub, /memunsub\n"
         "• Сохранить данные: /save или /сохранить\n"
         "• Состояние системы: /status\n"
-        "• Очистка старых данных: /cleanup\n"
         f"• Веб-интерфейс: {BASE_URL}"
     )
     keyboard = [[InlineKeyboardButton("👑 Открыть админ-меню", callback_data="menu_admin")]]
@@ -949,14 +947,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bot_stats.track_response_time(elapsed)
         return
 
-    for r in results[:3]:
-        # r может быть кортежем из 3 или 4 элементов
-        if len(r) == 4:
-            faq_id, q, a, s = r
-        else:
-            q, a, s = r
-            faq_id = 0  # временный ID для обратной совместимости
-        response = f"📌 <b>Результат:</b>\n\n• <b>{q}</b>\n{a[:200]}...\n\n"
+    for idx, (faq_id, q, a, s) in enumerate(results[:3]):
+        response = f"📌 <b>Результат {idx+1}:</b>\n\n• <b>{q}</b>\n{a[:200]}...\n\n"
         keyboard = [
             [
                 InlineKeyboardButton("👍 Помог", callback_data=f"rate_{faq_id}_1"),
@@ -1007,7 +999,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if len(parts) >= 3:
             faq_id = int(parts[1])
             is_helpful = parts[2] == '1'
-            if not fallback_mode and faq_id != 0:  # не сохраняем оценку, если ID временный
+            if not fallback_mode:
                 await save_rating(faq_id, update.effective_user.id, is_helpful)
                 if bot_stats:
                     bot_stats.record_rating(faq_id, is_helpful)
@@ -1026,6 +1018,14 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
     if data.startswith('cat_'):
         category_name = data[4:]
+        # Проверка наличия search_engine и данных
+        if search_engine is None or not search_engine.faq_data:
+            await query.edit_message_text("⚠️ Категории временно недоступны.")
+            elapsed = time.time() - start_time
+            if bot_stats:
+                bot_stats.track_response_time(elapsed)
+            return
+
         questions = []
         question_ids = []
         for item in search_engine.faq_data:
@@ -1070,7 +1070,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             if hasattr(item, 'id') and item.id == faq_id:
                 found = item
                 break
-            elif isinstance(item, dict) and item.get('id') == faq_id:
+            elif item.get('id') == faq_id:
                 found = item
                 break
         if found:
@@ -1102,6 +1102,13 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
     if data == "menu_admin" and update.effective_user.id in ADMIN_IDS:
         await admin_panel(update, context)
+        elapsed = time.time() - start_time
+        if bot_stats:
+            bot_stats.track_response_time(elapsed)
+        return
+
+    if data == "restart":
+        await start_command(update, context)
         elapsed = time.time() - start_time
         if bot_stats:
             bot_stats.track_response_time(elapsed)
@@ -1148,7 +1155,7 @@ async def setup_bot_background():
             return
         _bot_initializing = True
 
-    # Ждём 5 сек для стабилизации сети (Render может "просыпаться" медленно)
+    # Ждём 5 сек для стабилизации сети
     logger.info("🔄 Ожидание стабилизации сети (5 сек)...")
     await asyncio.sleep(5.0)
 
@@ -1157,9 +1164,8 @@ async def setup_bot_background():
     for attempt in range(20):
         try:
             logger.info(f"🔄 Попытка подключения к БД {attempt+1}/20...")
-            await init_db()  # внутри init_db вызывается get_pool() с его собственными повторами
+            await init_db()
             pool = await get_pool()
-            # Проверяем работоспособность простым запросом
             async with pool.acquire() as conn:
                 await conn.fetchval("SELECT 1")
             logger.info("✅ База данных подключена и готова к работе")
@@ -1170,7 +1176,7 @@ async def setup_bot_background():
             if attempt == 19:
                 logger.error("❌ Не удалось подключиться к БД после 20 попыток.")
             else:
-                wait = min(20.0, 0.5 * (2 ** attempt))  # экспоненциальная задержка до 20 сек
+                wait = min(20.0, 0.5 * (2 ** attempt))
                 logger.warning(f"⏳ Повтор через {wait:.1f}с...")
                 await asyncio.sleep(wait)
 
@@ -1180,7 +1186,11 @@ async def setup_bot_background():
         sys.exit(1)
 
     # Загружаем FAQ (из БД, из бэкапа или резервный список)
-    fallback_mode = not db_connected  # если БД не подключена, включаем резервный режим
+    fallback_mode = not db_connected
+    # Синхронизируем статус с database.py
+    set_db_available(not fallback_mode)
+    logger.info(f"🔄 Синхронизация с database.py: fallback_mode={fallback_mode}")
+
     faq_data = []
 
     if db_connected:
@@ -1190,9 +1200,9 @@ async def setup_bot_background():
                 logger.warning("⚠️ FAQ из БД пустой. Будет использован резервный набор.")
                 faq_data = FALLBACK_FAQ
                 fallback_mode = True
+                set_db_available(False)
             else:
                 logger.info(f"✅ Загружено {len(faq_data)} записей FAQ из БД")
-                # Сохраняем бэкап локально
                 try:
                     with open('faq_backup.json', 'w', encoding='utf-8') as f:
                         json.dump(faq_data, f, ensure_ascii=False, indent=2)
@@ -1206,22 +1216,23 @@ async def setup_bot_background():
                 logger.warning("⚠️ Резервный бэкап не найден, используем встроенный FALLBACK_FAQ")
                 faq_data = FALLBACK_FAQ
                 fallback_mode = True
+                set_db_available(False)
             else:
-                # успешно загрузили из бэкапа, но БД всё ещё недоступна, fallback_mode = True
                 fallback_mode = True
+                set_db_available(False)
     else:
-        # БД недоступна, пробуем загрузить из бэкапа
         logger.warning("⚠️ БД недоступна, пробуем загрузить FAQ из локального бэкапа...")
         faq_data = load_faq_from_backup()
         if not faq_data:
             logger.warning("⚠️ Резервный бэкап не найден, используем встроенный FALLBACK_FAQ")
             faq_data = FALLBACK_FAQ
             fallback_mode = True
+            set_db_available(False)
         else:
             logger.info(f"✅ Загружено {len(faq_data)} записей из бэкапа, но БД недоступна.")
             fallback_mode = True
+            set_db_available(False)
 
-    # Если EXIT_ON_DB_FAILURE был включён, но мы активировали резервный режим, игнорируем выход
     if EXIT_ON_DB_FAILURE and fallback_mode and not db_connected:
         logger.info("ℹ️ EXIT_ON_DB_FAILURE игнорируется — активирован резервный режим работоспособности")
 
@@ -1370,7 +1381,7 @@ async def setup_bot_background():
             except Exception as e:
                 logger.error(f"Не удалось отправить уведомление админу {aid}: {e}")
 
-    # Устанавливаем вебхук всегда (даже в резервном режиме), чтобы бот получал обновления
+    # Устанавливаем вебхук всегда
     if RENDER:
         webhook_url = WEBHOOK_URL + WEBHOOK_PATH
         logger.info(f"🔄 Установка вебхука на {webhook_url} (режим: {'полный' if db_connected else 'резервный'})...")
@@ -1442,6 +1453,14 @@ async def force_save():
         return jsonify({'error': 'Forbidden'}), 403
     logger.info("💾 Запрос /save (ничего не делает)")
     return jsonify({'status': 'saved'}), 200
+
+@app.route('/health', methods=['GET'])
+async def health_check():
+    return jsonify({
+        'status': 'ok' if _bot_initialized else 'initializing',
+        'fallback_mode': fallback_mode,
+        'timestamp': datetime.now().isoformat()
+    })
 
 @app.route(WEBHOOK_PATH, methods=['POST'])
 async def telegram_webhook():

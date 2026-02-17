@@ -1,7 +1,7 @@
 # stats.py
 """
 Модуль статистики для HR-бота Мечел
-Версия 2.5 – добавлено свойство daily_stats для совместимости с web_panel
+Версия 2.8 – улучшен flush, использование _safe_async_task во всех асинхронных вызовах
 """
 import asyncio
 import io
@@ -24,6 +24,16 @@ from database import (
 )
 
 logger = logging.getLogger(__name__)
+
+def _safe_async_task(coro):
+    """Безопасно создаёт задачу asyncio, если цикл событий запущен."""
+    try:
+        loop = asyncio.get_running_loop()
+        return loop.create_task(coro)
+    except RuntimeError:
+        # Если цикла нет (например, при импорте), возвращаем None
+        logger.warning("⚠️ Нет запущенного цикла событий, задача не создана")
+        return None
 
 class BotStatistics:
     """
@@ -53,11 +63,10 @@ class BotStatistics:
         self._user_last_active = {}  # user_id -> datetime последней активности
 
         # Загружаем последние 7 дней из БД для инициализации буфера
-        asyncio.create_task(self._load_recent_stats())
+        _safe_async_task(self._load_recent_stats())
 
         # Задача для периодического сброса
-        self._flush_task: Optional[asyncio.Task] = None
-        asyncio.create_task(self._start_flush_loop())
+        _safe_async_task(self._start_flush_loop())
 
     @property
     def daily_stats(self):
@@ -93,7 +102,10 @@ class BotStatistics:
             for field, value in counts.items():
                 if value > 0:
                     await log_daily_stat(date, field, value)
-            counts.clear()
+
+            # Удаляем ключ, чтобы defaultdict создал новую запись при следующем обращении
+            if date in self._daily_buffer:
+                del self._daily_buffer[date]
 
         for date, users in list(self._users_buffer.items()):
             if users:
@@ -152,7 +164,7 @@ class BotStatistics:
         self._response_times_cache.append(response_time)
         if len(self._response_times_cache) > 100:
             self._response_times_cache.pop(0)
-        asyncio.create_task(add_response_time(response_time))
+        _safe_async_task(add_response_time(response_time))
 
     def get_avg_response_time(self) -> float:
         if not self._response_times_cache:
@@ -169,12 +181,12 @@ class BotStatistics:
             return "Медленно", "red"
 
     def log_error(self, error_type: str, error_msg: str, user_id: int = None):
-        asyncio.create_task(log_error(error_type, error_msg, user_id))
+        _safe_async_task(log_error(error_type, error_msg, user_id))
 
     def record_rating(self, faq_id: int, is_helpful: bool):
         date_key = datetime.now().strftime("%Y-%m-%d")
         self._daily_buffer[date_key]['ratings_helpful' if is_helpful else 'ratings_unhelpful'] += 1
-        asyncio.create_task(db_save_rating(faq_id, 0, is_helpful))
+        _safe_async_task(db_save_rating(faq_id, 0, is_helpful))
 
     async def get_rating_stats(self) -> Dict[str, Any]:
         from database import get_rating_stats as db_stats
@@ -388,11 +400,18 @@ def generate_excel_report(bot_stats: BotStatistics, subscribers: List[int], sear
         if search_engine and hasattr(search_engine, 'faq_data') and search_engine.faq_data:
             row = 4
             for item in search_engine.faq_data:
-                item_id = item.get('id', '')
-                cat = item.get('category', 'Без категории')
-                q = item.get('question', '')
-                a = item.get('answer', '')
-                kw = item.get('keywords', '')
+                if hasattr(item, 'id'):
+                    item_id = item.id
+                    cat = item.category
+                    q = item.question
+                    a = item.answer
+                    kw = item.keywords if hasattr(item, 'keywords') else ''
+                else:
+                    item_id = item.get('id', '')
+                    cat = item.get('category', 'Без категории')
+                    q = item.get('question', '')
+                    a = item.get('answer', '')
+                    kw = item.get('keywords', '')
                 ws3.cell(row=row, column=1, value=item_id)
                 ws3.cell(row=row, column=2, value=cat)
                 ws3.cell(row=row, column=3, value=q)

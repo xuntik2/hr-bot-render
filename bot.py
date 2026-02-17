@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram-бот для HR-отдела компании "Мечел"
-Версия 15.6 – исправлен поиск по базе FAQ, добавлено логирование
+Версия 15.7 – полная интеграция с SearchEngine v5.6 (FAQEntry dataclass)
 """
 import os
 import sys
@@ -67,7 +67,6 @@ try:
 except ImportError:
     MEME_MODULE_AVAILABLE = False
     print("⚠️ Модуль мемов не найден, команды /мем и подписки будут недоступны")
-    # Заглушки
     async def init_meme_handler(*args, **kwargs): pass
     async def close_meme_handler(): pass
     async def meme_command(*args, **kwargs): pass
@@ -75,13 +74,17 @@ except ImportError:
     async def meme_unsubscribe_command(*args, **kwargs): pass
     def get_meme_handler(): return None
 
-# Поисковый движок (может быть внешний или встроенный)
+# ✅ ПОИСКОВЫЙ ДВИЖОК – используем SearchEngine из search_engine.py
 try:
-    from search_engine import SearchEngine as ExternalSearchEngine
-    from search_engine import EnhancedSearchEngine
+    from search_engine import SearchEngine, EnhancedSearchEngine, FAQEntry
+    SEARCH_ENGINE_AVAILABLE = True
+    logger.info("✅ SearchEngine v5.6 загружен")
 except ImportError:
-    ExternalSearchEngine = None
+    SearchEngine = None
     EnhancedSearchEngine = None
+    FAQEntry = None
+    SEARCH_ENGINE_AVAILABLE = False
+    logger.warning("⚠️ search_engine.py не найден, будет использован встроенный движок")
 
 # ------------------------------------------------------------
 #  РЕЗЕРВНЫЙ FAQ (используется при недоступности БД)
@@ -163,7 +166,7 @@ app = Quart(__name__)
 
 # Глобальные объекты
 application: Optional[Application] = None
-search_engine: Optional[Union['BuiltinSearchEngine', 'ExternalSearchEngineAdapter']] = None
+search_engine: Optional[Union['SearchEngine', 'BuiltinSearchEngine']] = None
 bot_stats: Optional[BotStatistics] = None
 
 # Флаги инициализации
@@ -190,24 +193,72 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------
-#  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+#  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ – УНИВЕРСАЛЬНЫЙ ДОСТУП К FAQ
 # ------------------------------------------------------------
+
+def _get_faq_id(item) -> Optional[int]:
+    """✅ Универсальное получение ID из dict или FAQEntry"""
+    if isinstance(item, dict):
+        return item.get('id')
+    elif hasattr(item, 'id'):
+        return item.id
+    return None
+
+def _get_faq_question(item) -> str:
+    """✅ Универсальное получение вопроса"""
+    if isinstance(item, dict):
+        return item.get('question', '')
+    elif hasattr(item, 'question'):
+        return item.question
+    return ''
+
+def _get_faq_answer(item) -> str:
+    """✅ Универсальное получение ответа"""
+    if isinstance(item, dict):
+        return item.get('answer', '')
+    elif hasattr(item, 'answer'):
+        return item.answer
+    return ''
+
+def _get_faq_category(item) -> str:
+    """✅ Универсальное получение категории"""
+    if isinstance(item, dict):
+        return item.get('category', 'Без категории')
+    elif hasattr(item, 'category'):
+        return item.category
+    return 'Без категории'
+
+def _get_faq_priority(item) -> int:
+    """✅ Универсальное получение priority"""
+    if isinstance(item, dict):
+        return item.get('priority', 0)
+    elif hasattr(item, 'priority'):
+        return item.priority
+    return 0
+
 async def _reply_or_edit(update: Update, text: str, parse_mode: str = 'HTML', reply_markup=None):
     """✅ ИСПРАВЛЕНО: Корректная обработка message и callback_query"""
     try:
         if update.message:
             return await update.message.reply_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
         elif update.callback_query:
-            if update.callback_query.message and update.callback_query.message.text:
-                await update.callback_query.edit_message_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
+            # Проверяем есть ли сообщение для редактирования
+            if update.callback_query.message:
+                # Проверяем есть ли текст в сообщении
+                if update.callback_query.message.text:
+                    await update.callback_query.edit_message_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
+                else:
+                    # Если это фото или другое медиа, отправляем новое сообщение
+                    await update.callback_query.message.reply_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
             else:
-                await update.callback_query.message.reply_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
+                await update.callback_query.answer(text, show_alert=True)
             return None
         else:
             logger.error("Не удалось определить тип update для отправки сообщения")
             return None
     except Exception as e:
         logger.error(f"❌ Ошибка в _reply_or_edit: {e}")
+        # Fallback: пытаемся отправить как новое сообщение
         try:
             if update.callback_query and update.callback_query.message:
                 await update.callback_query.message.reply_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
@@ -234,6 +285,66 @@ def load_faq_from_backup() -> List[Dict]:
     return []
 
 # ------------------------------------------------------------
+#  ВСТРОЕННЫЙ ПОИСКОВЫЙ ДВИЖОК (резервный)
+# ------------------------------------------------------------
+class BuiltinSearchEngine:
+    def __init__(self, faq_data: List[Dict], max_cache_size: int = 500):
+        self.faq_data = []
+        if faq_
+            for item in faq_
+                if isinstance(item, dict):
+                    self.faq_data.append(item)
+                else:
+                    self.faq_data.append({
+                        'id': _get_faq_id(item),
+                        'question': _get_faq_question(item),
+                        'answer': _get_faq_answer(item),
+                        'category': _get_faq_category(item),
+                        'priority': _get_faq_priority(item)
+                    })
+        self.cache = {}
+        self.suggest_cache = {}
+        self.suggest_cache_ttl = timedelta(minutes=30)
+        self.max_cache_size = max_cache_size
+        logger.info(f"✅ BuiltinSearchEngine инициализирован с {len(self.faq_data)} записями")
+
+    def search(self, query: str, category: str = None, top_k: int = 5) -> List[Tuple[int, str, str, float]]:
+        if not query or not self.faq_
+            return []
+        query_lower = query.lower()
+        results = []
+        for item in self.faq_
+            if category and _get_faq_category(item) != category:
+                continue
+            question = _get_faq_question(item)
+            answer = _get_faq_answer(item)
+            faq_id = _get_faq_id(item)
+            if not question or not answer or faq_id is None:
+                continue
+            score = 0
+            if query_lower in question.lower():
+                score += 2
+            if query_lower in answer.lower():
+                score += 1
+            if score > 0:
+                results.append((faq_id, question, answer, score))
+        results.sort(key=lambda x: x[3], reverse=True)
+        return results[:top_k]
+
+    def suggest_correction(self, query: str, top_k: int = 3) -> List[str]:
+        if not query or not self.faq_
+            return []
+        return []
+
+    @property
+    def faq_data(self):
+        return self._faq_data if hasattr(self, '_faq_data') else []
+
+    @faq_data.setter
+    def faq_data(self, value):
+        self._faq_data = value
+
+# ------------------------------------------------------------
 #  ДЕКОРАТОР ДЛЯ КОМАНД, ТРЕБУЮЩИХ БД
 # ------------------------------------------------------------
 def db_required(func):
@@ -257,227 +368,9 @@ def db_required(func):
     return wrapper
 
 # ------------------------------------------------------------
-#  ВСТРОЕННЫЙ ПОИСКОВЫЙ ДВИЖОК
-# ------------------------------------------------------------
-class BuiltinSearchEngine:
-    def __init__(self, faq_data: List[Dict], max_cache_size: int = 500):
-        # ✅ ИСПРАВЛЕНО: Преобразуем все элементы в dict
-        self.faq_data = []
-        if faq_data:
-            for item in faq_data:
-                if isinstance(item, dict):
-                    self.faq_data.append(item)
-                else:
-                    # Конвертируем объект в dict
-                    self.faq_data.append({
-                        'id': getattr(item, 'id', None),
-                        'question': getattr(item, 'question', ''),
-                        'answer': getattr(item, 'answer', ''),
-                        'category': getattr(item, 'category', ''),
-                        'keywords': getattr(item, 'keywords', ''),
-                        'priority': getattr(item, 'priority', 0)
-                    })
-        self.cache = {}
-        self.suggest_cache = {}
-        self.suggest_cache_ttl = timedelta(minutes=30)
-        self.max_cache_size = max_cache_size
-        logger.info(f"✅ Встроенный поиск инициализирован с {len(self.faq_data)} записями")
-        
-        # ✅ ЛОГИРОВАНИЕ: Выводим первые 3 вопроса для проверки
-        if self.faq_data:
-            logger.info(f"📋 Примеры вопросов: {[item.get('question', '')[:50] for item in self.faq_data[:3]]}")
-
-    def refresh_data(self, new_faq_data: List[Dict]):
-        self.faq_data = []
-        if new_faq_data:
-            for item in new_faq_data:
-                if isinstance(item, dict):
-                    self.faq_data.append(item)
-                else:
-                    self.faq_data.append({
-                        'id': getattr(item, 'id', None),
-                        'question': getattr(item, 'question', ''),
-                        'answer': getattr(item, 'answer', ''),
-                        'category': getattr(item, 'category', ''),
-                        'keywords': getattr(item, 'keywords', ''),
-                        'priority': getattr(item, 'priority', 0)
-                    })
-        self.cache.clear()
-        self.suggest_cache.clear()
-        logger.info(f"🔄 Данные встроенного поиска обновлены, теперь {len(self.faq_data)} записей")
-
-    def search(self, query: str, category: str = None, top_k: int = 5) -> List[Tuple[int, str, str, float]]:
-        if not query or not self.faq_data:
-            logger.warning(f"⚠️ Поиск: query={bool(query)}, faq_data={len(self.faq_data) if self.faq_data else 0}")
-            return []
-        
-        query_lower = query.lower()
-        results = []
-        
-        for item in self.faq_data:
-            # ✅ ИСПРАВЛЕНО: Используем .get() только для dict
-            if not isinstance(item, dict):
-                continue
-                
-            if category and item.get('category') != category:
-                continue
-            
-            question = item.get('question', '')
-            answer = item.get('answer', '')
-            faq_id = item.get('id')
-            
-            if not question or not answer or faq_id is None:
-                continue
-            
-            score = 0
-            if query_lower in question.lower():
-                score += 2
-            if query_lower in answer.lower():
-                score += 1
-            
-            # ✅ ИСПРАВЛЕНО: Проверка ключевых слов
-            keywords = item.get('keywords', '')
-            if keywords and query_lower in keywords.lower():
-                score += 1
-            
-            if score > 0:
-                results.append((faq_id, question, answer, score))
-                logger.debug(f"🔍 Найдено совпадение: {question[:50]} (score={score})")
-        
-        results.sort(key=lambda x: x[3], reverse=True)
-        logger.info(f"🔍 Поиск по '{query}': найдено {len(results)} результатов")
-        return results[:top_k]
-
-    def suggest_correction(self, query: str, top_k: int = 3) -> List[str]:
-        if not query or not self.faq_data:
-            return []
-        cache_key = f"{query}_{top_k}"
-        cached = self.suggest_cache.get(cache_key)
-        if cached:
-            ts, value = cached
-            if datetime.now() - ts < self.suggest_cache_ttl:
-                return value
-        query_lower = query.lower()
-        suggestions = set()
-        for item in self.faq_data:
-            question = item.get('question', '')
-            if not question:
-                continue
-            if levenshtein_distance(query_lower, question.lower()) <= 3:
-                suggestions.add(question)
-            if len(suggestions) >= top_k:
-                break
-        result = list(suggestions)[:top_k]
-        self.suggest_cache[cache_key] = (datetime.now(), result)
-        return result
-
-class ExternalSearchEngineAdapter:
-    def __init__(self, engine):
-        self.engine = engine
-        self.cache = {}
-        self.suggest_cache = {}
-        self.suggest_cache_ttl = timedelta(minutes=30)
-
-    def search(self, query: str, category: str = None, top_k: int = 5) -> List[Tuple[int, str, str, float]]:
-        try:
-            raw_results = self.engine.search(query, category=category, top_k=top_k)
-            if not raw_results:
-                return []
-            converted = []
-            for r in raw_results:
-                if isinstance(r, dict):
-                    faq_id = r.get('id', 0)
-                    question = r.get('question', '')
-                    answer = r.get('answer', '')
-                    score = r.get('score', 0.0)
-                else:
-                    faq_id = getattr(r, 'id', 0)
-                    question = getattr(r, 'question', '')
-                    answer = getattr(r, 'answer', '')
-                    score = getattr(r, 'score', 0.0)
-                converted.append((faq_id, question, answer, float(score)))
-            return converted
-        except Exception as e:
-            logger.error(f"Ошибка поиска во внешнем движке: {e}")
-            return []
-
-    def suggest_correction(self, query: str, top_k: int = 3) -> List[str]:
-        if not query:
-            return []
-        cache_key = f"{query}_{top_k}"
-        cached = self.suggest_cache.get(cache_key)
-        if cached:
-            ts, value = cached
-            if datetime.now() - ts < self.suggest_cache_ttl:
-                return value
-        try:
-            if hasattr(self.engine, 'suggest_correction'):
-                result = self.engine.suggest_correction(query, top_k=top_k)
-                if not result:
-                    result = []
-                self.suggest_cache[cache_key] = (datetime.now(), result)
-                return result
-        except Exception as e:
-            logger.error(f"Ошибка предложения во внешнем движке: {e}")
-            return []
-        return []
-
-    def refresh_data(self):
-        if hasattr(self.engine, 'refresh_data'):
-            self.engine.refresh_data()
-        self.cache.clear()
-        self.suggest_cache.clear()
-
-    @property
-    def faq_data(self):
-        if hasattr(self.engine, 'faq_data'):
-            data = self.engine.faq_data
-            # ✅ ИСПРАВЛЕНО: Конвертируем в dict если нужно
-            if data and not isinstance(data[0], dict):
-                return [{
-                    'id': getattr(item, 'id', None),
-                    'question': getattr(item, 'question', ''),
-                    'answer': getattr(item, 'answer', ''),
-                    'category': getattr(item, 'category', '')
-                } for item in data]
-            return data
-        return []
-
-def levenshtein_distance(s1: str, s2: str) -> int:
-    if len(s1) < len(s2):
-        return levenshtein_distance(s2, s1)
-    if len(s2) == 0:
-        return len(s1)
-    previous_row = range(len(s2) + 1)
-    for i, c1 in enumerate(s1):
-        current_row = [i + 1]
-        for j, c2 in enumerate(s2):
-            insertions = previous_row[j + 1] + 1
-            deletions = current_row[j] + 1
-            substitutions = previous_row[j] + (c1 != c2)
-            current_row.append(min(insertions, deletions, substitutions))
-        previous_row = current_row
-    return previous_row[-1]
-
-# ------------------------------------------------------------
-#  ПЕРИОДИЧЕСКАЯ ЗАДАЧА ОЧИСТКИ
-# ------------------------------------------------------------
-async def periodic_cleanup_tasks():
-    while True:
-        try:
-            await asyncio.sleep(86400)
-            logger.info("🧹 Запуск плановой очистки старых данных...")
-            await cleanup_old_errors(days=30)
-            await cleanup_old_feedback(days=90)
-            logger.info("✅ Плановая очистка старых данных выполнена")
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.error(f"❌ Ошибка при очистке старых данных: {e}")
-
-# ------------------------------------------------------------
 #  ОБРАБОТЧИКИ КОМАНД
 # ------------------------------------------------------------
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     start_time = time.time()
     user = update.effective_user
@@ -506,6 +399,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("СТАРТ", callback_data="restart")]])
     
+    # ✅ Проверяем что update.message существует перед отправкой фото
     if update.message and os.path.exists('mechel_start.png'):
         try:
             with open('mechel_start.png', 'rb') as photo:
@@ -623,13 +517,12 @@ async def categories_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception:
         pass
     
-    # ✅ ИСПРАВЛЕНО: Проверка search_engine и faq_data
     if search_engine is None:
         await _reply_or_edit(update, "⚠️ Поиск временно не инициализирован.", parse_mode='HTML')
         return
     
     faq_data = search_engine.faq_data
-    if not faq_data:
+    if not faq_
         logger.warning("⚠️ categories_command: faq_data пуст!")
         await _reply_or_edit(update, "⚠️ База вопросов пуста. Попробуйте позже.", parse_mode='HTML')
         return
@@ -637,11 +530,8 @@ async def categories_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     logger.info(f"📂 categories_command: faq_data содержит {len(faq_data)} записей")
     
     categories = {}
-    for item in faq_data:
-        if isinstance(item, dict):
-            cat = item.get('category', 'Без категории')
-        else:
-            cat = getattr(item, 'category', 'Без категории')
+    for item in faq_
+        cat = _get_faq_category(item)
         categories[cat] = categories.get(cat, 0) + 1
     
     if not categories:
@@ -945,7 +835,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if bot_stats:
         await bot_stats.log_message(user.id, user.username or "Unknown", 'search')
     
-    # ✅ ИСПРАВЛЕНО: Проверка search_engine
     if search_engine is None:
         logger.error("❌ handle_message: search_engine = None!")
         await update.message.reply_text(
@@ -957,9 +846,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bot_stats.track_response_time(elapsed)
         return
     
-    # ✅ ИСПРАВЛЕНО: Проверка faq_data с логированием
     faq_data = search_engine.faq_data
-    if not faq_data:
+    if not faq_
         logger.error(f"❌ handle_message: faq_data пуст! search_engine={type(search_engine)}")
         await update.message.reply_text(
             "⚠️ База вопросов пуста. Попробуйте /categories или напишите /feedback.",
@@ -977,24 +865,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if ':' in text:
         parts = text.split(':', 1)
         cat_candidate = parts[0].strip().lower()
-        for item in faq_data:
-            if isinstance(item, dict):
-                cat = item.get('category', '')
-            else:
-                cat = getattr(item, 'category', '')
+        for item in faq_
+            cat = _get_faq_category(item)
             if cat and cat_candidate in cat.lower():
                 category = cat
                 search_text = parts[1].strip()
                 break
     
     try:
+        # ✅ SearchEngine.search() возвращает List[Tuple[int, str, str, float]]
         results = search_engine.search(search_text, category, top_k=3)
         logger.info(f"🔍 Поиск по запросу '{search_text}', категория {category}, найдено {len(results)} результатов")
     except Exception as e:
         logger.error(f"❌ Ошибка поиска: {e}", exc_info=True)
         results = []
     
-    # ✅ ИСПРАВЛЕНО: Обработка пустых результатов
     if not results:
         logger.warning(f"⚠️ Не найдено результатов для '{text}'")
         suggestions = []
@@ -1011,8 +896,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bot_stats.track_response_time(elapsed)
         return
     
-    # ✅ ИСПРАВЛЕНО: Показ результатов с полным текстом
-    for idx, (faq_id, q, a, s) in enumerate(results[:3]):
+    # ✅ results уже содержит кортежи (id, question, answer, score)
+    for idx, (faq_id, q, a, score) in enumerate(results[:3]):
         if not q or not a:
             logger.warning(f"⚠️ Пропущен результат {idx}: вопрос или ответ пустые")
             continue
@@ -1086,7 +971,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     
     if data.startswith('cat_'):
         category_name = data[4:]
-        if search_engine is None or not search_engine.faq_data:
+        if search_engine is None or not search_engine.faq_
             await query.edit_message_text("⚠️ Категории временно недоступны.")
             elapsed = time.time() - start_time
             if bot_stats:
@@ -1095,15 +980,10 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         
         questions = []
         question_ids = []
-        for item in search_engine.faq_data:
-            if isinstance(item, dict):
-                cat = item.get('category', '')
-                q = item.get('question', '')
-                faq_id = item.get('id', 0)
-            else:
-                cat = getattr(item, 'category', '')
-                q = getattr(item, 'question', '')
-                faq_id = getattr(item, 'id', 0)
+        for item in search_engine.faq_
+            cat = _get_faq_category(item)
+            q = _get_faq_question(item)
+            faq_id = _get_faq_id(item)
             if cat == category_name:
                 questions.append(q)
                 question_ids.append(faq_id)
@@ -1135,25 +1015,17 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     if data.startswith('q_'):
         faq_id = int(data[2:])
         found = None
-        # ✅ ИСПРАВЛЕНО: Универсальное получение ID
-        for item in search_engine.faq_data:
-            if isinstance(item, dict):
-                item_id = item.get('id')
-            else:
-                item_id = getattr(item, 'id', None)
+        # ✅ Ищем по ID используя универсальную функцию
+        for item in search_engine.faq_
+            item_id = _get_faq_id(item)
             if item_id == faq_id:
                 found = item
                 break
         
         if found:
-            if isinstance(found, dict):
-                question = found.get('question', '')
-                answer = found.get('answer', '')
-                category = found.get('category', '')
-            else:
-                question = getattr(found, 'question', '')
-                answer = getattr(found, 'answer', '')
-                category = getattr(found, 'category', '')
+            question = _get_faq_question(found)
+            answer = _get_faq_answer(found)
+            category = _get_faq_category(found)
             
             # ✅ ПОКАЗЫВАЕМ ПОЛНЫЙ ВОПРОС И ОТВЕТ
             response = f"❓ <b>{question}</b>\n\n📌 <b>Ответ:</b>\n{answer}\n\n📁 Категория: {category}"
@@ -1260,7 +1132,7 @@ async def setup_bot_background():
         if db_connected:
             try:
                 faq_data = await load_all_faq()
-                if not faq_data:
+                if not faq_
                     logger.warning("⚠️ FAQ из БД пустой. Будет использован резервный набор.")
                     faq_data = FALLBACK_FAQ
                     fallback_mode = True
@@ -1297,22 +1169,19 @@ async def setup_bot_background():
                 fallback_mode = True
                 set_db_available(False)
         
-        if EXIT_ON_DB_FAILURE and fallback_mode and not db_connected:
-            logger.info("ℹ️ EXIT_ON_DB_FAILURE игнорируется — активирован резервный режим работоспособности")
-        
-        # ✅ ИСПРАВЛЕНО: Инициализация поискового движка
+        # ✅ ИНИЦИАЛИЗАЦИЯ ПОИСКОВОГО ДВИЖКА
         try:
-            if EnhancedSearchEngine:
-                ext_engine = EnhancedSearchEngine(max_cache_size=1000, faq_data=faq_data)
-                search_engine = ExternalSearchEngineAdapter(ext_engine)
-            elif ExternalSearchEngine:
-                ext_engine = ExternalSearchEngine(faq_data=faq_data)
-                search_engine = ExternalSearchEngineAdapter(ext_engine)
+            if SEARCH_ENGINE_AVAILABLE and SearchEngine:
+                # ✅ Используем SearchEngine из search_engine.py как основной
+                search_engine = SearchEngine(max_cache_size=1000, faq_data=faq_data)
+                logger.info(f"✅ SearchEngine v5.6 инициализирован: {len(search_engine.faq_data)} записей")
+                logger.info(f"📊 Инвертированный индекс: {len(search_engine._inverted_index)} слов")
+            elif EnhancedSearchEngine:
+                search_engine = EnhancedSearchEngine(max_cache_size=1000, faq_data=faq_data)
+                logger.info("✅ EnhancedSearchEngine инициализирован")
             else:
-                # ✅ Используем встроенный движок с конвертацией данных
                 search_engine = BuiltinSearchEngine(faq_data)
-            logger.info(f"✅ Поисковый движок инициализирован: {type(search_engine)}")
-            logger.info(f"📊 FAQ записей в поиске: {len(search_engine.faq_data)}")
+                logger.info("⚠️ Используется BuiltinSearchEngine (резервный)")
         except Exception as e:
             logger.warning(f"⚠️ Ошибка инициализации поискового движка: {e}, используем встроенный")
             search_engine = BuiltinSearchEngine(faq_data)
@@ -1538,7 +1407,7 @@ async def telegram_webhook():
             logger.warning(f"Неверный секретный токен: {secret_token}")
             return jsonify({'error': 'Invalid secret token'}), 403
         update_data = await request.get_json()
-        if not update_data:
+        if not update_
             return jsonify({'error': 'No data'}), 400
         update = Update.de_json(update_data, application.bot)
         await application.process_update(update)

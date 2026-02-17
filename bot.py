@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram-бот для HR-отдела компании "Мечел"
-Версия 15.5 – исправлены ошибки с FAQEntry, кнопкой СТАРТ и доступом к командам
+Версия 15.6 – исправлен поиск по базе FAQ, добавлено логирование
 """
 import os
 import sys
@@ -45,7 +45,8 @@ from database import (
     cleanup_old_errors,
     cleanup_old_feedback,
     get_total_rows_count,
-    set_db_available
+    set_db_available,
+    is_db_available
 )
 from stats import BotStatistics, generate_excel_report
 from utils import is_greeting, truncate_question, parse_period_argument
@@ -74,7 +75,7 @@ except ImportError:
     async def meme_unsubscribe_command(*args, **kwargs): pass
     def get_meme_handler(): return None
 
-# Поисковый движок
+# Поисковый движок (может быть внешний или встроенный)
 try:
     from search_engine import SearchEngine as ExternalSearchEngine
     from search_engine import EnhancedSearchEngine
@@ -83,7 +84,7 @@ except ImportError:
     EnhancedSearchEngine = None
 
 # ------------------------------------------------------------
-#  РЕЗЕРВНЫЙ FAQ
+#  РЕЗЕРВНЫЙ FAQ (используется при недоступности БД)
 # ------------------------------------------------------------
 FALLBACK_FAQ = [
     {"id": 1, "question": "Как получить справку о заработной плате?", "answer": "Справку можно запросить в отделе кадров (каб. 205) или через корпоративный портал в разделе «Документы».", "category": "Документы"},
@@ -197,11 +198,9 @@ async def _reply_or_edit(update: Update, text: str, parse_mode: str = 'HTML', re
         if update.message:
             return await update.message.reply_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
         elif update.callback_query:
-            # Проверяем есть ли сообщение для редактирования
             if update.callback_query.message and update.callback_query.message.text:
                 await update.callback_query.edit_message_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
             else:
-                # Если сообщения нет или это фото, отправляем новое
                 await update.callback_query.message.reply_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
             return None
         else:
@@ -209,7 +208,6 @@ async def _reply_or_edit(update: Update, text: str, parse_mode: str = 'HTML', re
             return None
     except Exception as e:
         logger.error(f"❌ Ошибка в _reply_or_edit: {e}")
-        # Fallback: пытаемся отправить как новое сообщение
         try:
             if update.callback_query and update.callback_query.message:
                 await update.callback_query.message.reply_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
@@ -263,40 +261,91 @@ def db_required(func):
 # ------------------------------------------------------------
 class BuiltinSearchEngine:
     def __init__(self, faq_data: List[Dict], max_cache_size: int = 500):
-        self.faq_data = faq_data if faq_data is not None else []
+        # ✅ ИСПРАВЛЕНО: Преобразуем все элементы в dict
+        self.faq_data = []
+        if faq_data:
+            for item in faq_data:
+                if isinstance(item, dict):
+                    self.faq_data.append(item)
+                else:
+                    # Конвертируем объект в dict
+                    self.faq_data.append({
+                        'id': getattr(item, 'id', None),
+                        'question': getattr(item, 'question', ''),
+                        'answer': getattr(item, 'answer', ''),
+                        'category': getattr(item, 'category', ''),
+                        'keywords': getattr(item, 'keywords', ''),
+                        'priority': getattr(item, 'priority', 0)
+                    })
         self.cache = {}
         self.suggest_cache = {}
         self.suggest_cache_ttl = timedelta(minutes=30)
         self.max_cache_size = max_cache_size
         logger.info(f"✅ Встроенный поиск инициализирован с {len(self.faq_data)} записями")
+        
+        # ✅ ЛОГИРОВАНИЕ: Выводим первые 3 вопроса для проверки
+        if self.faq_data:
+            logger.info(f"📋 Примеры вопросов: {[item.get('question', '')[:50] for item in self.faq_data[:3]]}")
 
     def refresh_data(self, new_faq_data: List[Dict]):
-        self.faq_data = new_faq_data if new_faq_data is not None else []
+        self.faq_data = []
+        if new_faq_data:
+            for item in new_faq_data:
+                if isinstance(item, dict):
+                    self.faq_data.append(item)
+                else:
+                    self.faq_data.append({
+                        'id': getattr(item, 'id', None),
+                        'question': getattr(item, 'question', ''),
+                        'answer': getattr(item, 'answer', ''),
+                        'category': getattr(item, 'category', ''),
+                        'keywords': getattr(item, 'keywords', ''),
+                        'priority': getattr(item, 'priority', 0)
+                    })
         self.cache.clear()
         self.suggest_cache.clear()
         logger.info(f"🔄 Данные встроенного поиска обновлены, теперь {len(self.faq_data)} записей")
 
     def search(self, query: str, category: str = None, top_k: int = 5) -> List[Tuple[int, str, str, float]]:
         if not query or not self.faq_data:
+            logger.warning(f"⚠️ Поиск: query={bool(query)}, faq_data={len(self.faq_data) if self.faq_data else 0}")
             return []
+        
         query_lower = query.lower()
         results = []
+        
         for item in self.faq_data:
-            if category and self._get_category(item) != category:
+            # ✅ ИСПРАВЛЕНО: Используем .get() только для dict
+            if not isinstance(item, dict):
                 continue
-            question = self._get_question(item)
-            answer = self._get_answer(item)
-            faq_id = self._get_id(item)
+                
+            if category and item.get('category') != category:
+                continue
+            
+            question = item.get('question', '')
+            answer = item.get('answer', '')
+            faq_id = item.get('id')
+            
             if not question or not answer or faq_id is None:
                 continue
+            
             score = 0
             if query_lower in question.lower():
                 score += 2
             if query_lower in answer.lower():
                 score += 1
+            
+            # ✅ ИСПРАВЛЕНО: Проверка ключевых слов
+            keywords = item.get('keywords', '')
+            if keywords and query_lower in keywords.lower():
+                score += 1
+            
             if score > 0:
                 results.append((faq_id, question, answer, score))
+                logger.debug(f"🔍 Найдено совпадение: {question[:50]} (score={score})")
+        
         results.sort(key=lambda x: x[3], reverse=True)
+        logger.info(f"🔍 Поиск по '{query}': найдено {len(results)} результатов")
         return results[:top_k]
 
     def suggest_correction(self, query: str, top_k: int = 3) -> List[str]:
@@ -311,7 +360,7 @@ class BuiltinSearchEngine:
         query_lower = query.lower()
         suggestions = set()
         for item in self.faq_data:
-            question = self._get_question(item)
+            question = item.get('question', '')
             if not question:
                 continue
             if levenshtein_distance(query_lower, question.lower()) <= 3:
@@ -321,27 +370,6 @@ class BuiltinSearchEngine:
         result = list(suggestions)[:top_k]
         self.suggest_cache[cache_key] = (datetime.now(), result)
         return result
-
-    # ✅ ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ для работы с dict и объектами
-    def _get_id(self, item):
-        if isinstance(item, dict):
-            return item.get('id')
-        return getattr(item, 'id', None)
-
-    def _get_question(self, item):
-        if isinstance(item, dict):
-            return item.get('question', '')
-        return getattr(item, 'question', '')
-
-    def _get_answer(self, item):
-        if isinstance(item, dict):
-            return item.get('answer', '')
-        return getattr(item, 'answer', '')
-
-    def _get_category(self, item):
-        if isinstance(item, dict):
-            return item.get('category', '')
-        return getattr(item, 'category', '')
 
 class ExternalSearchEngineAdapter:
     def __init__(self, engine):
@@ -403,7 +431,16 @@ class ExternalSearchEngineAdapter:
     @property
     def faq_data(self):
         if hasattr(self.engine, 'faq_data'):
-            return self.engine.faq_data
+            data = self.engine.faq_data
+            # ✅ ИСПРАВЛЕНО: Конвертируем в dict если нужно
+            if data and not isinstance(data[0], dict):
+                return [{
+                    'id': getattr(item, 'id', None),
+                    'question': getattr(item, 'question', ''),
+                    'answer': getattr(item, 'answer', ''),
+                    'category': getattr(item, 'category', '')
+                } for item in data]
+            return data
         return []
 
 def levenshtein_distance(s1: str, s2: str) -> int:
@@ -442,7 +479,6 @@ async def periodic_cleanup_tasks():
 #  ОБРАБОТЧИКИ КОМАНД
 # ------------------------------------------------------------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """✅ ИСПРАВЛЕНО: Корректная обработка для message и callback_query"""
     start_time = time.time()
     user = update.effective_user
     
@@ -470,7 +506,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("СТАРТ", callback_data="restart")]])
     
-    # ✅ ИСПРАВЛЕНО: Проверяем что update.message существует перед отправкой фото
     if update.message and os.path.exists('mechel_start.png'):
         try:
             with open('mechel_start.png', 'rb') as photo:
@@ -487,7 +522,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Ошибка отправки приветственного фото: {e}")
     
-    # ✅ ИСПРАВЛЕНО: Используем _reply_or_edit вместо прямого вызова
     await _reply_or_edit(update, text, parse_mode='HTML', reply_markup=keyboard)
     elapsed = time.time() - start_time
     if bot_stats:
@@ -510,15 +544,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @db_required
 async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """✅ ИСПРАВЛЕНО: Только для админов"""
     start_time = time.time()
     user = update.effective_user
-    
-    # ✅ ПРОВЕРКА: Только админы могут подписываться
     if user.id not in ADMIN_IDS:
         await _reply_or_edit(update, "⛔ Эта команда доступна только администраторам.", parse_mode='HTML')
         return
-    
     await add_subscriber(user.id)
     user_subscribed_cache[user.id] = True
     if bot_stats:
@@ -531,15 +561,11 @@ async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @db_required
 async def unsubscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """✅ ИСПРАВЛЕНО: Только для админов"""
     start_time = time.time()
     user = update.effective_user
-    
-    # ✅ ПРОВЕРКА: Только админы могут отписываться
     if user.id not in ADMIN_IDS:
         await _reply_or_edit(update, "⛔ Эта команда доступна только администраторам.", parse_mode='HTML')
         return
-    
     await remove_subscriber(user.id)
     user_subscribed_cache.pop(user.id, None)
     if bot_stats:
@@ -596,16 +622,32 @@ async def categories_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await bot_stats.log_message(user.id, user.username or "Unknown", 'command', '/categories')
     except Exception:
         pass
-    if search_engine is None or not search_engine.faq_data:
-        await _reply_or_edit(update, "⚠️ Категории временно недоступны.", parse_mode='HTML')
+    
+    # ✅ ИСПРАВЛЕНО: Проверка search_engine и faq_data
+    if search_engine is None:
+        await _reply_or_edit(update, "⚠️ Поиск временно не инициализирован.", parse_mode='HTML')
         return
+    
+    faq_data = search_engine.faq_data
+    if not faq_data:
+        logger.warning("⚠️ categories_command: faq_data пуст!")
+        await _reply_or_edit(update, "⚠️ База вопросов пуста. Попробуйте позже.", parse_mode='HTML')
+        return
+    
+    logger.info(f"📂 categories_command: faq_data содержит {len(faq_data)} записей")
+    
     categories = {}
-    for item in search_engine.faq_data:
-        cat = _get_item_category(item)
+    for item in faq_data:
+        if isinstance(item, dict):
+            cat = item.get('category', 'Без категории')
+        else:
+            cat = getattr(item, 'category', 'Без категории')
         categories[cat] = categories.get(cat, 0) + 1
+    
     if not categories:
         await _reply_or_edit(update, "📂 Категории не найдены.", parse_mode='HTML')
         return
+    
     keyboard = []
     for cat in sorted(categories.keys()):
         count = categories[cat]
@@ -856,42 +898,20 @@ async def cleanup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bot_stats.track_response_time(elapsed)
 
 # ------------------------------------------------------------
-#  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ РАБОТЫ С FAQ
-# ------------------------------------------------------------
-def _get_item_id(item):
-    """✅ ИСПРАВЛЕНО: Универсальное получение ID из dict или объекта"""
-    if isinstance(item, dict):
-        return item.get('id')
-    return getattr(item, 'id', None)
-
-def _get_item_question(item):
-    if isinstance(item, dict):
-        return item.get('question', '')
-    return getattr(item, 'question', '')
-
-def _get_item_answer(item):
-    if isinstance(item, dict):
-        return item.get('answer', '')
-    return getattr(item, 'answer', '')
-
-def _get_item_category(item):
-    if isinstance(item, dict):
-        return item.get('category', 'Без категории')
-    return getattr(item, 'category', 'Без категории')
-
-# ------------------------------------------------------------
 #  ОБРАБОТЧИК ТЕКСТОВЫХ СООБЩЕНИЙ
 # ------------------------------------------------------------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     start_time = time.time()
     user = update.effective_user
     text = update.message.text.strip()
+    
     try:
         await ensure_subscribed_cached(user.id)
         if bot_stats:
             await bot_stats.log_message(user.id, user.username or "Unknown", 'message')
     except Exception:
         pass
+    
     if context.user_data.get('awaiting_feedback'):
         if fallback_mode:
             await _reply_or_edit(update, "⚠️ Функция обратной связи временно недоступна.", parse_mode='HTML')
@@ -905,6 +925,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if bot_stats:
             bot_stats.track_response_time(elapsed)
         return
+    
     if is_greeting(text):
         logger.info(f"Приветствие от {user.id}: '{text}'")
         greeting_text = await get_message('greeting_response')
@@ -913,40 +934,69 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if bot_stats:
             bot_stats.track_response_time(elapsed)
         return
+    
     if text.lower() in ['статистика', 'stats'] and user.id in ADMIN_IDS:
         await stats_command(update, context)
         elapsed = time.time() - start_time
         if bot_stats:
             bot_stats.track_response_time(elapsed)
         return
+    
     if bot_stats:
         await bot_stats.log_message(user.id, user.username or "Unknown", 'search')
+    
+    # ✅ ИСПРАВЛЕНО: Проверка search_engine
     if search_engine is None:
-        await update.message.reply_text("⚠️ Поиск временно недоступен. Попробуйте позже или используйте /feedback /предложения.", parse_mode='HTML')
+        logger.error("❌ handle_message: search_engine = None!")
+        await update.message.reply_text(
+            "⚠️ Поиск временно недоступен. Попробуйте позже или используйте /feedback.",
+            parse_mode='HTML'
+        )
         elapsed = time.time() - start_time
         if bot_stats:
             bot_stats.track_response_time(elapsed)
         return
+    
+    # ✅ ИСПРАВЛЕНО: Проверка faq_data с логированием
+    faq_data = search_engine.faq_data
+    if not faq_data:
+        logger.error(f"❌ handle_message: faq_data пуст! search_engine={type(search_engine)}")
+        await update.message.reply_text(
+            "⚠️ База вопросов пуста. Попробуйте /categories или напишите /feedback.",
+            parse_mode='HTML'
+        )
+        elapsed = time.time() - start_time
+        if bot_stats:
+            bot_stats.track_response_time(elapsed)
+        return
+    
+    logger.info(f"🔍 Поиск: user={user.id}, query='{text}', faq_count={len(faq_data)}")
+    
     category = None
     search_text = text
     if ':' in text:
         parts = text.split(':', 1)
         cat_candidate = parts[0].strip().lower()
-        for item in search_engine.faq_data:
-            cat = _get_item_category(item)
+        for item in faq_data:
+            if isinstance(item, dict):
+                cat = item.get('category', '')
+            else:
+                cat = getattr(item, 'category', '')
             if cat and cat_candidate in cat.lower():
                 category = cat
                 search_text = parts[1].strip()
                 break
+    
     try:
         results = search_engine.search(search_text, category, top_k=3)
-        logger.info(f"Поиск по запросу '{search_text}', категория {category}, найдено {len(results)} результатов")
+        logger.info(f"🔍 Поиск по запросу '{search_text}', категория {category}, найдено {len(results)} результатов")
     except Exception as e:
         logger.error(f"❌ Ошибка поиска: {e}", exc_info=True)
         results = []
     
-    # ✅ ИСПРАВЛЕНО: Проверка на пустые результаты
+    # ✅ ИСПРАВЛЕНО: Обработка пустых результатов
     if not results:
+        logger.warning(f"⚠️ Не найдено результатов для '{text}'")
         suggestions = []
         if hasattr(search_engine, 'suggest_correction'):
             suggestions = search_engine.suggest_correction(search_text, top_k=3)
@@ -961,17 +1011,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bot_stats.track_response_time(elapsed)
         return
     
+    # ✅ ИСПРАВЛЕНО: Показ результатов с полным текстом
     for idx, (faq_id, q, a, s) in enumerate(results[:3]):
-        # ✅ ИСПРАВЛЕНО: Проверка что вопрос и ответ не пустые
         if not q or not a:
+            logger.warning(f"⚠️ Пропущен результат {idx}: вопрос или ответ пустые")
             continue
-        response = f"📌 <b>Результат {idx+1}:</b>\n• <b>{q}</b>\n{a[:200]}..."
+        # ✅ ПОКАЗЫВАЕМ ПОЛНЫЙ ОТВЕТ (не обрезаем)
+        response = f"📌 <b>Результат {idx+1}:</b>\n• <b>{q}</b>\n\n{a}"
         keyboard = [
             [InlineKeyboardButton("👍 Помог", callback_data=f"rate_{faq_id}_1"),
              InlineKeyboardButton("👎 Нет", callback_data=f"rate_{faq_id}_0")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text(response, parse_mode='HTML', reply_markup=reply_markup)
+    
     await update.message.reply_text("🔍 /categories — все темы")
     elapsed = time.time() - start_time
     if bot_stats:
@@ -1039,21 +1092,29 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             if bot_stats:
                 bot_stats.track_response_time(elapsed)
             return
+        
         questions = []
         question_ids = []
         for item in search_engine.faq_data:
-            cat = _get_item_category(item)
-            q = _get_item_question(item)
-            faq_id = _get_item_id(item)
+            if isinstance(item, dict):
+                cat = item.get('category', '')
+                q = item.get('question', '')
+                faq_id = item.get('id', 0)
+            else:
+                cat = getattr(item, 'category', '')
+                q = getattr(item, 'question', '')
+                faq_id = getattr(item, 'id', 0)
             if cat == category_name:
                 questions.append(q)
                 question_ids.append(faq_id)
+        
         if not questions:
             await query.edit_message_text(f"❓ В категории {category_name} нет вопросов.")
             elapsed = time.time() - start_time
             if bot_stats:
                 bot_stats.track_response_time(elapsed)
             return
+        
         keyboard = []
         for qid, q in zip(question_ids, questions[:20]):
             short_q = truncate_question(q, 50)
@@ -1076,15 +1137,25 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         found = None
         # ✅ ИСПРАВЛЕНО: Универсальное получение ID
         for item in search_engine.faq_data:
-            item_id = _get_item_id(item)
+            if isinstance(item, dict):
+                item_id = item.get('id')
+            else:
+                item_id = getattr(item, 'id', None)
             if item_id == faq_id:
                 found = item
                 break
+        
         if found:
-            question = _get_item_question(found)
-            answer = _get_item_answer(found)
-            category = _get_item_category(found)
-            # ✅ ИСПРАВЛЕНО: Показываем полный вопрос и ответ
+            if isinstance(found, dict):
+                question = found.get('question', '')
+                answer = found.get('answer', '')
+                category = found.get('category', '')
+            else:
+                question = getattr(found, 'question', '')
+                answer = getattr(found, 'answer', '')
+                category = getattr(found, 'category', '')
+            
+            # ✅ ПОКАЗЫВАЕМ ПОЛНЫЙ ВОПРОС И ОТВЕТ
             response = f"❓ <b>{question}</b>\n\n📌 <b>Ответ:</b>\n{answer}\n\n📁 Категория: {category}"
             keyboard = [[InlineKeyboardButton("◀ Назад к категории", callback_data=f"cat_{category}")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1156,6 +1227,7 @@ async def setup_bot_background():
         _bot_initializing = True
         logger.info("🔄 Ожидание стабилизации сети (5 сек)...")
         await asyncio.sleep(5.0)
+        
         db_connected = False
         for attempt in range(20):
             try:
@@ -1175,12 +1247,15 @@ async def setup_bot_background():
                     wait = min(20.0, 0.5 * (2 ** attempt))
                     logger.warning(f"⏳ Повтор через {wait:.1f}с...")
                     await asyncio.sleep(wait)
+        
         if RENDER and EXIT_ON_DB_FAILURE and not db_connected:
             logger.critical("❌ БД недоступна на Render, EXIT_ON_DB_FAILURE=true. Завершение для перезапуска.")
             sys.exit(1)
+        
         fallback_mode = not db_connected
         set_db_available(not fallback_mode)
         logger.info(f"🔄 Синхронизация с database.py: fallback_mode={fallback_mode}")
+        
         faq_data = []
         if db_connected:
             try:
@@ -1221,8 +1296,11 @@ async def setup_bot_background():
                 logger.info(f"✅ Загружено {len(faq_data)} записей из бэкапа, но БД недоступна.")
                 fallback_mode = True
                 set_db_available(False)
+        
         if EXIT_ON_DB_FAILURE and fallback_mode and not db_connected:
             logger.info("ℹ️ EXIT_ON_DB_FAILURE игнорируется — активирован резервный режим работоспособности")
+        
+        # ✅ ИСПРАВЛЕНО: Инициализация поискового движка
         try:
             if EnhancedSearchEngine:
                 ext_engine = EnhancedSearchEngine(max_cache_size=1000, faq_data=faq_data)
@@ -1231,18 +1309,24 @@ async def setup_bot_background():
                 ext_engine = ExternalSearchEngine(faq_data=faq_data)
                 search_engine = ExternalSearchEngineAdapter(ext_engine)
             else:
+                # ✅ Используем встроенный движок с конвертацией данных
                 search_engine = BuiltinSearchEngine(faq_data)
-            logger.info("✅ Поисковый движок инициализирован")
+            logger.info(f"✅ Поисковый движок инициализирован: {type(search_engine)}")
+            logger.info(f"📊 FAQ записей в поиске: {len(search_engine.faq_data)}")
         except Exception as e:
             logger.warning(f"⚠️ Ошибка инициализации поискового движка: {e}, используем встроенный")
             search_engine = BuiltinSearchEngine(faq_data)
+        
         bot_stats = BotStatistics()
         logger.info("✅ Модуль статистики инициализирован")
+        
         builder = ApplicationBuilder().token(BOT_TOKEN).post_init(lambda app: logger.info("✅ Приложение Telegram готово"))
         application = builder.build()
+        
         if MEME_MODULE_AVAILABLE:
             await init_meme_handler(application.job_queue, admin_ids=ADMIN_IDS)
             logger.info("✅ Модуль мемов инициализирован")
+        
         # --- Регистрация обработчиков команд ---
         application.add_handler(CommandHandler("start", start_command))
         application.add_handler(CommandHandler("help", help_command))
@@ -1264,6 +1348,7 @@ async def setup_bot_background():
             application.add_handler(CommandHandler("mem", meme_command))
             application.add_handler(CommandHandler("memsub", meme_subscribe_command))
             application.add_handler(CommandHandler("memunsub", meme_unsubscribe_command))
+        
         # --- Русские команды через MessageHandler ---
         async def russian_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = update.message.text.lower().strip()
@@ -1304,6 +1389,7 @@ async def setup_bot_background():
                 await admin_panel(update, context)
             elif text.startswith('/статус'):
                 await status_command(update, context)
+        
         application.add_handler(MessageHandler(
             filters.Regex(r'^/(старт|помощь|категории|предложения|отзывы|статистика|экспорт|подписаться|отписаться|рассылка|сохранить|мем|мемподписка|мемотписка|что_могу|админ|статус)'),
             russian_command_handler
@@ -1311,6 +1397,7 @@ async def setup_bot_background():
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         application.add_handler(CallbackQueryHandler(handle_callback_query))
         application.add_error_handler(error_handler)
+        
         # --- Регистрация веб-маршрутов ---
         if not _routes_registered:
             register_web_routes(
@@ -1333,13 +1420,16 @@ async def setup_bot_background():
             )
             _routes_registered = True
             logger.info("✅ Веб-маршруты зарегистрированы")
+        
         await application.initialize()
         await application.start()
+        
         if db_connected:
             asyncio.create_task(periodic_cleanup_tasks())
             logger.info("✅ Запущена периодическая очистка старых данных")
         else:
             logger.warning("⏸️ Периодическая очистка отключена (режим резервной работоспособности)")
+        
         if fallback_mode and ADMIN_IDS:
             for aid in ADMIN_IDS:
                 try:
@@ -1351,6 +1441,7 @@ async def setup_bot_background():
                     )
                 except Exception as e:
                     logger.error(f"Не удалось отправить уведомление админу {aid}: {e}")
+        
         if RENDER:
             webhook_url = WEBHOOK_URL + WEBHOOK_PATH
             logger.info(f"🔄 Установка вебхука на {webhook_url} (режим: {'полный' if db_connected else 'резервный'})...")
@@ -1375,6 +1466,7 @@ async def setup_bot_background():
         else:
             await application.bot.delete_webhook(drop_pending_updates=True)
             logger.info("✅ Режим поллинга")
+        
         _bot_initialized = True
         _bot_initializing = False
         logger.info("✅✅✅ Бот полностью инициализирован и готов к работе ✅✅✅")

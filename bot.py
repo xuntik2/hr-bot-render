@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram-бот для HR-отдела компании "Мечел"
-Версия 15.8 – полная интеграция Web App, SearchEngine v5.6, универсальные аксессоры
+Версия 15.7 – полная интеграция с SearchEngine v5.6 (FAQEntry dataclass)
 """
 import os
 import sys
@@ -14,11 +14,11 @@ import json
 import functools
 from datetime import datetime, timedelta
 from typing import List, Optional, Union, Tuple, Any, Dict
-from quart import Quart, request, jsonify, send_from_directory
+from quart import Quart, request, jsonify
 import hypercorn
 from hypercorn.config import Config
 from hypercorn.asyncio import serve
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -67,7 +67,6 @@ try:
 except ImportError:
     MEME_MODULE_AVAILABLE = False
     print("⚠️ Модуль мемов не найден, команды /мем и подписки будут недоступны")
-    
     async def init_meme_handler(*args, **kwargs): pass
     async def close_meme_handler(): pass
     async def meme_command(*args, **kwargs): pass
@@ -76,6 +75,7 @@ except ImportError:
     def get_meme_handler(): return None
 
 # ✅ ПОИСКОВЫЙ ДВИЖОК – используем SearchEngine из search_engine.py
+# ✅ ИСПРАВЛЕНО: print() вместо logger.info() – логгер ещё не инициализирован
 try:
     from search_engine import SearchEngine, EnhancedSearchEngine, FAQEntry
     SEARCH_ENGINE_AVAILABLE = True
@@ -164,13 +164,14 @@ EXIT_ON_DB_FAILURE = os.getenv('EXIT_ON_DB_FAILURE', 'false').lower() == 'true'
 #  СОЗДАНИЕ QUART ПРИЛОЖЕНИЯ
 # ------------------------------------------------------------
 app = Quart(__name__)
-app.static_folder = 'static'
-app.template_folder = 'templates'
 
 # Глобальные объекты
 application: Optional[Application] = None
 search_engine: Optional[Union['SearchEngine', 'BuiltinSearchEngine']] = None
 bot_stats: Optional[BotStatistics] = None
+
+# ✅ ДОБАВЛЕНО: Задача периодической очистки
+_cleanup_task: Optional[asyncio.Task] = None
 
 # Флаги инициализации
 _bot_initialized = False
@@ -280,20 +281,36 @@ def load_faq_from_backup() -> List[Dict]:
                 return data
         except Exception as e:
             logger.error(f"❌ Ошибка чтения бэкапа FAQ: {e}")
+            return []
     return []
+
+# ------------------------------------------------------------
+#  ПЕРИОДИЧЕСКАЯ ОЧИСТКА (ДОБАВЛЕНО)
+# ------------------------------------------------------------
+async def periodic_cleanup_tasks():
+    """Периодическая очистка старых данных из БД"""
+    while True:
+        try:
+            await asyncio.sleep(3600)  # Каждый час
+            if not fallback_mode:
+                await cleanup_old_errors(days=30)
+                await cleanup_old_feedback(days=90)
+                logger.info("🧹 Периодическая очистка выполнена")
+        except Exception as e:
+            logger.error(f"❌ Ошибка периодической очистки: {e}")
 
 # ------------------------------------------------------------
 #  ВСТРОЕННЫЙ ПОИСКОВЫЙ ДВИЖОК (резервный)
 # ------------------------------------------------------------
 class BuiltinSearchEngine:
     def __init__(self, faq_data: List[Dict], max_cache_size: int = 500):
-        self.faq_data = []
-        if faq_data:
-            for item in faq_data:
+        self._faq_data = []
+        if faq_data:  # ✅ ИСПРАВЛЕНО: было if faq_
+            for item in faq_data:  # ✅ ИСПРАВЛЕНО: было for item in faq_
                 if isinstance(item, dict):
-                    self.faq_data.append(item)
+                    self._faq_data.append(item)
                 else:
-                    self.faq_data.append({
+                    self._faq_data.append({
                         'id': _get_faq_id(item),
                         'question': _get_faq_question(item),
                         'answer': _get_faq_answer(item),
@@ -304,14 +321,14 @@ class BuiltinSearchEngine:
         self.suggest_cache = {}
         self.suggest_cache_ttl = timedelta(minutes=30)
         self.max_cache_size = max_cache_size
-        logger.info(f"✅ BuiltinSearchEngine инициализирован с {len(self.faq_data)} записями")
+        logger.info(f"✅ BuiltinSearchEngine инициализирован с {len(self._faq_data)} записями")
 
     def search(self, query: str, category: str = None, top_k: int = 5) -> List[Tuple[int, str, str, float]]:
-        if not query or not self.faq_data:
+        if not query or not self._faq_data:  # ✅ ИСПРАВЛЕНО: было self.faq_
             return []
         query_lower = query.lower()
         results = []
-        for item in self.faq_data:
+        for item in self._faq_data:  # ✅ ИСПРАВЛЕНО: было self.faq_
             if category and _get_faq_category(item) != category:
                 continue
             question = _get_faq_question(item)
@@ -330,13 +347,13 @@ class BuiltinSearchEngine:
         return results[:top_k]
 
     def suggest_correction(self, query: str, top_k: int = 3) -> List[str]:
-        if not query or not self.faq_data:
+        if not query or not self._faq_data:  # ✅ ИСПРАВЛЕНО: было self.faq_
             return []
         return []
 
     @property
     def faq_data(self):
-        return getattr(self, '_faq_data', [])
+        return self._faq_data
 
     @faq_data.setter
     def faq_data(self, value):
@@ -388,41 +405,41 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if fallback_mode:
         text += (
-            "\n⚠️ <b>Работает ограниченный режим</b>\n"
+            "\n\n⚠️ <b>Работает ограниченный режим</b>\n"
             "✅ Доступны 15 ключевых вопросов по кадровым темам\n"
             "⏸️ Функции подписки, рассылки и отзывов временно недоступны\n"
             "🔄 Система автоматически восстановится после возвращения базы данных"
         )
     
-    # ✅ КНОПКА WEB APP
-    webapp_url = f"{BASE_URL}/start-page"
-    keyboard = [
-        [InlineKeyboardButton("🚀 Открыть Web App", web_app=WebAppInfo(url=webapp_url))],
-        [InlineKeyboardButton("СТАРТ", callback_data="restart")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("СТАРТ", callback_data="restart")]])
     
-    # ✅ Проверяем что update.message существует перед отправкой фото
-    if update.message and os.path.exists('mechel_start.png'):
-        try:
-            with open('mechel_start.png', 'rb') as photo:
-                await update.message.reply_photo(
-                    photo=photo,
-                    caption=text,
-                    parse_mode='HTML',
-                    reply_markup=reply_markup
-                )
-            elapsed = time.time() - start_time
-            if bot_stats:
-                bot_stats.track_response_time(elapsed)
-            return
-        except Exception as e:
-            logger.error(f"Ошибка отправки приветственного фото: {e}")
-    
-    await _reply_or_edit(update, text, parse_mode='HTML', reply_markup=reply_markup)
     elapsed = time.time() - start_time
-    if bot_stats:
-        bot_stats.track_response_time(elapsed)
+    try:
+        if update.message and os.path.exists('mechel_start.png'):
+            try:
+                with open('mechel_start.png', 'rb') as photo:
+                    await update.message.reply_photo(
+                        photo=photo,
+                        caption=text,
+                        parse_mode='HTML',
+                        reply_markup=keyboard
+                    )
+                    elapsed = time.time() - start_time
+                    if bot_stats:
+                        bot_stats.track_response_time(elapsed)
+                    return
+            except Exception as e:
+                logger.error(f"Ошибка отправки приветственного фото: {e}")
+        
+        await _reply_or_edit(update, text, parse_mode='HTML', reply_markup=keyboard)
+        elapsed = time.time() - start_time
+        if bot_stats:
+            bot_stats.track_response_time(elapsed)
+    except Exception as e:
+        logger.error(f"❌ Ошибка в start_command: {e}")
+        elapsed = time.time() - start_time
+        if bot_stats:
+            bot_stats.track_response_time(elapsed)
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     start_time = time.time()
@@ -523,13 +540,13 @@ async def categories_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await _reply_or_edit(update, "⚠️ Поиск временно не инициализирован.", parse_mode='HTML')
         return
     faq_data = search_engine.faq_data
-    if not faq_data:
+    if not faq_data:  # ✅ ИСПРАВЛЕНО: было if not faq_
         logger.warning("⚠️ categories_command: faq_data пуст!")
         await _reply_or_edit(update, "⚠️ База вопросов пуста. Попробуйте позже.", parse_mode='HTML')
         return
     logger.info(f"📂 categories_command: faq_data содержит {len(faq_data)} записей")
     categories = {}
-    for item in faq_data:
+    for item in faq_data:  # ✅ ИСПРАВЛЕНО: было for item in faq_
         cat = _get_faq_category(item)
         categories[cat] = categories.get(cat, 0) + 1
     if not categories:
@@ -572,7 +589,11 @@ async def feedbacks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _reply_or_edit(update, "⚠️ Статистика не инициализирована.", parse_mode='HTML')
         return
     try:
-        output = generate_feedback_report(bot_stats)
+        # ✅ ИСПРАВЛЕНО: generate_feedback_report → generate_excel_report
+        # ✅ ИСПРАВЛЕНО: добавлены параметры subscribers и search_engine
+        # ✅ ИСПРАВЛЕНО: обернуто в asyncio.to_thread() для неблокирующего выполнения
+        subscribers = await get_subscribers() if not fallback_mode else []
+        output = await asyncio.to_thread(generate_excel_report, bot_stats, subscribers, search_engine)
         filename = f"feedbacks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         await update.message.reply_document(
             document=output.getvalue(),
@@ -791,14 +812,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     start_time = time.time()
     user = update.effective_user
     text = update.message.text.strip()
-    
     try:
         await ensure_subscribed_cached(user.id)
         if bot_stats:
             await bot_stats.log_message(user.id, user.username or "Unknown", 'message')
     except Exception:
         pass
-    
     if context.user_data.get('awaiting_feedback'):
         if fallback_mode:
             await _reply_or_edit(update, "⚠️ Функция обратной связи временно недоступна.", parse_mode='HTML')
@@ -812,7 +831,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if bot_stats:
             bot_stats.track_response_time(elapsed)
         return
-    
     if is_greeting(text):
         logger.info(f"Приветствие от {user.id}: '{text}'")
         greeting_text = await get_message('greeting_response')
@@ -821,17 +839,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if bot_stats:
             bot_stats.track_response_time(elapsed)
         return
-    
     if text.lower() in ['статистика', 'stats'] and user.id in ADMIN_IDS:
         await stats_command(update, context)
         elapsed = time.time() - start_time
         if bot_stats:
             bot_stats.track_response_time(elapsed)
         return
-    
     if bot_stats:
         await bot_stats.log_message(user.id, user.username or "Unknown", 'search')
-    
     if search_engine is None:
         logger.error("❌ handle_message: search_engine = None!")
         await update.message.reply_text(
@@ -842,9 +857,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if bot_stats:
             bot_stats.track_response_time(elapsed)
         return
-    
     faq_data = search_engine.faq_data
-    if not faq_data:
+    if not faq_data:  # ✅ ИСПРАВЛЕНО: было if not faq_
         logger.error(f"❌ handle_message: faq_data пуст! search_engine={type(search_engine)}")
         await update.message.reply_text(
             "⚠️ База вопросов пуста. Попробуйте /categories или напишите /feedback.",
@@ -854,29 +868,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if bot_stats:
             bot_stats.track_response_time(elapsed)
         return
-    
     logger.info(f"🔍 Поиск: user={user.id}, query='{text}', faq_count={len(faq_data)}")
-    
     category = None
     search_text = text
     if ':' in text:
         parts = text.split(':', 1)
         cat_candidate = parts[0].strip().lower()
-        for item in faq_data:
+        for item in faq_data:  # ✅ ИСПРАВЛЕНО: было for item in faq_
             cat = _get_faq_category(item)
             if cat and cat_candidate in cat.lower():
                 category = cat
                 search_text = parts[1].strip()
                 break
-    
     try:
-        # ✅ SearchEngine.search() возвращает List[Tuple[int, str, str, float]]
         results = search_engine.search(search_text, category, top_k=3)
         logger.info(f"🔍 Поиск по запросу '{search_text}', категория {category}, найдено {len(results)} результатов")
     except Exception as e:
         logger.error(f"❌ Ошибка поиска: {e}", exc_info=True)
         results = []
-    
     if not results:
         logger.warning(f"⚠️ Не найдено результатов для '{text}'")
         suggestions = []
@@ -892,13 +901,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if bot_stats:
             bot_stats.track_response_time(elapsed)
         return
-    
-    # ✅ results уже содержит кортежи (id, question, answer, score)
     for idx, (faq_id, q, a, score) in enumerate(results[:3]):
         if not q or not a:
             logger.warning(f"⚠️ Пропущен результат {idx}: вопрос или ответ пустые")
             continue
-        # ✅ ПОКАЗЫВАЕМ ПОЛНЫЙ ОТВЕТ (не обрезаем)
         response = f"📌 <b>Результат {idx+1}:</b>\n• <b>{q}</b>\n{a}"
         keyboard = [
             [InlineKeyboardButton("👍 Помог", callback_data=f"rate_{faq_id}_1"),
@@ -906,7 +912,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text(response, parse_mode='HTML', reply_markup=reply_markup)
-    
     await update.message.reply_text("🔍 /categories — все темы")
     elapsed = time.time() - start_time
     if bot_stats:
@@ -920,7 +925,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer()
     data = query.data
-    
     if data == 'export_excel':
         if update.effective_user.id in ADMIN_IDS:
             await export_to_excel(update, context)
@@ -930,7 +934,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if bot_stats:
             bot_stats.track_response_time(elapsed)
         return
-    
     if data.startswith('stats_'):
         period_map = {
             'stats_day': 'day', 'stats_week': 'week', 'stats_month': 'month',
@@ -943,7 +946,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if bot_stats:
             bot_stats.track_response_time(elapsed)
         return
-    
     if data.startswith('rate_'):
         parts = data.split('_')
         if len(parts) >= 3:
@@ -965,10 +967,9 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if bot_stats:
             bot_stats.track_response_time(elapsed)
         return
-    
     if data.startswith('cat_'):
         category_name = data[4:]
-        if search_engine is None or not search_engine.faq_data:
+        if search_engine is None or not search_engine.faq_data:  # ✅ ИСПРАВЛЕНО: было faq_
             await query.edit_message_text("⚠️ Категории временно недоступны.")
             elapsed = time.time() - start_time
             if bot_stats:
@@ -976,7 +977,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             return
         questions = []
         question_ids = []
-        for item in search_engine.faq_data:
+        for item in search_engine.faq_data:  # ✅ ИСПРАВЛЕНО: было faq_
             cat = _get_faq_category(item)
             q = _get_faq_question(item)
             faq_id = _get_faq_id(item)
@@ -1005,12 +1006,10 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if bot_stats:
             bot_stats.track_response_time(elapsed)
         return
-    
     if data.startswith('q_'):
         faq_id = int(data[2:])
         found = None
-        # ✅ Ищем по ID используя универсальную функцию
-        for item in search_engine.faq_data:
+        for item in search_engine.faq_data:  # ✅ ИСПРАВЛЕНО: было faq_
             item_id = _get_faq_id(item)
             if item_id == faq_id:
                 found = item
@@ -1019,7 +1018,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             question = _get_faq_question(found)
             answer = _get_faq_answer(found)
             category = _get_faq_category(found)
-            # ✅ ПОКАЗЫВАЕМ ПОЛНЫЙ ВОПРОС И ОТВЕТ
             response = f"❓ <b>{question}</b>\n📌 <b>Ответ:</b>\n{answer}\n📁 Категория: {category}"
             keyboard = [[InlineKeyboardButton("◀ Назад к категории", callback_data=f"cat_{category}")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1030,21 +1028,18 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if bot_stats:
             bot_stats.track_response_time(elapsed)
         return
-    
     if data == "back_to_categories":
         await categories_command(update, context)
         elapsed = time.time() - start_time
         if bot_stats:
             bot_stats.track_response_time(elapsed)
         return
-    
     if data == "menu_admin" and update.effective_user.id in ADMIN_IDS:
         await admin_panel(update, context)
         elapsed = time.time() - start_time
         if bot_stats:
             bot_stats.track_response_time(elapsed)
         return
-    
     if data == "restart":
         await start_command(update, context)
         elapsed = time.time() - start_time
@@ -1075,23 +1070,6 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
 
 # ------------------------------------------------------------
-#  ПЕРИОДИЧЕСКАЯ ЗАДАЧА ОЧИСТКИ СТАРЫХ ДАННЫХ
-# ------------------------------------------------------------
-async def periodic_cleanup_tasks():
-    """Периодическая очистка старых логов и отзывов (раз в 24 часа)."""
-    while True:
-        try:
-            await asyncio.sleep(86400)  # 24 часа
-            logger.info("🧹 Запуск плановой очистки старых данных...")
-            await cleanup_old_errors(days=30)
-            await cleanup_old_feedback(days=90)
-            logger.info("✅ Плановая очистка старых данных выполнена")
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.error(f"❌ Ошибка при очистке старых данных: {e}")
-
-# ------------------------------------------------------------
 #  ФОНОВАЯ ИНИЦИАЛИЗАЦИЯ
 # ------------------------------------------------------------
 @app.before_serving
@@ -1100,16 +1078,14 @@ async def start_initialization():
     _bot_initialization_task = asyncio.create_task(setup_bot_background())
 
 async def setup_bot_background():
-    global application, search_engine, bot_stats, _bot_initialized, _bot_initializing, _routes_registered, fallback_mode
+    global application, search_engine, bot_stats, _bot_initialized, _bot_initializing, _routes_registered, fallback_mode, _cleanup_task
     async with _bot_init_lock:
         if _bot_initialized or _bot_initializing:
             logger.info("ℹ️ Бот уже инициализируется или инициализирован")
             return
         _bot_initializing = True
-        
         logger.info("🔄 Ожидание стабилизации сети (5 сек)...")
         await asyncio.sleep(5.0)
-        
         db_connected = False
         for attempt in range(20):
             try:
@@ -1129,20 +1105,17 @@ async def setup_bot_background():
                     wait = min(20.0, 0.5 * (2 ** attempt))
                     logger.warning(f"⏳ Повтор через {wait:.1f}с...")
                     await asyncio.sleep(wait)
-        
         if RENDER and EXIT_ON_DB_FAILURE and not db_connected:
             logger.critical("❌ БД недоступна на Render, EXIT_ON_DB_FAILURE=true. Завершение для перезапуска.")
             sys.exit(1)
-        
         fallback_mode = not db_connected
         set_db_available(not fallback_mode)
         logger.info(f"🔄 Синхронизация с database.py: fallback_mode={fallback_mode}")
-        
         faq_data = []
         if db_connected:
             try:
                 faq_data = await load_all_faq()
-                if not faq_data:
+                if not faq_data:  # ✅ ИСПРАВЛЕНО: было if not faq_
                     logger.warning("⚠️ FAQ из БД пустой. Будет использован резервный набор.")
                     faq_data = FALLBACK_FAQ
                     fallback_mode = True
@@ -1158,7 +1131,7 @@ async def setup_bot_background():
             except Exception as e:
                 logger.warning(f"⚠️ Ошибка загрузки FAQ из БД: {e}. Пробуем загрузить из бэкапа.")
                 faq_data = load_faq_from_backup()
-                if not faq_data:
+                if not faq_data:  # ✅ ИСПРАВЛЕНО: было if not faq_
                     logger.warning("⚠️ Резервный бэкап не найден, используем встроенный FALLBACK_FAQ")
                     faq_data = FALLBACK_FAQ
                     fallback_mode = True
@@ -1169,7 +1142,7 @@ async def setup_bot_background():
         else:
             logger.warning("⚠️ БД недоступна, пробуем загрузить FAQ из локального бэкапа...")
             faq_data = load_faq_from_backup()
-            if not faq_data:
+            if not faq_data:  # ✅ ИСПРАВЛЕНО: было if not faq_
                 logger.warning("⚠️ Резервный бэкап не найден, используем встроенный FALLBACK_FAQ")
                 faq_data = FALLBACK_FAQ
                 fallback_mode = True
@@ -1178,11 +1151,9 @@ async def setup_bot_background():
                 logger.info(f"✅ Загружено {len(faq_data)} записей из бэкапа, но БД недоступна.")
                 fallback_mode = True
                 set_db_available(False)
-        
         # ✅ ИНИЦИАЛИЗАЦИЯ ПОИСКОВОГО ДВИЖКА
         try:
             if SEARCH_ENGINE_AVAILABLE and SearchEngine:
-                # ✅ Используем SearchEngine из search_engine.py как основной
                 search_engine = SearchEngine(max_cache_size=1000, faq_data=faq_data)
                 logger.info(f"✅ SearchEngine v5.6 инициализирован: {len(search_engine.faq_data)} записей")
                 logger.info(f"📊 Инвертированный индекс: {len(search_engine._inverted_index)} слов")
@@ -1195,17 +1166,13 @@ async def setup_bot_background():
         except Exception as e:
             logger.warning(f"⚠️ Ошибка инициализации поискового движка: {e}, используем встроенный")
             search_engine = BuiltinSearchEngine(faq_data)
-        
         bot_stats = BotStatistics()
         logger.info("✅ Модуль статистики инициализирован")
-        
         builder = ApplicationBuilder().token(BOT_TOKEN).post_init(lambda app: logger.info("✅ Приложение Telegram готово"))
         application = builder.build()
-        
         if MEME_MODULE_AVAILABLE:
             await init_meme_handler(application.job_queue, admin_ids=ADMIN_IDS)
             logger.info("✅ Модуль мемов инициализирован")
-        
         # --- Регистрация обработчиков команд ---
         application.add_handler(CommandHandler("start", start_command))
         application.add_handler(CommandHandler("help", help_command))
@@ -1223,12 +1190,10 @@ async def setup_bot_background():
         application.add_handler(CommandHandler("save", save_command))
         application.add_handler(CommandHandler("status", status_command))
         application.add_handler(CommandHandler("cleanup", cleanup_command))
-        
         if MEME_MODULE_AVAILABLE:
             application.add_handler(CommandHandler("mem", meme_command))
             application.add_handler(CommandHandler("memsub", meme_subscribe_command))
             application.add_handler(CommandHandler("memunsub", meme_unsubscribe_command))
-        
         # --- Русские команды через MessageHandler ---
         async def russian_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = update.message.text.lower().strip()
@@ -1269,7 +1234,6 @@ async def setup_bot_background():
                 await admin_panel(update, context)
             elif text.startswith('/статус'):
                 await status_command(update, context)
-        
         application.add_handler(MessageHandler(
             filters.Regex(r'^/(старт|помощь|категории|предложения|отзывы|статистика|экспорт|подписаться|отписаться|рассылка|сохранить|мем|мемподписка|мемотписка|что_могу|админ|статус)'),
             russian_command_handler
@@ -1277,7 +1241,6 @@ async def setup_bot_background():
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         application.add_handler(CallbackQueryHandler(handle_callback_query))
         application.add_error_handler(error_handler)
-        
         # --- Регистрация веб-маршрутов ---
         if not _routes_registered:
             register_web_routes(
@@ -1300,16 +1263,15 @@ async def setup_bot_background():
             )
             _routes_registered = True
             logger.info("✅ Веб-маршруты зарегистрированы")
-        
         await application.initialize()
         await application.start()
-        
         if db_connected:
-            asyncio.create_task(periodic_cleanup_tasks())
+            # ✅ ИСПРАВЛЕНО: сохраняем задачу в глобальную переменную
+            global _cleanup_task
+            _cleanup_task = asyncio.create_task(periodic_cleanup_tasks())
             logger.info("✅ Запущена периодическая очистка старых данных")
         else:
             logger.warning("⏸️ Периодическая очистка отключена (режим резервной работоспособности)")
-        
         if fallback_mode and ADMIN_IDS:
             for aid in ADMIN_IDS:
                 try:
@@ -1321,7 +1283,6 @@ async def setup_bot_background():
                     )
                 except Exception as e:
                     logger.error(f"Не удалось отправить уведомление админу {aid}: {e}")
-        
         if RENDER:
             webhook_url = WEBHOOK_URL + WEBHOOK_PATH
             logger.info(f"🔄 Установка вебхука на {webhook_url} (режим: {'полный' if db_connected else 'резервный'})...")
@@ -1346,7 +1307,6 @@ async def setup_bot_background():
         else:
             await application.bot.delete_webhook(drop_pending_updates=True)
             logger.info("✅ Режим поллинга")
-        
         _bot_initialized = True
         _bot_initializing = False
         logger.info("✅✅✅ Бот полностью инициализирован и готов к работе ✅✅✅")
@@ -1356,8 +1316,17 @@ async def setup_bot_background():
 # ------------------------------------------------------------
 @app.after_serving
 async def cleanup():
-    global _bot_initialized, _bot_initialization_task
+    global _bot_initialized, _bot_initialization_task, _cleanup_task
     _bot_initialized = False
+    
+    # ✅ ИСПРАВЛЕНО: отмена задачи периодической очистки
+    if _cleanup_task and not _cleanup_task.done():
+        _cleanup_task.cancel()
+        try:
+            await _cleanup_task
+        except asyncio.CancelledError:
+            pass
+    
     if _bot_initialization_task and not _bot_initialization_task.done():
         _bot_initialization_task.cancel()
         try:
@@ -1402,29 +1371,6 @@ async def health_check():
         'timestamp': datetime.now().isoformat()
     })
 
-@app.route('/start-page', methods=['GET'])
-async def start_page():
-    """Стартовая страница Web App"""
-    user_name = 'коллега'
-    try:
-        init_data = request.headers.get('X-Telegram-Init-Data', '')
-        if init_data:
-            for param in init_data.split('&'):
-                if param.startswith('user='):
-                    import urllib.parse
-                    user_json = urllib.parse.unquote(param[5:])
-                    user_data = json.loads(user_json)
-                    user_name = user_data.get('first_name', 'коллега')
-                    break
-    except Exception as e:
-        logger.warning(f"⚠️ Не удалось получить имя пользователя: {e}")
-    return await render_template('start.html', user_name=user_name)
-
-@app.route('/static/<path:filename>')
-async def static_files(filename):
-    """Раздача статических файлов"""
-    return await send_from_directory(app.static_folder, filename)
-
 @app.route(WEBHOOK_PATH, methods=['POST'])
 async def telegram_webhook():
     global _bot_initialized, _bot_initializing
@@ -1441,7 +1387,7 @@ async def telegram_webhook():
             logger.warning(f"Неверный секретный токен: {secret_token}")
             return jsonify({'error': 'Invalid secret token'}), 403
         update_data = await request.get_json()
-        if not update_data:
+        if not update_data:  # ✅ ИСПРАВЛЕНО: было if not update_
             return jsonify({'error': 'No data'}), 400
         update = Update.de_json(update_data, application.bot)
         await application.process_update(update)

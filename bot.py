@@ -389,7 +389,6 @@ def db_required(func):
 # ------------------------------------------------------------
 #  ОБРАБОТЧИКИ КОМАНД
 # ------------------------------------------------------------
-# ✅ ЭКРАН 1: ПРИВЕТСТВИЕ (по ТЗ)
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     start_time = time.time()
     user = update.effective_user
@@ -1056,7 +1055,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         
         is_admin = update.effective_user.id in ADMIN_IDS
         
-        # Текст Второго экрана (как на й2)
+        # Текст Второго экрана (как на й1)
         text = (
             "🤖 <b>Что я умею:</b>\n\n"
             "📌 <b>1. Отвечать на HR-вопросы</b>\n"

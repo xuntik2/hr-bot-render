@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram-бот для HR-отдела компании "Мечел"
-Версия 14.4 – исправлен UnboundLocalError, добавлена команда /status, уведомления админам
+Версия 15.1 – исправлена работа с объектами FAQEntry, адаптация под разные форматы результатов поиска
 """
 import os
 import sys
@@ -169,7 +169,7 @@ _bot_initialized = False
 _bot_initializing = False
 _bot_init_lock = asyncio.Lock()
 _routes_registered = False
-_bot_initialization_task: Optional[asyncio.Task] = None  # объявлена глобально
+_bot_initialization_task: Optional[asyncio.Task] = None
 
 # Кэш подписок (чтобы не долбить БД на каждый /start)
 user_subscribed_cache = TTLCache(maxsize=10000, ttl=3600)  # 1 час
@@ -264,6 +264,7 @@ class BuiltinSearchEngine:
         logger.info(f"🔄 Данные встроенного поиска обновлены, теперь {len(self.faq_data)} записей")
 
     def search(self, query: str, category: str = None, top_k: int = 5) -> List[Tuple[int, str, str, float]]:
+        """Поиск, возвращающий кортеж (id, вопрос, ответ, релевантность)."""
         if not query or not self.faq_data:
             return []
         query_lower = query.lower()
@@ -319,6 +320,7 @@ class ExternalSearchEngineAdapter:
         self.suggest_cache_ttl = timedelta(minutes=30)
 
     def search(self, query: str, category: str = None, top_k: int = 5) -> List[Tuple[int, str, str, float]]:
+        """Возвращает результаты в формате (id, вопрос, ответ, релевантность)."""
         try:
             raw_results = self.engine.search(query, category=category, top_k=top_k)
             if not raw_results:
@@ -330,6 +332,13 @@ class ExternalSearchEngineAdapter:
                     question = r.get('question', '')
                     answer = r.get('answer', '')
                     score = r.get('score', 0.0)
+                elif isinstance(r, tuple):
+                    if len(r) == 4:
+                        faq_id, question, answer, score = r
+                    else:
+                        # Если внешний движок вернул (question, answer, score), генерируем id
+                        question, answer, score = r
+                        faq_id = hash(question) % 1000000  # временный ID
                 else:
                     faq_id = getattr(r, 'id', 0)
                     question = getattr(r, 'question', '')
@@ -438,7 +447,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     if user.id in ADMIN_IDS:
-        text += "\n\n👑 Админ-команды:\n/stats [период] — статистика\n/feedbacks — отзывы (выгрузка)\n/export — Excel\n/статистика, /отзывы, /экспорт\n/subscribe /unsubscribe — подписка\n/broadcast — рассылка\n/save — принудительное сохранение данных\n/status — состояние системы"
+        text += "\n\n👑 Админ-команды:\n/stats [период] — статистика\n/feedbacks — отзывы (выгрузка)\n/export — Excel\n/статистика, /отзывы, /экспорт\n/subscribe /unsubscribe — подписка\n/broadcast — рассылка\n/save — принудительное сохранение данных\n/status — состояние системы\n/cleanup — очистка старых данных"
 
     photo_path = os.path.join(os.path.dirname(__file__), 'mechel_start.png')
     if os.path.exists(photo_path):
@@ -560,7 +569,11 @@ async def categories_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     categories = {}
     for item in search_engine.faq_data:
-        cat = item.get('category', 'Без категории')
+        # item может быть словарём или объектом FAQEntry
+        if hasattr(item, 'category'):
+            cat = item.category
+        else:
+            cat = item.get('category', 'Без категории')
         categories[cat] = categories.get(cat, 0) + 1
     if not categories:
         await _reply_or_edit(update, "📂 Категории не найдены.", parse_mode='HTML')
@@ -632,7 +645,11 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await bot_stats.log_message(user.id, user.username or "Unknown", 'command', f'/stats {period}')
     s = bot_stats.get_summary_stats(period)
     subscribers = await get_subscribers() if not fallback_mode else []
-    faq_count = len(search_engine.faq_data) if search_engine else 0
+    # Безопасное получение количества записей FAQ
+    if search_engine and hasattr(search_engine, 'faq_data'):
+        faq_count = len(search_engine.faq_data)
+    else:
+        faq_count = 0
     period_names = {
         'all': 'всё время',
         'day': 'день',
@@ -741,6 +758,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Мемы: /memsub, /memunsub\n"
         "• Сохранить данные: /save или /сохранить\n"
         "• Состояние системы: /status\n"
+        "• Очистка старых данных: /cleanup\n"
         f"• Веб-интерфейс: {BASE_URL}"
     )
     keyboard = [[InlineKeyboardButton("👑 Открыть админ-меню", callback_data="menu_admin")]]
@@ -813,6 +831,30 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await _reply_or_edit(update, text, parse_mode='HTML')
 
+@db_required
+async def cleanup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда для принудительной очистки старых данных"""
+    start_time = time.time()
+    user = update.effective_user
+    if user.id not in ADMIN_IDS:
+        await _reply_or_edit(update, "⛔ Нет прав.", parse_mode='HTML')
+        return
+
+    await _reply_or_edit(update, "🧹 Запуск очистки старых данных...", parse_mode='HTML')
+
+    try:
+        await cleanup_old_errors(days=30)
+        await cleanup_old_feedback(days=90)
+
+        await _reply_or_edit(update, "✅ Очистка завершена успешно!", parse_mode='HTML')
+    except Exception as e:
+        logger.error(f"❌ Ошибка при очистке: {e}")
+        await _reply_or_edit(update, f"❌ Ошибка: {str(e)}", parse_mode='HTML')
+
+    elapsed = time.time() - start_time
+    if bot_stats:
+        bot_stats.track_response_time(elapsed)
+
 # ------------------------------------------------------------
 #  ОБРАБОТЧИК ТЕКСТОВЫХ СООБЩЕНИЙ
 # ------------------------------------------------------------
@@ -876,7 +918,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts = text.split(':', 1)
         cat_candidate = parts[0].strip().lower()
         for item in search_engine.faq_data:
-            cat = item.get('category')
+            if hasattr(item, 'category'):
+                cat = item.category
+            else:
+                cat = item.get('category')
             if cat and cat_candidate in cat.lower():
                 category = cat
                 search_text = parts[1].strip()
@@ -904,8 +949,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bot_stats.track_response_time(elapsed)
         return
 
-    for idx, (faq_id, q, a, s) in enumerate(results[:3]):
-        response = f"📌 <b>Результат {idx+1}:</b>\n\n• <b>{q}</b>\n{a[:200]}...\n\n"
+    for r in results[:3]:
+        # r может быть кортежем из 3 или 4 элементов
+        if len(r) == 4:
+            faq_id, q, a, s = r
+        else:
+            q, a, s = r
+            faq_id = 0  # временный ID для обратной совместимости
+        response = f"📌 <b>Результат:</b>\n\n• <b>{q}</b>\n{a[:200]}...\n\n"
         keyboard = [
             [
                 InlineKeyboardButton("👍 Помог", callback_data=f"rate_{faq_id}_1"),
@@ -956,7 +1007,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if len(parts) >= 3:
             faq_id = int(parts[1])
             is_helpful = parts[2] == '1'
-            if not fallback_mode:
+            if not fallback_mode and faq_id != 0:  # не сохраняем оценку, если ID временный
                 await save_rating(faq_id, update.effective_user.id, is_helpful)
                 if bot_stats:
                     bot_stats.record_rating(faq_id, is_helpful)
@@ -978,10 +1029,17 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         questions = []
         question_ids = []
         for item in search_engine.faq_data:
-            cat = item.get('category')
+            if hasattr(item, 'category'):
+                cat = item.category
+                q = item.question
+                faq_id = item.id
+            else:
+                cat = item.get('category')
+                q = item.get('question', '')
+                faq_id = item.get('id', 0)
             if cat == category_name:
-                questions.append(item.get('question', ''))
-                question_ids.append(item.get('id', 0))
+                questions.append(q)
+                question_ids.append(faq_id)
         if not questions:
             await query.edit_message_text(f"❓ В категории {category_name} нет вопросов.")
             elapsed = time.time() - start_time
@@ -1009,13 +1067,21 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         faq_id = int(data[2:])
         found = None
         for item in search_engine.faq_data:
-            if item.get('id') == faq_id:
+            if hasattr(item, 'id') and item.id == faq_id:
+                found = item
+                break
+            elif isinstance(item, dict) and item.get('id') == faq_id:
                 found = item
                 break
         if found:
-            question = found.get('question', '')
-            answer = found.get('answer', '')
-            category = found.get('category', '')
+            if hasattr(found, 'question'):
+                question = found.question
+                answer = found.answer
+                category = found.category
+            else:
+                question = found.get('question', '')
+                answer = found.get('answer', '')
+                category = found.get('category', '')
             response = f"❓ <b>{question}</b>\n\n📌 <b>Ответ:</b>\n{answer}\n\n📁 Категория: {category}"
             keyboard = [[InlineKeyboardButton("◀ Назад к категории", callback_data=f"cat_{category}")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1199,7 +1265,8 @@ async def setup_bot_background():
     application.add_handler(CommandHandler("broadcast", broadcast_command))
     application.add_handler(CommandHandler("whatcanido", what_can_i_do))
     application.add_handler(CommandHandler("save", save_command))
-    application.add_handler(CommandHandler("status", status_command))  # новая команда
+    application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("cleanup", cleanup_command))
 
     if MEME_MODULE_AVAILABLE:
         application.add_handler(CommandHandler("mem", meme_command))
@@ -1361,7 +1428,7 @@ async def cleanup():
 # ------------------------------------------------------------
 @app.route('/wake', methods=['GET', 'POST'])
 async def wake():
-    global _bot_initialization_task  # обязательно global!
+    global _bot_initialization_task
     if not _bot_initialized:
         logger.info("🔄 Пробуждение: запуск инициализации")
         if not _bot_initialization_task or _bot_initialization_task.done():

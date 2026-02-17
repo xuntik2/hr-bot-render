@@ -1,7 +1,7 @@
 # search_engine.py
 """
 ПОИСКОВЫЙ ДВИЖОК ДЛЯ HR-БОТА МЕЧЕЛ
-Версия 5.5 – исправлена проблема хеширования для pgbouncer (индекс хранит ID, а не объекты)
+Версия 5.6 – search() возвращает кортежи с id записи
 - Инвертированный индекс (O(1) доступ к кандидатам)
 - TF‑IDF ранжирование
 - Быстрый Левенштейн с порогом
@@ -457,7 +457,7 @@ class SearchEngine:
             self._load_faq()
 
         self._build_indexes()
-        logger.info(f"✅ SearchEngine v5.5: загружено {len(self.faq_data)} записей, "
+        logger.info(f"✅ SearchEngine v5.6: загружено {len(self.faq_data)} записей, "
                     f"инвертированный индекс: {len(self._inverted_index)} уникальных слов, "
                     f"источник: {self.stats['loaded_from']}")
 
@@ -831,10 +831,10 @@ class SearchEngine:
     # ------------------------------------------------------------
     #  ОСНОВНОЙ ПОИСК
     # ------------------------------------------------------------
-    def search(self, query: str, category: Optional[str] = None, top_k: int = 5) -> List[Tuple[str, str, float]]:
+    def search(self, query: str, category: Optional[str] = None, top_k: int = 5) -> List[Tuple[int, str, str, float]]:
         """
         Поиск по запросу.
-        Возвращает список кортежей (вопрос, ответ, релевантность).
+        Возвращает список кортежей (id, вопрос, ответ, релевантность).
         """
         if not query or len(query.strip()) < 2:
             return []
@@ -852,7 +852,7 @@ class SearchEngine:
             if matched_cat:
                 logger.info(f"🔍 Запрос '{query}' совпал с категорией '{matched_cat}' на >=75%, показываем все вопросы категории")
                 # Получаем все вопросы этой категории (до top_k)
-                return [(faq.question, faq.answer, 100.0) for faq in self.faq_data if faq.category == matched_cat][:top_k]
+                return [(faq.id, faq.question, faq.answer, 100.0) for faq in self.faq_data if faq.category == matched_cat][:top_k]
         # ---------------------------------------------------------
 
         cache_key = f"{norm_query}_{category}_{top_k}"
@@ -892,9 +892,9 @@ class SearchEngine:
             if faq.priority > 0:
                 score += 5.0
             if score > 0:
-                results.append((faq.question, faq.answer, score))
+                results.append((faq.id, faq.question, faq.answer, score))
 
-        results.sort(key=lambda x: x[2], reverse=True)
+        results.sort(key=lambda x: x[3], reverse=True)
         top_results = results[:top_k]
 
         # Сохраняем в кэш
